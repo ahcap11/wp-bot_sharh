@@ -7,7 +7,7 @@ import { LogLevel } from '../types';
 const logFormat = winston.format.combine(
   winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
   winston.format.errors({ stack: true }),
-  winston.format.json(),
+  winston.format.json()
 );
 
 /**
@@ -22,13 +22,15 @@ const consoleFormat = winston.format.combine(
       metaStr = ` ${JSON.stringify(meta)}`;
     }
     return `${timestamp} [${level}]: ${message}${metaStr}`;
-  }),
+  })
 );
 
 /**
  * Create logger instance
  */
-export const createLogger = (level: LogLevel = LogLevel.INFO): winston.Logger => {
+export const createLogger = (
+  level: LogLevel = LogLevel.INFO
+): winston.Logger => {
   const transports: winston.transport[] = [
     new winston.transports.Console({
       format: consoleFormat,
@@ -46,7 +48,7 @@ export const createLogger = (level: LogLevel = LogLevel.INFO): winston.Logger =>
       new winston.transports.File({
         filename: 'logs/combined.log',
         format: logFormat,
-      }),
+      })
     );
   }
 
@@ -116,7 +118,11 @@ export const logUtils = {
    * Log errors with context
    */
   error: (message: string, error?: Error, context?: any): void => {
-    logger.error(message, { error: error?.message, stack: error?.stack, context });
+    logger.error(message, {
+      error: error?.message,
+      stack: error?.stack,
+      context,
+    });
   },
 };
 
@@ -125,10 +131,14 @@ export const logUtils = {
  */
 export const baileysLogger = {
   trace: (..._args: unknown[]) => {}, // no-op for trace
-  debug: (...args: unknown[]) => logger.debug(typeof args[0] === 'object' ? args[0] : { msg: args[0] }),
-  info: (...args: unknown[]) => logger.info(typeof args[0] === 'object' ? args[0] : { msg: args[0] }),
-  warn: (...args: unknown[]) => logger.warn(typeof args[0] === 'object' ? args[0] : { msg: args[0] }),
-  error: (...args: unknown[]) => logger.error(typeof args[0] === 'object' ? args[0] : { msg: args[0] }),
+  debug: (...args: unknown[]) =>
+    logger.debug(typeof args[0] === 'object' ? args[0] : { msg: args[0] }),
+  info: (...args: unknown[]) =>
+    logger.info(typeof args[0] === 'object' ? args[0] : { msg: args[0] }),
+  warn: (...args: unknown[]) =>
+    logger.warn(typeof args[0] === 'object' ? args[0] : { msg: args[0] }),
+  error: (...args: unknown[]) =>
+    logger.error(typeof args[0] === 'object' ? args[0] : { msg: args[0] }),
   level: 'info',
   child: () => baileysLogger,
-}; 
+};

@@ -27,6 +27,8 @@ A sophisticated WhatsApp AI chatbot built with Node.js, TypeScript, and OpenAI o
 - **💬 Chat History Management**: Maintains conversation context for better responses
 - **🌐 Real-time WebSocket**: Live status updates and message monitoring
 - **⚡ Auto-Reply**: Instant responses to incoming messages
+- **🎭 Dual Role Switching**: Switch between `support` and `sales` modes from client messages
+- **📄 Google Sheets Lead Sync**: Automatically writes captured sales lead data to Google Sheets
 - **🔧 Configurable**: Easy environment-based configuration
 - **📊 Logging**: Comprehensive logging with Winston
 - **🧪 Testing**: Jest testing framework included
@@ -131,6 +133,8 @@ src/
 │   ├── whatsapp.service.ts     # WhatsApp connection
 │   ├── chat-history.service.ts # Message history
 │   ├── websocket.service.ts    # Real-time communication
+│   ├── lead-capture.service.ts # Sales lead extraction and state
+│   ├── google-sheets.service.ts# Google Sheets writer
 │   └── chatbot.service.ts      # Main orchestrator
 ├── types/          # TypeScript type definitions
 ├── utils/          # Utilities (logging, etc.)
@@ -154,6 +158,32 @@ src/
 | `LOG_LEVEL`      | Logging level                      | `info`            |
 | `AI_MAX_TOKENS`  | Max tokens for AI response         | `150`             |
 | `AI_TEMPERATURE` | AI response creativity (0-2)       | `0.7`             |
+| `GOOGLE_SHEETS_ENABLED` | Enable Google Sheets sync (`true`/`false`) | `false` |
+| `GOOGLE_SHEETS_SPREADSHEET_ID` | Target spreadsheet ID | *(required when enabled)* |
+| `GOOGLE_SHEETS_SHEET_NAME` | Worksheet name for lead rows | `Leads` |
+| `GOOGLE_SHEETS_CREDENTIALS_JSON` | Service account JSON string | *(optional)* |
+| `GOOGLE_SHEETS_CREDENTIALS_PATH` | Path to service account JSON file | *(optional)* |
+
+### Google Sheets Setup
+
+1. Create a Google Cloud service account and enable Google Sheets API.
+2. Download the service account JSON key.
+3. Share the target spreadsheet with the service account email (`client_email`) as Editor.
+4. Configure one credentials option in `.env`:
+
+```env
+GOOGLE_SHEETS_ENABLED=true
+GOOGLE_SHEETS_SPREADSHEET_ID=your_spreadsheet_id_here
+GOOGLE_SHEETS_SHEET_NAME=Leads
+
+# Option A: inline JSON
+GOOGLE_SHEETS_CREDENTIALS_JSON={"type":"service_account",...}
+
+# Option B: path to JSON key file
+GOOGLE_SHEETS_CREDENTIALS_PATH=./service-account.json
+```
+
+When enabled, the bot writes structured sales lead snapshots whenever key data is captured or lead status changes.
 
 ### AI System Prompt
 
@@ -173,6 +203,22 @@ The chatbot uses a configurable system prompt that instructs the AI to:
 2. Scan the QR code with WhatsApp
 3. Send a message to the connected number
 4. The bot will automatically respond with AI-generated content
+
+### Role Switching
+
+The bot supports two conversation roles per chat:
+
+- `support`: Troubleshooting and guidance focused responses
+- `sales`: Benefit/value focused responses with clear next steps
+
+Clients can switch role by sending messages like:
+
+- `/role support`
+- `/role sales`
+- `switch to support`
+- `switch to sales`
+- `support mode`
+- `sales mode`
 
 ### WebSocket Monitoring
 

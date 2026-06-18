@@ -1,9 +1,9 @@
-import { 
-  default as makeWASocket, 
-  DisconnectReason, 
+import {
+  default as makeWASocket,
+  DisconnectReason,
   useMultiFileAuthState,
   WASocket,
-  proto 
+  proto,
 } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
 import { WhatsAppMessage, ConnectionStatus } from '../types';
@@ -30,15 +30,16 @@ export class WhatsAppService {
       logger.info('Initializing WhatsApp connection...');
       this.updateConnectionStatus(ConnectionStatus.CONNECTING);
 
-      const { state, saveCreds } = await useMultiFileAuthState('.whatsapp-session');
-      
+      const { state, saveCreds } =
+        await useMultiFileAuthState('.whatsapp-session');
+
       this.sock = makeWASocket({
         auth: state,
         printQRInTerminal: false,
       });
 
       // Handle connection updates
-      this.sock.ev.on('connection.update', async (update) => {
+      this.sock.ev.on('connection.update', async update => {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
@@ -47,11 +48,13 @@ export class WhatsAppService {
         }
 
         if (connection === 'close') {
-          const shouldReconnect = (lastDisconnect?.error as any)?.output?.statusCode !== DisconnectReason.loggedOut;
-          
-          logger.info('Connection closed', { 
-            reason: lastDisconnect?.error, 
-            shouldReconnect 
+          const shouldReconnect =
+            (lastDisconnect?.error as any)?.output?.statusCode !==
+            DisconnectReason.loggedOut;
+
+          logger.info('Connection closed', {
+            reason: lastDisconnect?.error,
+            shouldReconnect,
           });
 
           if (shouldReconnect) {
@@ -70,23 +73,26 @@ export class WhatsAppService {
       this.sock.ev.on('creds.update', saveCreds);
 
       // Handle messages
-      this.sock.ev.on('messages.upsert', async (m) => {
+      this.sock.ev.on('messages.upsert', async m => {
         const msg = m.messages[0];
-        
+
         if (msg && !msg.key.fromMe && msg.message) {
           const whatsappMessage = this.parseMessage(msg);
           if (whatsappMessage) {
-            logger.info('Message received', { 
-              from: whatsappMessage.from, 
-              content: whatsappMessage.content.substring(0, 50) 
+            logger.info('Message received', {
+              from: whatsappMessage.from,
+              content: whatsappMessage.content.substring(0, 50),
             });
-            
+
             // Notify all message handlers
             this.messageHandlers.forEach(handler => {
               try {
                 handler(whatsappMessage);
               } catch (error) {
-                logger.error('Error in message handler', { error: error instanceof Error ? error.message : 'Unknown error' });
+                logger.error('Error in message handler', {
+                  error:
+                    error instanceof Error ? error.message : 'Unknown error',
+                });
               }
             });
           }
@@ -95,7 +101,9 @@ export class WhatsAppService {
 
       logger.info('WhatsApp service initialized successfully');
     } catch (error) {
-      logger.error('Failed to initialize WhatsApp service', { error: error instanceof Error ? error.message : 'Unknown error' });
+      logger.error('Failed to initialize WhatsApp service', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
       this.updateConnectionStatus(ConnectionStatus.DISCONNECTED);
       throw error;
     }
@@ -112,12 +120,15 @@ export class WhatsAppService {
 
     try {
       await this.sock.sendMessage(chatId, { text: message });
-      logger.info('Message sent successfully', { chatId, messageLength: message.length });
+      logger.info('Message sent successfully', {
+        chatId,
+        messageLength: message.length,
+      });
       return true;
     } catch (error) {
-      logger.error('Failed to send message', { 
-        chatId, 
-        error: error instanceof Error ? error.message : 'Unknown error' 
+      logger.error('Failed to send message', {
+        chatId,
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
       return false;
     }
@@ -130,7 +141,7 @@ export class WhatsAppService {
     try {
       const messageType = this.getMessageType(msg.message || undefined);
       const content = this.extractMessageContent(msg.message || undefined);
-      
+
       if (!content) return null;
 
       const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
@@ -140,15 +151,20 @@ export class WhatsAppService {
         id: msg.key.id || '',
         from: msg.key.participant || msg.key.remoteJid || '',
         to: msg.key.remoteJid || '',
-        timestamp: msg.messageTimestamp ? (msg.messageTimestamp as number) * 1000 : Date.now(),
+        timestamp: msg.messageTimestamp
+          ? (msg.messageTimestamp as number) * 1000
+          : Date.now(),
         type: messageType,
         content,
         isGroup,
         groupId: groupId || undefined,
         senderName: msg.pushName || undefined,
+        isFromBot: false,
       };
     } catch (error) {
-      logger.error('Error parsing message', { error: error instanceof Error ? error.message : 'Unknown error' });
+      logger.error('Error parsing message', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
       return null;
     }
   }
@@ -156,11 +172,14 @@ export class WhatsAppService {
   /**
    * Extract message content based on type
    */
-  private extractMessageContent(message: proto.IMessage | undefined): string | null {
+  private extractMessageContent(
+    message: proto.IMessage | undefined
+  ): string | null {
     if (!message) return null;
 
     if (message.conversation) return message.conversation;
-    if (message.extendedTextMessage?.text) return message.extendedTextMessage.text;
+    if (message.extendedTextMessage?.text)
+      return message.extendedTextMessage.text;
     if (message.imageMessage?.caption) return message.imageMessage.caption;
     if (message.videoMessage?.caption) return message.videoMessage.caption;
     if (message.documentMessage?.title) return message.documentMessage.title;
@@ -171,7 +190,9 @@ export class WhatsAppService {
   /**
    * Get message type
    */
-  private getMessageType(message: proto.IMessage | undefined): WhatsAppMessage['type'] {
+  private getMessageType(
+    message: proto.IMessage | undefined
+  ): WhatsAppMessage['type'] {
     if (!message) return 'text';
 
     if (message.conversation || message.extendedTextMessage) return 'text';
@@ -205,12 +226,14 @@ export class WhatsAppService {
   private updateConnectionStatus(status: ConnectionStatus): void {
     this.connectionStatus = status;
     logger.info('Connection status changed', { status });
-    
+
     this.statusHandlers.forEach(handler => {
       try {
         handler(status);
       } catch (error) {
-        logger.error('Error in status handler', { error: error instanceof Error ? error.message : 'Unknown error' });
+        logger.error('Error in status handler', {
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
       }
     });
   }
@@ -253,8 +276,11 @@ export class WhatsAppService {
       const groupMetadata = await this.sock.groupMetadata(chatId);
       return groupMetadata.participants.map(p => p.id);
     } catch (error) {
-      logger.error('Failed to get chat participants', { chatId, error: error instanceof Error ? error.message : 'Unknown error' });
+      logger.error('Failed to get chat participants', {
+        chatId,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
       return [];
     }
   }
-} 
+}

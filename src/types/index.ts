@@ -6,12 +6,25 @@ export interface WhatsAppMessage {
   from: string;
   to: string;
   timestamp: number;
-  type: 'text' | 'image' | 'video' | 'audio' | 'document' | 'location' | 'contact';
+  type:
+    | 'text'
+    | 'image'
+    | 'video'
+    | 'audio'
+    | 'document'
+    | 'location'
+    | 'contact';
   content: string;
   isGroup: boolean;
   groupId?: string | undefined;
   senderName?: string | undefined;
+  isFromBot?: boolean | undefined;
 }
+
+/**
+ * Supported bot conversation roles
+ */
+export type BotRole = 'support' | 'sales';
 
 /**
  * Chat history interface
@@ -30,6 +43,7 @@ export interface AIResponse {
   confidence: number;
   context: string[];
   timestamp: number;
+  role?: BotRole | undefined;
 }
 
 /**
@@ -51,6 +65,7 @@ export type AIProvider = 'openai' | 'gemini';
  */
 export interface AppConfig {
   port: number;
+  healthPort: number;
   aiProvider: AIProvider;
   openaiApiKey?: string | undefined;
   openaiModel?: string | undefined;
@@ -59,6 +74,7 @@ export interface AppConfig {
   maxHistoryLength: number;
   responseDelay: number;
   logLevel: string;
+  wsAuthToken?: string | undefined;
 }
 
 /**
@@ -92,6 +108,47 @@ export interface AIServiceConfig {
   maxTokens: number;
   temperature: number;
   systemPrompt: string;
+}
+
+/**
+ * Google Sheets integration configuration
+ */
+export interface GoogleSheetsConfig {
+  enabled: boolean;
+  spreadsheetId: string;
+  sheetName: string;
+  credentialsJson?: string | undefined;
+  credentialsPath?: string | undefined;
+}
+
+/**
+ * Neon read-only search configuration
+ */
+export interface NeonSearchConfig {
+  enabled: boolean;
+  databaseUrl?: string | undefined;
+  tableName: string;
+  searchableColumns: string[];
+  limit: number;
+}
+
+/**
+ * State persistence configuration
+ */
+export interface PersistenceConfig {
+  enabled: boolean;
+  filePath: string;
+}
+
+/**
+ * Access control (allowlist + rate limit) configuration
+ */
+export interface AccessControlConfig {
+  allowlistEnabled: boolean;
+  allowedNumbers: string[];
+  rateLimitEnabled: boolean;
+  rateLimitMaxMessages: number;
+  rateLimitWindowMs: number;
 }
 
 /**
@@ -138,4 +195,4 @@ export interface HealthStatus {
   };
   connections: number;
   lastError?: string;
-} 
+}

@@ -30,12 +30,12 @@ export const truncateText = (text: string, maxLength: number): string => {
 export const sanitizePhoneNumber = (phone: string): string => {
   // Remove all non-digit characters
   const cleaned = phone.replace(/\D/g, '');
-  
+
   // Add @s.whatsapp.net suffix if not present
   if (!cleaned.includes('@s.whatsapp.net')) {
     return `${cleaned}@s.whatsapp.net`;
   }
-  
+
   return cleaned;
 };
 
@@ -86,22 +86,22 @@ export const retryWithBackoff = async <T>(
   baseDelay: number = 1000
 ): Promise<T> => {
   let lastError: Error;
-  
+
   for (let i = 0; i < maxRetries; i++) {
     try {
       return await fn();
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
-      
+
       if (i === maxRetries - 1) {
         throw lastError;
       }
-      
+
       const delay = baseDelay * Math.pow(2, i);
       await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
-  
+
   throw lastError!;
 };
 
@@ -113,7 +113,7 @@ export const debounce = <T extends (...args: any[]) => any>(
   wait: number
 ): ((...args: Parameters<T>) => void) => {
   let timeout: NodeJS.Timeout;
-  
+
   return (...args: Parameters<T>) => {
     clearTimeout(timeout);
     timeout = setTimeout(() => func(...args), wait);
@@ -128,7 +128,7 @@ export const throttle = <T extends (...args: any[]) => any>(
   limit: number
 ): ((...args: Parameters<T>) => void) => {
   let inThrottle: boolean;
-  
+
   return (...args: Parameters<T>) => {
     if (!inThrottle) {
       func(...args);
@@ -148,7 +148,7 @@ export const deepClone = <T>(obj: T): T => {
   if (typeof obj === 'object') {
     const clonedObj = {} as T;
     for (const key in obj) {
-      if (obj.hasOwnProperty(key)) {
+      if (Object.prototype.hasOwnProperty.call(obj, key)) {
         clonedObj[key] = deepClone(obj[key]);
       }
     }
@@ -166,4 +166,4 @@ export const isEmpty = (obj: any): boolean => {
   if (obj instanceof Map || obj instanceof Set) return obj.size === 0;
   if (typeof obj === 'object') return Object.keys(obj).length === 0;
   return false;
-}; 
+};

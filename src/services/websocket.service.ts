@@ -1,5 +1,11 @@
+import { IncomingMessage } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { WebSocketMessage, EventType, AppEvent, ConnectionStatus } from '../types';
+import {
+  WebSocketMessage,
+  EventType,
+  AppEvent,
+  ConnectionStatus,
+} from '../types';
 import { logger } from '../utils/logger';
 
 /**
@@ -10,8 +16,19 @@ export class WebSocketService {
   private clients: Set<WebSocket> = new Set();
   private eventHandlers: Map<EventType, Array<(data: any) => void>> = new Map();
 
-  constructor(private port: number = 8080) {
-    logger.info('WebSocket Service initialized', { port });
+  constructor(
+    private port: number = 8080,
+    private authToken?: string | undefined
+  ) {
+    logger.info('WebSocket Service initialized', {
+      port,
+      authRequired: Boolean(authToken),
+    });
+    if (!authToken) {
+      logger.warn(
+        'WebSocket auth token not set; the monitoring stream is unauthenticated'
+      );
+    }
   }
 
   /**
@@ -20,22 +37,59 @@ export class WebSocketService {
   initialize(): void {
     try {
       this.wss = new WebSocketServer({ port: this.port });
-      
-      this.wss.on('connection', (ws: WebSocket) => {
+
+      this.wss.on('connection', (ws: WebSocket, request: IncomingMessage) => {
+        if (!this.isAuthorized(request)) {
+          logger.warn('Rejected unauthorized WebSocket connection');
+          ws.close(1008, 'Unauthorized');
+          return;
+        }
         this.handleConnection(ws);
       });
 
-      this.wss.on('error', (error) => {
+      this.wss.on('error', error => {
         logger.error('WebSocket server error', { error: error.message });
       });
 
       logger.info('WebSocket server started', { port: this.port });
     } catch (error) {
-      logger.error('Failed to initialize WebSocket server', { 
-        error: error instanceof Error ? error.message : 'Unknown error' 
+      logger.error('Failed to initialize WebSocket server', {
+        error: error instanceof Error ? error.message : 'Unknown error',
       });
       throw error;
     }
+  }
+
+  /**
+   * Validate an incoming connection against the configured auth token.
+   * When no token is configured, all connections are allowed (dev mode).
+   */
+  private isAuthorized(request: IncomingMessage): boolean {
+    if (!this.authToken) {
+      return true;
+    }
+
+    try {
+      const url = new URL(request.url || '', `http://localhost:${this.port}`);
+      const queryToken = url.searchParams.get('token');
+      const headerToken = this.extractBearerToken(
+        request.headers['authorization']
+      );
+      return queryToken === this.authToken || headerToken === this.authToken;
+    } catch {
+      return false;
+    }
+  }
+
+  private extractBearerToken(
+    header: string | string[] | undefined
+  ): string | null {
+    if (typeof header !== 'string') {
+      return null;
+    }
+
+    const match = header.match(/^Bearer\s+(.+)$/i);
+    return match?.[1] ?? null;
   }
 
   /**
@@ -43,8 +97,8 @@ export class WebSocketService {
    */
   private handleConnection(ws: WebSocket): void {
     this.clients.add(ws);
-    logger.info('New WebSocket client connected', { 
-      totalClients: this.clients.size 
+    logger.info('New WebSocket client connected', {
+      totalClients: this.clients.size,
     });
 
     // Send initial connection message
@@ -59,22 +113,22 @@ export class WebSocketService {
         const message = JSON.parse(data.toString()) as WebSocketMessage;
         this.handleClientMessage(ws, message);
       } catch (error) {
-        logger.error('Error parsing WebSocket message', { 
-          error: error instanceof Error ? error.message : 'Unknown error' 
+        logger.error('Error parsing WebSocket message', {
+          error: error instanceof Error ? error.message : 'Unknown error',
         });
       }
     });
 
     ws.on('close', () => {
       this.clients.delete(ws);
-      logger.info('WebSocket client disconnected', { 
-        totalClients: this.clients.size 
+      logger.info('WebSocket client disconnected', {
+        totalClients: this.clients.size,
       });
     });
 
-    ws.on('error', (error) => {
-      logger.error('WebSocket client error', { 
-        error: error.message 
+    ws.on('error', error => {
+      logger.error('WebSocket client error', {
+        error: error.message,
       });
       this.clients.delete(ws);
     });
@@ -84,9 +138,9 @@ export class WebSocketService {
    * Handle incoming client messages
    */
   private handleClientMessage(_ws: WebSocket, message: WebSocketMessage): void {
-    logger.debug('Received WebSocket message', { 
-      type: message.type, 
-      data: message.data 
+    logger.debug('Received WebSocket message', {
+      type: message.type,
+      data: message.data,
     });
 
     switch (message.type) {
@@ -109,8 +163,8 @@ export class WebSocketService {
       try {
         ws.send(JSON.stringify(message));
       } catch (error) {
-        logger.error('Error sending message to client', { 
-          error: error instanceof Error ? error.message : 'Unknown error' 
+        logger.error('Error sending message to client', {
+          error: error instanceof Error ? error.message : 'Unknown error',
         });
       }
     }
@@ -121,14 +175,14 @@ export class WebSocketService {
    */
   broadcastMessage(message: WebSocketMessage): void {
     const messageStr = JSON.stringify(message);
-    
+
     for (const client of this.clients) {
       if (client.readyState === WebSocket.OPEN) {
         try {
           client.send(messageStr);
         } catch (error) {
-          logger.error('Error broadcasting message to client', { 
-            error: error instanceof Error ? error.message : 'Unknown error' 
+          logger.error('Error broadcasting message to client', {
+            error: error instanceof Error ? error.message : 'Unknown error',
           });
         }
       }
@@ -144,7 +198,7 @@ export class WebSocketService {
       data: status,
       timestamp: Date.now(),
     };
-    
+
     this.broadcastMessage(message);
   }
 
@@ -157,7 +211,7 @@ export class WebSocketService {
       data: event,
       timestamp: Date.now(),
     };
-    
+
     this.broadcastMessage(message);
   }
 
@@ -168,7 +222,7 @@ export class WebSocketService {
     if (!this.eventHandlers.has(eventType)) {
       this.eventHandlers.set(eventType, []);
     }
-    
+
     this.eventHandlers.get(eventType)!.push(handler);
   }
 
@@ -182,9 +236,9 @@ export class WebSocketService {
         try {
           handler(event.data);
         } catch (error) {
-          logger.error('Error in event handler', { 
-            eventType: event.type, 
-            error: error instanceof Error ? error.message : 'Unknown error' 
+          logger.error('Error in event handler', {
+            eventType: event.type,
+            error: error instanceof Error ? error.message : 'Unknown error',
           });
         }
       });
@@ -279,4 +333,4 @@ export class WebSocketService {
       timestamp: Date.now(),
     });
   }
-} 
+}
