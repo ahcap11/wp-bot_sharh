@@ -5,8 +5,9 @@ import {
   getNeonSearchConfig,
   getPersistenceConfig,
   getAccessControlConfig,
+  getMessagingConfig,
 } from './config';
-import { WhatsAppService } from './services/whatsapp.service';
+import { createMessagingTransport } from './services/messaging-transport.factory';
 import { AIService } from './services/ai.service';
 import { ChatHistoryService } from './services/chat-history.service';
 import { WebSocketService } from './services/websocket.service';
@@ -73,7 +74,7 @@ class WhatsAppAIChatbot {
       );
 
       // Initialize services
-      const whatsappService = new WhatsAppService();
+      const whatsappService = createMessagingTransport(getMessagingConfig());
       const neonReadService = new NeonReadService(neonSearchConfig);
       const aiService = new AIService(aiConfig, neonReadService);
       const chatHistoryService = new ChatHistoryService(

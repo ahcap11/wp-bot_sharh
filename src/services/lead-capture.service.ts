@@ -252,8 +252,52 @@ export class LeadCaptureService {
       `Lead: ${summary}.${scorePart}`,
       'This is a broker outreach about an existing lead.',
       'Do NOT run consumer buy/sell qualification.',
-      'Acknowledge professionally in English and transfer to a manager immediately.',
+      "Acknowledge professionally in the client's language and transfer to a manager immediately.",
     ].join(' ');
+  }
+
+  /**
+   * Authoritative known-facts block injected into the prompt every turn so the
+   * model never re-asks captured data and never contradicts the engine state.
+   * Returns null when there is nothing useful to inject yet.
+   */
+  getKnownFactsBlock(chatId: string): string | null {
+    const state = this.leadStates.get(chatId);
+    if (!state) {
+      return null;
+    }
+
+    const facts: string[] = [];
+    if (state.clientName) facts.push(`- Name: ${state.clientName}`);
+    if (state.clientPhone) facts.push(`- Phone: ${state.clientPhone}`);
+    if (state.inquiryPurpose) facts.push(`- Purpose: ${state.inquiryPurpose}`);
+    if (state.businessType) facts.push(`- Business: ${state.businessType}`);
+    if (state.annualRevenueAed)
+      facts.push(`- Annual revenue: ${state.annualRevenueAed}`);
+    if (state.desiredSellingPriceAed)
+      facts.push(`- Asking price: ${state.desiredSellingPriceAed}`);
+
+    const escalating =
+      state.status === 'qualified_lead' || state.status === 'early_escalation';
+
+    // Nothing captured and still collecting: no authoritative context to add.
+    if (facts.length === 0 && !escalating) {
+      return null;
+    }
+
+    const lines = [
+      'KNOWN FACTS (authoritative — already collected, do NOT ask for these again):',
+      facts.length ? facts.join('\n') : '- (none captured yet)',
+    ];
+
+    if (escalating) {
+      lines.push(
+        `LEAD STATUS: ${state.status}. The system is already handing this lead to a manager. ` +
+          'Send ONE short closing message saying a manager will follow up shortly, then stop asking questions.'
+      );
+    }
+
+    return lines.join('\n');
   }
 
   /**
@@ -287,7 +331,9 @@ export class LeadCaptureService {
       );
     }
 
-    return true;
+    // Buying: require at least the sector/type of business of interest, so a
+    // buyer is never handed to a manager on name + auto-detected phone alone.
+    return Boolean(state.businessType);
   }
 
   private normalizeWhitespace(value: string): string {
@@ -396,11 +442,15 @@ export class LeadCaptureService {
   }
 
   private extractClientName(value: string): string | null {
+    // Capture 1–3 name-like words after an explicit introducer, WITHOUT anchoring
+    // to end-of-string, so "my name is John and I want to sell" yields "John",
+    // not the whole tail. Each candidate is then validated against stopwords.
     const patterns: RegExp[] = [
-      /\bmy name is\s+([a-z][a-z\s'-]{1,60})$/i,
-      /\bi am\s+([a-z][a-z\s'-]{1,60})$/i,
-      /\bthis is\s+([a-z][a-z\s'-]{1,60})$/i,
-      /\bname\s*[:=-]\s*([a-z][a-z\s'-]{1,60})$/i,
+      /\bmy name is\s+([a-z][a-z'’-]+(?:\s+[a-z][a-z'’-]+){0,2})/i,
+      /\bi am\s+([a-z][a-z'’-]+(?:\s+[a-z][a-z'’-]+){0,2})/i,
+      /\bi'?m\s+([a-z][a-z'’-]+(?:\s+[a-z][a-z'’-]+){0,2})/i,
+      /\bthis is\s+([a-z][a-z'’-]+(?:\s+[a-z][a-z'’-]+){0,2})/i,
+      /\bname\s*[:=-]\s*([a-z][a-z'’-]+(?:\s+[a-z][a-z'’-]+){0,2})/i,
     ];
 
     for (const pattern of patterns) {
@@ -408,19 +458,72 @@ export class LeadCaptureService {
       if (!match || !match[1]) {
         continue;
       }
-
-      const normalizedName = this.normalizeName(match[1]);
-      if (normalizedName) {
-        return normalizedName;
+      const candidate = this.trimToPlausibleName(match[1]);
+      if (candidate) {
+        return this.normalizeName(candidate);
       }
     }
 
-    // Fallback for short standalone name responses such as "John".
+    // Fallback for short standalone name responses such as "John Smith".
     if (this.looksLikeStandaloneName(value)) {
-      return this.normalizeName(value);
+      const candidate = this.trimToPlausibleName(value);
+      if (candidate) {
+        return this.normalizeName(candidate);
+      }
     }
 
     return null;
+  }
+
+  /**
+   * Words that must never be treated as a name even when they pass the shape
+   * check. Greetings, command/intent words, and common filler are the usual
+   * false positives ("Hello" captured as a name, etc.).
+   */
+  private static readonly NAME_STOPWORDS = new Set<string>([
+    'hello', 'hi', 'hey', 'yo', 'hiya', 'salam', 'salaam', 'assalamualaikum',
+    'yes', 'no', 'ok', 'okay', 'yeah', 'yep', 'nope', 'sure', 'fine',
+    'thanks', 'thank', 'thx', 'please', 'pls', 'welcome', 'good', 'morning',
+    'evening', 'afternoon', 'sir', 'madam', 'maam', 'mr', 'mrs', 'ms',
+    'support', 'sales', 'help', 'manager', 'human', 'agent', 'admin', 'bot',
+    'buy', 'buying', 'buyer', 'sell', 'selling', 'seller', 'sale', 'business',
+    'businesses', 'company', 'want', 'wanted', 'need', 'needed', 'looking',
+    'interested', 'interest', 'inquiry', 'enquiry', 'info', 'information',
+    'and', 'or', 'but', 'the', 'a', 'an', 'my', 'me', 'mine', 'name', 'is',
+    'am', 'are', 'was', 'this', 'that', 'to', 'for', 'in', 'on', 'of', 'with',
+    'quickly', 'quick', 'asap', 'urgent', 'urgently', 'now', 'today',
+    'price', 'revenue', 'profit', 'here', 'there', 'okay', 'great', 'cool',
+  ]);
+
+  /**
+   * Reduce a captured fragment to a plausible name: drop tokens once a
+   * stopword appears, reject if nothing plausible remains.
+   */
+  private trimToPlausibleName(value: string): string | null {
+    const tokens = value
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+
+    const kept: string[] = [];
+    for (const token of tokens) {
+      const bare = token.replace(/[^a-z'’-]/gi, '').toLowerCase();
+      if (!bare) {
+        break;
+      }
+      if (LeadCaptureService.NAME_STOPWORDS.has(bare)) {
+        break;
+      }
+      kept.push(token);
+      if (kept.length === 3) {
+        break;
+      }
+    }
+
+    if (kept.length === 0) {
+      return null;
+    }
+    return kept.join(' ');
   }
 
   private looksLikeStandaloneName(value: string): boolean {
@@ -438,7 +541,15 @@ export class LeadCaptureService {
       return false;
     }
 
-    return words.every(word => /^[a-z][a-z'-]*$/i.test(word));
+    if (!words.every(word => /^[a-z][a-z'’-]*$/i.test(word))) {
+      return false;
+    }
+
+    // Reject if every word is a stopword (e.g. "hello", "thank you").
+    const allStopwords = words.every(word =>
+      LeadCaptureService.NAME_STOPWORDS.has(word.toLowerCase())
+    );
+    return !allStopwords;
   }
 
   private normalizeName(value: string): string | null {
@@ -476,7 +587,7 @@ export class LeadCaptureService {
 
   private extractAnnualRevenueAed(value: string): string | null {
     const hasRevenueHint =
-      /\b(revenue|turnover|annual sales|yearly sales|sales per year)\b/i.test(
+      /\b(revenue|turnover|annual sales|yearly sales|sales per year|profit|earnings|net income|makes?|making|earn(?:s|ing)?|bring(?:s|ing)? in|per year|a year|\/\s*year|annually|yearly|p\.?a\.?)\b/i.test(
         value
       );
     if (!hasRevenueHint) {
@@ -489,7 +600,7 @@ export class LeadCaptureService {
 
   private extractDesiredSellingPriceAed(value: string): string | null {
     const hasPriceHint =
-      /\b(asking price|sell(?:ing)? price|desired price|price range|expected price|selling for)\b/i.test(
+      /\b(asking price|sell(?:ing)? price|desired price|price range|expected price|selling for|sell for|asking|want(?:ing)? (?:for|to get)|valuation|valued at|priced at|price)\b/i.test(
         value
       );
     if (!hasPriceHint) {
@@ -501,6 +612,32 @@ export class LeadCaptureService {
   }
 
   private extractMoneyAmount(value: string): number | null {
+    // Word amounts: "half a million", "a/one million", "quarter million".
+    const wordMillion = value.match(
+      /\b(half|quarter|a|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:a\s+)?million\b/i
+    );
+    if (wordMillion?.[1]) {
+      const multipliers: Record<string, number> = {
+        half: 0.5,
+        quarter: 0.25,
+        a: 1,
+        one: 1,
+        two: 2,
+        three: 3,
+        four: 4,
+        five: 5,
+        six: 6,
+        seven: 7,
+        eight: 8,
+        nine: 9,
+        ten: 10,
+      };
+      const mult = multipliers[wordMillion[1].toLowerCase()];
+      if (mult) {
+        return Math.round(mult * 1_000_000);
+      }
+    }
+
     const millionMatch = value.match(/(\d+(?:\.\d+)?)\s*(m|mn|million)\b/i);
     if (millionMatch?.[1]) {
       const base = parseFloat(millionMatch[1]);

@@ -89,6 +89,39 @@ export enum ConnectionStatus {
 }
 
 /**
+ * Backend-agnostic messaging transport contract.
+ *
+ * The whole app depends on this interface, never on a concrete WhatsApp
+ * backend. Today it is implemented by the Baileys adapter (WhatsAppService);
+ * a WhatsApp Cloud API adapter (CloudApiTransport) implements the same contract
+ * so switching backends is a config change, not a rewrite.
+ */
+export interface MessagingTransport {
+  initialize(): Promise<void>;
+  sendMessage(chatId: string, message: string): Promise<boolean>;
+  onMessage(handler: (message: WhatsAppMessage) => void): void;
+  onConnectionStatusChange(handler: (status: ConnectionStatus) => void): void;
+  getConnectionStatus(): ConnectionStatus;
+  isConnected(): boolean;
+  disconnect(): Promise<void>;
+  getChatParticipants(chatId: string): Promise<string[]>;
+}
+
+export type MessagingTransportKind = 'baileys' | 'cloud';
+
+/**
+ * Configuration for the messaging transport layer. `cloud*` fields are only
+ * required when `kind === 'cloud'`.
+ */
+export interface MessagingConfig {
+  kind: MessagingTransportKind;
+  cloudPhoneNumberId: string;
+  cloudAccessToken: string;
+  cloudVerifyToken: string;
+  cloudApiVersion: string;
+}
+
+/**
  * Message processing result
  */
 export interface MessageProcessingResult {

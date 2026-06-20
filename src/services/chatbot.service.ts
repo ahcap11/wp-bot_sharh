@@ -1,4 +1,3 @@
-import { WhatsAppService } from './whatsapp.service';
 import { AIService } from './ai.service';
 import { ChatHistoryService } from './chat-history.service';
 import { WebSocketService } from './websocket.service';
@@ -11,6 +10,7 @@ import {
   MessageProcessingResult,
   ConnectionStatus,
   BotRole,
+  MessagingTransport,
 } from '../types';
 import { logger } from '../utils/logger';
 
@@ -20,7 +20,7 @@ const ROLES_PERSISTENCE_NAMESPACE = 'chatRoles';
  * Main Chatbot Service that orchestrates all components
  */
 export class ChatbotService {
-  private whatsappService: WhatsAppService;
+  private whatsappService: MessagingTransport;
   private aiService: AIService;
   private chatHistoryService: ChatHistoryService;
   private webSocketService: WebSocketService;
@@ -36,7 +36,7 @@ export class ChatbotService {
   private accessControl: AccessControlService | null;
 
   constructor(
-    whatsappService: WhatsAppService,
+    whatsappService: MessagingTransport,
     aiService: AIService,
     chatHistoryService: ChatHistoryService,
     webSocketService: WebSocketService,
@@ -445,8 +445,10 @@ export class ChatbotService {
 
     try {
       const update = this.leadCaptureService.updateFromMessage(chatId, message);
+      const scenario = this.leadCaptureService.getConversationContext(chatId);
+      const knownFacts = this.leadCaptureService.getKnownFactsBlock(chatId);
       const leadContext =
-        this.leadCaptureService.getConversationContext(chatId) ?? undefined;
+        [scenario, knownFacts].filter(Boolean).join('\n\n') || undefined;
 
       if (
         update.shouldPersist &&

@@ -6,13 +6,18 @@ import {
   proto,
 } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
-import { WhatsAppMessage, ConnectionStatus } from '../types';
+import {
+  WhatsAppMessage,
+  ConnectionStatus,
+  MessagingTransport,
+} from '../types';
 import { logger } from '../utils/logger';
 
 /**
- * WhatsApp Service for handling WhatsApp Web connection and messages
+ * WhatsApp transport backed by Baileys (WhatsApp Web).
+ * Implements the backend-agnostic MessagingTransport contract.
  */
-export class WhatsAppService {
+export class WhatsAppService implements MessagingTransport {
   private sock: WASocket | null = null;
   private connectionStatus: ConnectionStatus = ConnectionStatus.DISCONNECTED;
   private messageHandlers: Array<(message: WhatsAppMessage) => void> = [];
@@ -118,10 +123,37 @@ export class WhatsAppService {
       return false;
     }
 
+    // The model separates distinct chat bubbles with a line containing '---'.
+    // Send them as separate short messages with a typing indicator so the
+    // conversation reads like a human on WhatsApp instead of one wall of text.
+    const bubbles = message
+      .split(/\n?\s*---\s*\n?/g)
+      .map(part => part.trim())
+      .filter(Boolean);
+    const outgoing = bubbles.length > 0 ? bubbles : [message];
+
     try {
-      await this.sock.sendMessage(chatId, { text: message });
+      for (let i = 0; i < outgoing.length; i++) {
+        const text = outgoing[i] as string;
+        try {
+          await this.sock.sendPresenceUpdate('composing', chatId);
+        } catch {
+          // Presence is best-effort; never block sending on it.
+        }
+        await this.delay(Math.min(1200, 300 + text.length * 12));
+        await this.sock.sendMessage(chatId, { text });
+        if (i < outgoing.length - 1) {
+          await this.delay(400);
+        }
+      }
+      try {
+        await this.sock.sendPresenceUpdate('paused', chatId);
+      } catch {
+        // best-effort
+      }
       logger.info('Message sent successfully', {
         chatId,
+        bubbles: outgoing.length,
         messageLength: message.length,
       });
       return true;
@@ -132,6 +164,10 @@ export class WhatsAppService {
       });
       return false;
     }
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   /**

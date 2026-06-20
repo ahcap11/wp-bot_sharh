@@ -8,6 +8,7 @@ import {
   NeonSearchConfig,
   PersistenceConfig,
   AccessControlConfig,
+  MessagingConfig,
 } from '../types';
 
 // Load environment variables
@@ -97,6 +98,11 @@ const envSchema = Joi.object({
   RATE_LIMIT_ENABLED: booleanFlag().default(false),
   RATE_LIMIT_MAX_MESSAGES: Joi.number().integer().min(1).default(20),
   RATE_LIMIT_WINDOW_MS: Joi.number().integer().min(1000).default(60000),
+  WHATSAPP_TRANSPORT: Joi.string().valid('baileys', 'cloud').default('baileys'),
+  WHATSAPP_CLOUD_PHONE_NUMBER_ID: Joi.string().allow(''),
+  WHATSAPP_CLOUD_ACCESS_TOKEN: Joi.string().allow(''),
+  WHATSAPP_CLOUD_VERIFY_TOKEN: Joi.string().allow(''),
+  WHATSAPP_CLOUD_API_VERSION: Joi.string().default('v21.0'),
 }).unknown();
 
 /**
@@ -177,7 +183,7 @@ export const getAIServiceConfig = (): AIServiceConfig => {
     apiKey,
     model,
     maxTokens: parseInt(process.env['AI_MAX_TOKENS'] || '150', 10),
-    temperature: parseFloat(process.env['AI_TEMPERATURE'] || '0.7'),
+    temperature: parseFloat(process.env['AI_TEMPERATURE'] || '0.3'),
     systemPrompt: `You are a helpful WhatsApp AI assistant. You should:\n- Be friendly and conversational\n- Provide helpful and accurate responses\n- Keep responses concise but informative\n- Use appropriate emojis when suitable\n- Ask clarifying questions when needed\n- Maintain context from the conversation history`,
   };
 };
@@ -254,6 +260,24 @@ export const getAccessControlConfig = (): AccessControlConfig => {
       process.env['RATE_LIMIT_WINDOW_MS'] || '60000',
       10
     ),
+  };
+};
+
+/**
+ * Get messaging transport configuration (backend selection + Cloud API creds)
+ */
+export const getMessagingConfig = (): MessagingConfig => {
+  validateEnv();
+
+  const kind =
+    process.env['WHATSAPP_TRANSPORT'] === 'cloud' ? 'cloud' : 'baileys';
+
+  return {
+    kind,
+    cloudPhoneNumberId: process.env['WHATSAPP_CLOUD_PHONE_NUMBER_ID'] || '',
+    cloudAccessToken: process.env['WHATSAPP_CLOUD_ACCESS_TOKEN'] || '',
+    cloudVerifyToken: process.env['WHATSAPP_CLOUD_VERIFY_TOKEN'] || '',
+    cloudApiVersion: process.env['WHATSAPP_CLOUD_API_VERSION'] || 'v21.0',
   };
 };
 

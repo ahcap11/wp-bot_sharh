@@ -39,7 +39,7 @@ A sophisticated WhatsApp AI chatbot built with Node.js, TypeScript, and OpenAI o
 
 ### Prerequisites
 
-- Node.js 18+ 
+- Node.js 18++
 - npm or yarn
 - OpenAI or Gemini API key
 - WhatsApp account

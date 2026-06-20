@@ -23,7 +23,7 @@ describe('LeadCaptureService', () => {
     leadCaptureService = new LeadCaptureService();
   });
 
-  it('should capture required fields and mark lead as qualified', () => {
+  it('should qualify a buyer only once a sector of interest is known', () => {
     const firstUpdate = leadCaptureService.updateFromMessage(
       'chat-1',
       buildMessage('m1', 'My name is John Carter')
@@ -36,13 +36,22 @@ describe('LeadCaptureService', () => {
 
     const secondUpdate = leadCaptureService.updateFromMessage(
       'chat-1',
-      buildMessage('m2', 'I want to buy a business in Dubai')
+      buildMessage('m2', 'I want to buy a business')
     );
 
-    expect(secondUpdate.shouldPersist).toBe(true);
-    expect(secondUpdate.record?.status).toBe('qualified_lead');
-    expect(secondUpdate.record?.escalationReason).toBe('qualified_lead');
+    // Name + phone + purpose alone must NOT qualify a buyer anymore.
+    expect(secondUpdate.record?.status).toBe('collecting');
     expect(secondUpdate.record?.inquiryPurpose).toBe('buying');
+
+    const thirdUpdate = leadCaptureService.updateFromMessage(
+      'chat-1',
+      buildMessage('m3', 'Business type: restaurant')
+    );
+
+    expect(thirdUpdate.record?.businessType).toBeTruthy();
+    expect(thirdUpdate.record?.status).toBe('qualified_lead');
+    expect(thirdUpdate.record?.escalationReason).toBe('qualified_lead');
+    expect(thirdUpdate.record?.inquiryPurpose).toBe('buying');
   });
 
   it('should require selling-specific fields before qualifying a seller', () => {
