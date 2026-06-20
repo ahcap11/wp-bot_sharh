@@ -2,6 +2,8 @@ import {
   default as makeWASocket,
   DisconnectReason,
   useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  Browsers,
   WASocket,
   proto,
 } from '@whiskeysockets/baileys';
@@ -40,9 +42,32 @@ export class WhatsAppService implements MessagingTransport {
         process.env['WHATSAPP_AUTH_DIR'] || '.whatsapp-session';
       const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
+      // Use the current WhatsApp Web protocol version. A stale bundled version
+      // causes WhatsApp to reject the handshake with a 405 "Connection Failure"
+      // loop before any QR is issued. Fall back to the bundled version if the
+      // lookup fails.
+      let version: [number, number, number] | undefined;
+      try {
+        const latest = await fetchLatestBaileysVersion();
+        version = latest.version;
+        logger.info('Using WhatsApp Web version', {
+          version: latest.version,
+          isLatest: latest.isLatest,
+        });
+      } catch (versionError) {
+        logger.warn('Could not fetch latest WhatsApp Web version; using bundled', {
+          error:
+            versionError instanceof Error
+              ? versionError.message
+              : 'Unknown error',
+        });
+      }
+
       this.sock = makeWASocket({
+        ...(version ? { version } : {}),
         auth: state,
         printQRInTerminal: false,
+        browser: Browsers.ubuntu('Chrome'),
       });
 
       // Handle connection updates
@@ -69,6 +94,9 @@ export class WhatsAppService implements MessagingTransport {
 
           if (shouldReconnect) {
             this.updateConnectionStatus(ConnectionStatus.CONNECTING);
+            // Back off before reconnecting so we don't hammer WhatsApp, which
+            // can trigger 405 rate-limiting and a tight failure loop.
+            await this.delay(5000);
             await this.initialize();
           } else {
             this.updateConnectionStatus(ConnectionStatus.DISCONNECTED);
