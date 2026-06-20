@@ -33,12 +33,13 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=builder /app/dist ./dist
 
 # Persisted WhatsApp session and app state live here; mount volumes to keep
-# them across restarts/redeploys.
-RUN mkdir -p /app/.whatsapp-session /app/.state /app/logs \
-  && addgroup -S app && adduser -S app -G app \
-  && chown -R app:app /app
+# them across restarts/redeploys. /app/data is the mount point for the Railway
+# volume (WHATSAPP_AUTH_DIR + PERSISTENCE_PATH live under it).
+RUN mkdir -p /app/.whatsapp-session /app/.state /app/logs /app/data
 
-USER app
+# NOTE: We run as root. Railway mounts volumes owned by root, so a non-root
+# user cannot create directories inside the mount (EACCES). Running as root
+# avoids that. Railway containers are isolated, so this is acceptable here.
 
 EXPOSE 8080 3001
 
