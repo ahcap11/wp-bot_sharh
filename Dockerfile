@@ -43,8 +43,8 @@ USER app
 EXPOSE 8080 3001
 
 
-# Liveness check against the built-in health server.
+# Liveness check against the built-in health server (now on $PORT).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD wget -qO- "http://127.0.0.1:${HEALTH_PORT}/health" || exit 1
+  CMD wget -qO- "http://127.0.0.1:${PORT}/health" || exit 1
 
 CMD ["node", "dist/index.js"]
