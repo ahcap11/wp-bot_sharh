@@ -39,24 +39,41 @@ export class NeonReadService {
 
     try {
       const tableRef = this.toQualifiedIdentifier(this.config.tableName);
-      const columns = this.config.searchableColumns.filter(column =>
+      const matchColumns = this.config.searchableColumns.filter(column =>
         this.isSafeIdentifier(column)
       );
-      if (columns.length === 0) {
+      if (matchColumns.length === 0) {
         logger.warn(
           'Neon search disabled for request because no valid searchable columns are configured'
         );
         return [];
       }
 
-      const whereClause = columns
+      const publicColumns = this.config.publicColumns.filter(column =>
+        this.isSafeIdentifier(column)
+      );
+      if (publicColumns.length === 0) {
+        logger.warn(
+          'Neon search disabled for request because no valid public columns are configured'
+        );
+        return [];
+      }
+
+      const selectClause = publicColumns
+        .map(column => this.quoteIdentifier(column))
+        .join(', ');
+
+      const whereClause = matchColumns
         .map(
           column =>
             `${this.quoteIdentifier(column)}::text ILIKE '%' || $1 || '%'`
         )
         .join(' OR ');
 
-      const querySql = `SELECT * FROM ${tableRef} WHERE ${whereClause} LIMIT ${this.config.limit}`;
+      // Only ever return a single best match, and only the allowlisted public
+      // columns — internal fields are never selected, so they cannot leak into
+      // the model context.
+      const querySql = `SELECT ${selectClause} FROM ${tableRef} WHERE ${whereClause} LIMIT 1`;
       await this.ensureConnected();
       const result = await this.client.query(querySql, [cleanQuery]);
       return result.rows as SearchResultRow[];

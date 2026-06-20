@@ -9,6 +9,7 @@ import {
   PersistenceConfig,
   AccessControlConfig,
   MessagingConfig,
+  HandoffConfig,
 } from '../types';
 
 // Load environment variables
@@ -95,7 +96,7 @@ const envSchema = Joi.object({
   PERSISTENCE_PATH: Joi.string().default('./.state/state.json'),
   ALLOWLIST_ENABLED: booleanFlag().default(false),
   ALLOWED_NUMBERS: Joi.string().allow(''),
-  RATE_LIMIT_ENABLED: booleanFlag().default(false),
+  RATE_LIMIT_ENABLED: booleanFlag().default(true),
   RATE_LIMIT_MAX_MESSAGES: Joi.number().integer().min(1).default(20),
   RATE_LIMIT_WINDOW_MS: Joi.number().integer().min(1000).default(60000),
   WHATSAPP_TRANSPORT: Joi.string().valid('baileys', 'cloud').default('baileys'),
@@ -103,6 +104,12 @@ const envSchema = Joi.object({
   WHATSAPP_CLOUD_ACCESS_TOKEN: Joi.string().allow(''),
   WHATSAPP_CLOUD_VERIFY_TOKEN: Joi.string().allow(''),
   WHATSAPP_CLOUD_API_VERSION: Joi.string().default('v21.0'),
+  WHATSAPP_AUTH_DIR: Joi.string().default('./auth_info_baileys'),
+  NEON_PUBLIC_COLUMNS: Joi.string().allow(''),
+  HANDOFF_WHATSAPP_JIDS: Joi.string().allow(''),
+  ROLE_SWITCH_ENABLED: booleanFlag().default(false),
+  OPERATOR_JIDS: Joi.string().allow(''),
+  IGNORE_GROUPS: booleanFlag().default(true),
 }).unknown();
 
 /**
@@ -216,11 +223,21 @@ export const getNeonSearchConfig = (): NeonSearchConfig => {
     .map(column => column.trim())
     .filter(Boolean);
 
+  // Columns the bot is allowed to reveal to a client. Defaults to the
+  // searchable columns so nothing internal is exposed unless explicitly listed.
+  const publicColumns = (
+    process.env['NEON_PUBLIC_COLUMNS'] || searchableColumns.join(',')
+  )
+    .split(',')
+    .map(column => column.trim())
+    .filter(Boolean);
+
   return {
     enabled: parseBoolean(process.env['NEON_SEARCH_ENABLED'], false),
     databaseUrl: process.env['NEON_READONLY_DATABASE_URL'] || undefined,
     tableName: process.env['NEON_SEARCH_TABLE_NAME'] || 'business_listings',
     searchableColumns,
+    publicColumns,
     limit: parseInt(process.env['NEON_SEARCH_LIMIT'] || '5', 10),
   };
 };
@@ -251,7 +268,7 @@ export const getAccessControlConfig = (): AccessControlConfig => {
   return {
     allowlistEnabled: parseBoolean(process.env['ALLOWLIST_ENABLED'], false),
     allowedNumbers,
-    rateLimitEnabled: parseBoolean(process.env['RATE_LIMIT_ENABLED'], false),
+    rateLimitEnabled: parseBoolean(process.env['RATE_LIMIT_ENABLED'], true),
     rateLimitMaxMessages: parseInt(
       process.env['RATE_LIMIT_MAX_MESSAGES'] || '20',
       10
@@ -279,6 +296,20 @@ export const getMessagingConfig = (): MessagingConfig => {
     cloudVerifyToken: process.env['WHATSAPP_CLOUD_VERIFY_TOKEN'] || '',
     cloudApiVersion: process.env['WHATSAPP_CLOUD_API_VERSION'] || 'v21.0',
   };
+};
+
+/**
+ * Get manager handoff configuration (WhatsApp ids notified on qualify/escalate)
+ */
+export const getHandoffConfig = (): HandoffConfig => {
+  validateEnv();
+
+  const jids = (process.env['HANDOFF_WHATSAPP_JIDS'] || '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
+
+  return { jids };
 };
 
 /**

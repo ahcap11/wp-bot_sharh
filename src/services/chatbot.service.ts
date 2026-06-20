@@ -5,6 +5,7 @@ import { GoogleSheetsService } from './google-sheets.service';
 import { LeadCaptureService } from './lead-capture.service';
 import { PersistenceService } from './persistence.service';
 import { AccessControlService } from './access-control.service';
+import { HandoffService } from './handoff.service';
 import {
   WhatsAppMessage,
   MessageProcessingResult,
@@ -34,6 +35,10 @@ export class ChatbotService {
   private leadCaptureService: LeadCaptureService | null;
   private persistence: PersistenceService | null;
   private accessControl: AccessControlService | null;
+  private handoffService: HandoffService;
+  private readonly ignoreGroups: boolean;
+  private readonly roleSwitchEnabled: boolean;
+  private readonly operatorJids: Set<string>;
 
   constructor(
     whatsappService: MessagingTransport,
@@ -55,6 +60,25 @@ export class ChatbotService {
     this.leadCaptureService = leadCaptureService;
     this.persistence = persistence;
     this.accessControl = accessControl;
+
+    this.ignoreGroups = process.env['IGNORE_GROUPS'] !== 'false';
+    this.roleSwitchEnabled = process.env['ROLE_SWITCH_ENABLED'] === 'true';
+    this.operatorJids = new Set(
+      (process.env['OPERATOR_JIDS'] || '')
+        .split(',')
+        .map(value => value.trim())
+        .filter(Boolean)
+    );
+    this.handoffService = new HandoffService(
+      whatsappService,
+      {
+        jids: (process.env['HANDOFF_WHATSAPP_JIDS'] || '')
+          .split(',')
+          .map(value => value.trim())
+          .filter(Boolean),
+      },
+      persistence
+    );
 
     this.hydrateRoles();
     this.setupEventHandlers();
@@ -137,6 +161,19 @@ export class ChatbotService {
    * Queue incoming messages by chat, allowing multiple chats in parallel
    */
   private enqueueMessageProcessing(message: WhatsAppMessage): void {
+    const from = message.from || '';
+    const isBroadcastOrChannel =
+      from.endsWith('@broadcast') ||
+      from === 'status@broadcast' ||
+      from.endsWith('@newsletter');
+    if (isBroadcastOrChannel || (this.ignoreGroups && message.isGroup)) {
+      logger.debug('Ignoring non-direct message', {
+        from,
+        isGroup: message.isGroup,
+      });
+      return;
+    }
+
     if (this.accessControl) {
       const verdict = this.accessControl.evaluate(message.from);
       if (!verdict.allowed) {
@@ -198,7 +235,7 @@ export class ChatbotService {
       logger.info('Processing incoming message', {
         from: incomingMessage.from,
         chatId,
-        content: incomingMessage.content.substring(0, 50),
+        length: incomingMessage.content.length,
       });
 
       // Notify WebSocket clients
@@ -373,8 +410,15 @@ export class ChatbotService {
    * Resolve active role for a chat and apply message-based switches
    */
   private resolveChatRole(chatId: string, messageContent: string): BotRole {
-    const requestedRole = this.detectRequestedRole(messageContent);
     const currentRole = this.chatRoles.get(chatId) || this.defaultRole;
+
+    // Client-triggered role switching is OFF by default. It is honored only when
+    // explicitly enabled, or when the chat belongs to a configured operator.
+    const switchingAllowed =
+      this.roleSwitchEnabled || this.operatorJids.has(chatId);
+    const requestedRole = switchingAllowed
+      ? this.detectRequestedRole(messageContent)
+      : null;
 
     if (requestedRole && requestedRole !== currentRole) {
       this.chatRoles.set(chatId, requestedRole);
@@ -449,6 +493,17 @@ export class ChatbotService {
       const knownFacts = this.leadCaptureService.getKnownFactsBlock(chatId);
       const leadContext =
         [scenario, knownFacts].filter(Boolean).join('\n\n') || undefined;
+
+      if (update.record) {
+        void this.handoffService
+          .notify(chatId, update.record)
+          .catch(error => {
+            logger.error('Handoff notification failed', {
+              chatId,
+              error: error instanceof Error ? error.message : 'Unknown error',
+            });
+          });
+      }
 
       if (
         update.shouldPersist &&

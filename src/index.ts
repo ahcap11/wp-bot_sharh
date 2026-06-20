@@ -45,7 +45,7 @@ class WhatsAppAIChatbot {
       const neonSearchConfig = getNeonSearchConfig();
       const persistenceConfig = getPersistenceConfig();
       const accessControlConfig = getAccessControlConfig();
-      this.webSocketPort = appConfig.port;
+      this.webSocketPort = appConfig.healthPort;
 
       // Apply configured log level to the shared logger.
       logger.level = appConfig.logLevel;
@@ -82,7 +82,7 @@ class WhatsAppAIChatbot {
         this.persistenceService
       );
       const webSocketService = new WebSocketService(
-        appConfig.port,
+        appConfig.healthPort,
         appConfig.wsAuthToken
       );
       const googleSheetsService = new GoogleSheetsService(googleSheetsConfig);
@@ -105,8 +105,9 @@ class WhatsAppAIChatbot {
 
       await this.chatbotService.initialize();
 
-      // Start HTTP health/readiness probes for deployment platforms.
-      this.healthService = new HealthService(appConfig.healthPort, () =>
+      // Start HTTP health/readiness probes on the platform-exposed port so
+      // Railway health checks reach them.
+      this.healthService = new HealthService(appConfig.port, () =>
         this.chatbotService ? this.chatbotService.getStatus() : null
       );
       this.healthService.start();

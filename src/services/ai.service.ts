@@ -448,7 +448,7 @@ export class AIService {
         leadContext
       );
       const prompt = `${this.buildSystemPrompt(role)}\n${context}\nUser: ${userContent}\nBot:`;
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.config.model}:generateContent?key=${this.config.apiKey}`;
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.config.model}:generateContent`;
       const body = {
         contents: [
           {
@@ -462,7 +462,10 @@ export class AIService {
       };
       const response = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': this.config.apiKey,
+        },
         body: JSON.stringify(body),
       });
       if (!response.ok) {
@@ -652,15 +655,25 @@ export class AIService {
       return '';
     }
 
-    const limitedRows = rows.slice(0, 3);
-    const serializedRows = limitedRows
-      .map((row, index) => `Result ${index + 1}: ${JSON.stringify(row)}`)
+    const row = rows[0] as Record<string, unknown>;
+    const fields = Object.entries(row)
+      .filter(([, value]) => value !== null && value !== undefined && value !== '')
+      .map(([key, value]) => `- ${key}: ${String(value)}`)
       .join('\n');
 
-    logger.info('Attached Neon sales lookup context', {
-      resultCount: rows.length,
-    });
-    return serializedRows;
+    if (!fields) {
+      return '';
+    }
+
+    logger.info('Attached Neon sales lookup context', { resultCount: 1 });
+
+    return [
+      'MATCHED LISTING (the only listing you may discuss in this reply).',
+      'Use ONLY the fields below. Do not invent or infer any other detail',
+      '(price, owner, location, financials). If the client asks for anything',
+      'not listed here, say a manager will share the details.',
+      fields,
+    ].join('\n');
   }
 
   /**

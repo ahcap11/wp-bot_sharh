@@ -162,7 +162,16 @@ export interface NeonSearchConfig {
   databaseUrl?: string | undefined;
   tableName: string;
   searchableColumns: string[];
+  publicColumns: string[];
   limit: number;
+}
+
+/**
+ * Manager handoff configuration. `jids` are the WhatsApp ids that receive lead
+ * notifications. When empty, handoff notifications are disabled (logged only).
+ */
+export interface HandoffConfig {
+  jids: string[];
 }
 
 /**

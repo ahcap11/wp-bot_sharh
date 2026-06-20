@@ -106,7 +106,7 @@ describe('ChatbotService', () => {
       expect(mockWhatsAppService.sendMessage).toHaveBeenCalledTimes(2);
     });
 
-    it('should send group replies back to the group chat id', async () => {
+    it('should ignore group messages by default (IGNORE_GROUPS)', async () => {
       const messageHandler = (mockWhatsAppService.onMessage as jest.Mock).mock
         .calls[0][0] as (message: WhatsAppMessage) => void;
 
@@ -124,10 +124,9 @@ describe('ChatbotService', () => {
       messageHandler(groupMessage);
       await flushAsyncWork();
 
-      expect(mockWhatsAppService.sendMessage).toHaveBeenCalledWith(
-        'group-123@g.us',
-        'Mock AI response'
-      );
+      // Group/broadcast traffic is dropped at intake: no AI call, no reply.
+      expect(mockAIService.generateResponse).not.toHaveBeenCalled();
+      expect(mockWhatsAppService.sendMessage).not.toHaveBeenCalled();
     });
 
     it('should switch to sales role when requested in message text', async () => {

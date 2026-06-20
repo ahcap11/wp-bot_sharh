@@ -35,8 +35,9 @@ export class WhatsAppService implements MessagingTransport {
       logger.info('Initializing WhatsApp connection...');
       this.updateConnectionStatus(ConnectionStatus.CONNECTING);
 
-      const { state, saveCreds } =
-        await useMultiFileAuthState('.whatsapp-session');
+      const authDir =
+        process.env['WHATSAPP_AUTH_DIR'] || '.whatsapp-session';
+      const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
       this.sock = makeWASocket({
         auth: state,
@@ -86,7 +87,8 @@ export class WhatsAppService implements MessagingTransport {
           if (whatsappMessage) {
             logger.info('Message received', {
               from: whatsappMessage.from,
-              content: whatsappMessage.content.substring(0, 50),
+              type: whatsappMessage.type,
+              length: whatsappMessage.content.length,
             });
 
             // Notify all message handlers

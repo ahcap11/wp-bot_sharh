@@ -22,6 +22,7 @@ const baseConfig = (
   databaseUrl: 'postgresql://user:pass@host/db',
   tableName: 'asset_sales',
   searchableColumns: ['title', 'description'],
+  publicColumns: ['title', 'description'],
   limit: 5,
   ...overrides,
 });
@@ -62,10 +63,13 @@ describe('NeonReadService', () => {
       expect(mockConnect).toHaveBeenCalledTimes(1);
 
       const [sql, params] = mockQuery.mock.calls[0];
-      expect(sql).toMatch(/^SELECT \* FROM "asset_sales" WHERE/);
+      expect(sql).toMatch(
+        /^SELECT "title", "description" FROM "asset_sales" WHERE/
+      );
+      expect(sql).not.toContain('SELECT *');
       expect(sql).toContain('ILIKE');
       expect(sql).toContain('$1');
-      expect(sql).toContain('LIMIT 5');
+      expect(sql).toContain('LIMIT 1');
       expect(params).toEqual(['vegan']);
     });
 
