@@ -22,6 +22,7 @@ export class WhatsAppService implements MessagingTransport {
   private connectionStatus: ConnectionStatus = ConnectionStatus.DISCONNECTED;
   private messageHandlers: Array<(message: WhatsAppMessage) => void> = [];
   private statusHandlers: Array<(status: ConnectionStatus) => void> = [];
+  private currentQr: string | null = null;
 
   constructor() {
     logger.info('WhatsApp Service initialized');
@@ -49,7 +50,10 @@ export class WhatsAppService implements MessagingTransport {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-          logger.info('QR Code received, please scan with WhatsApp');
+          this.currentQr = qr;
+          logger.info(
+            'QR Code received — open /qr on the health port to scan, or use the log QR below'
+          );
           qrcode.generate(qr, { small: true });
         }
 
@@ -70,6 +74,7 @@ export class WhatsAppService implements MessagingTransport {
             this.updateConnectionStatus(ConnectionStatus.DISCONNECTED);
           }
         } else if (connection === 'open') {
+          this.currentQr = null;
           logger.info('WhatsApp connection established');
           this.updateConnectionStatus(ConnectionStatus.READY);
         }
@@ -281,6 +286,11 @@ export class WhatsAppService implements MessagingTransport {
    */
   getConnectionStatus(): ConnectionStatus {
     return this.connectionStatus;
+  }
+
+  /** Latest pending QR string (null once linked or before one is issued). */
+  getCurrentQr(): string | null {
+    return this.currentQr;
   }
 
   /**

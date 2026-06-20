@@ -105,6 +105,8 @@ export interface MessagingTransport {
   isConnected(): boolean;
   disconnect(): Promise<void>;
   getChatParticipants(chatId: string): Promise<string[]>;
+  /** Latest pending QR (Baileys only); null when not applicable or linked. */
+  getCurrentQr?(): string | null;
 }
 
 export type MessagingTransportKind = 'baileys' | 'cloud';

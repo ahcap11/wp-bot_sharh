@@ -107,8 +107,10 @@ class WhatsAppAIChatbot {
 
       // Start HTTP health/readiness probes on the platform-exposed port so
       // Railway health checks reach them.
-      this.healthService = new HealthService(appConfig.port, () =>
-        this.chatbotService ? this.chatbotService.getStatus() : null
+      this.healthService = new HealthService(
+        appConfig.port,
+        () => (this.chatbotService ? this.chatbotService.getStatus() : null),
+        () => whatsappService.getCurrentQr?.() ?? null
       );
       this.healthService.start();
 
