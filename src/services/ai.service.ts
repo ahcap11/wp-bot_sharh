@@ -7,6 +7,13 @@ import {
 import { logger } from '../utils/logger';
 import type { ListingSearchProvider } from './listing-search.service';
 import type { SalesPlaybookService } from './sales-playbook.service';
+import type {
+  SalesMessageInterpretation,
+  SalesMessageInterpretationInput,
+  SalesMessageClassification,
+  SalesQuestionType,
+} from './sales-message-intelligence.types';
+import type { LeadField, ConversationLanguage } from './lead-capture.service';
 
 // Only import OpenAI if needed (optional dependency loaded lazily).
 let OpenAI: any;
@@ -38,6 +45,10 @@ COMMUNICATION
 - Mirror the client's language; default to English when unclear.
 - Write short professional WhatsApp messages without emoji or artificial urgency.
 - Acknowledge the client's concern, answer only with approved facts, then continue with the application-provided next step.
+- If the client asks a relevant question during qualification, answer it first, then ask the next required field naturally in the same reply.
+- Never copy the previous bot question word-for-word. Rephrase it based on the conversation.
+- If the client gives several answers in one message, acknowledge them together and do not ask for any captured field again.
+- If the client is unclear, ask one focused clarification with an example; after repeated uncertainty, allow “unknown” and continue.
 - Registration is optional at the end of the funnel and must not block initial qualification.
 - Do not promise a fixed sale time, buyer, valuation, or outcome.
 `.trim();
@@ -183,6 +194,200 @@ export class AIService {
   }
 
   /**
+   * Interpret a sales message into strict structured data before the funnel
+   * mutates state. The model may identify intent and values, but application
+   * validators remain authoritative and may reject every extracted field.
+   */
+  async interpretSalesMessage(
+    input: SalesMessageInterpretationInput
+  ): Promise<SalesMessageInterpretation | null> {
+    const allowedFields = [
+      'inquiry_purpose',
+      'client_name',
+      'seller_terms',
+      'business_type',
+      'business_location',
+      'annual_revenue_aed',
+      'lease_details',
+      'desired_selling_price_aed',
+      'year_established',
+      'employee_count',
+      'monthly_operating_expenses_aed',
+      'monthly_net_profit_aed',
+      'liabilities',
+      'contracts_licenses',
+      'sale_reason_urgency',
+      'included_assets',
+      'buyer_budget_aed',
+      'buyer_location',
+      'buyer_timeline',
+      'buyer_involvement',
+      'buyer_funding_status',
+      'buyer_additional_comments',
+    ] as LeadField[];
+
+    const system = [
+      'You are a strict multilingual data interpreter for a UAE business-sales funnel.',
+      'Return one JSON object only. No markdown and no explanation outside JSON.',
+      'Never invent, estimate, or repair a value the user did not provide.',
+      'Distinguish an answer from a question, objection, correction, unknown answer, off-topic text, abusive text, and nonsense.',
+      'Extract every explicit field in one message, not only the expected field.',
+      'For money, normalize only clear values to strings such as AED 150,000 or AED 1,000,000–1,500,000.',
+      'Words such as bazillion/bazilion, banana, asdf, random jokes, or unrelated text are not financial answers.',
+      'A correction means the user explicitly changes a previously supplied fact, for example “actually revenue is 250k”.',
+      'When the user says they do not know, put that field in unknown_fields and do not fabricate a value.',
+      `Allowed fields: ${allowedFields.join(', ')}`,
+      'Required JSON shape:',
+      '{"classification":"valid_answer|multiple_answers|question|objection|correction|unknown|off_topic|nonsense|abusive","confidence":0.0,"language":"en|ru|ar","fields":{},"corrections":[],"unknown_fields":[],"question_type":"none|price_guidance|valuation|commission|confidentiality|process|listing|documents|other","reason":"short reason"}',
+    ].join('\n');
+
+    const user = [
+      `EXPECTED FIELD: ${input.expectedField || 'none'}`,
+      `CURRENT LANGUAGE: ${input.language}`,
+      `KNOWN FACTS:\n${input.knownFacts || 'none'}`,
+      `RECENT CHAT:\n${input.recentHistory.slice(-6).join('\n') || 'none'}`,
+      `USER MESSAGE:\n${input.message}`,
+    ].join('\n\n');
+
+    try {
+      let raw = '';
+      if (this.config.provider === 'openai') {
+        const completion = await this.createChatCompletion(
+          [
+            { role: 'system', content: system },
+            { role: 'user', content: user },
+          ],
+          Math.max(350, this.config.maxTokens),
+          0
+        );
+        raw = completion.choices[0]?.message?.content || '';
+      } else {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.config.model}:generateContent`;
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': this.config.apiKey,
+          },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: `${system}\n\n${user}` }] }],
+            generationConfig: {
+              temperature: 0,
+              maxOutputTokens: Math.max(350, this.config.maxTokens),
+              responseMimeType: 'application/json',
+            },
+          }),
+        });
+        if (!response.ok) {
+          throw new Error(`Gemini interpretation error: ${response.status}`);
+        }
+        const data: any = await response.json();
+        raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      }
+
+      const parsed = this.parseInterpretationJson(raw);
+      return this.sanitizeSalesInterpretation(parsed, input.language, allowedFields);
+    } catch (error) {
+      logger.warn('Sales message interpretation failed; deterministic fallback will be used', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+      return null;
+    }
+  }
+
+  private parseInterpretationJson(raw: string): Record<string, unknown> {
+    const cleaned = raw
+      .trim()
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/i, '');
+    const first = cleaned.indexOf('{');
+    const last = cleaned.lastIndexOf('}');
+    if (first < 0 || last <= first) {
+      throw new Error('Interpreter did not return JSON');
+    }
+    return JSON.parse(cleaned.slice(first, last + 1)) as Record<string, unknown>;
+  }
+
+  private sanitizeSalesInterpretation(
+    value: Record<string, unknown>,
+    fallbackLanguage: ConversationLanguage,
+    allowedFields: LeadField[]
+  ): SalesMessageInterpretation {
+    const classifications: SalesMessageClassification[] = [
+      'valid_answer',
+      'multiple_answers',
+      'question',
+      'objection',
+      'correction',
+      'unknown',
+      'off_topic',
+      'nonsense',
+      'abusive',
+    ];
+    const questionTypes: SalesQuestionType[] = [
+      'none',
+      'price_guidance',
+      'valuation',
+      'commission',
+      'confidentiality',
+      'process',
+      'listing',
+      'documents',
+      'other',
+    ];
+    const classification = classifications.includes(
+      value['classification'] as SalesMessageClassification
+    )
+      ? (value['classification'] as SalesMessageClassification)
+      : 'nonsense';
+    const language = ['en', 'ru', 'ar'].includes(String(value['language']))
+      ? (String(value['language']) as ConversationLanguage)
+      : fallbackLanguage;
+    const numericConfidence = Number(value['confidence']);
+    const confidence = Number.isFinite(numericConfidence)
+      ? Math.max(0, Math.min(1, numericConfidence))
+      : 0.5;
+    const rawFields =
+      value['fields'] && typeof value['fields'] === 'object'
+        ? (value['fields'] as Record<string, unknown>)
+        : {};
+    const fields: Partial<Record<LeadField, string>> = {};
+    for (const field of allowedFields) {
+      const rawField = rawFields[field];
+      if (typeof rawField === 'string' && rawField.trim()) {
+        fields[field] = rawField.trim().slice(0, 1000);
+      }
+    }
+    const toFields = (rawValue: unknown): LeadField[] =>
+      Array.isArray(rawValue)
+        ? rawValue
+            .map(item => String(item))
+            .filter((item): item is LeadField =>
+              allowedFields.includes(item as LeadField)
+            )
+        : [];
+    const questionType = questionTypes.includes(
+      value['question_type'] as SalesQuestionType
+    )
+      ? (value['question_type'] as SalesQuestionType)
+      : 'none';
+
+    return {
+      classification,
+      confidence,
+      language,
+      fields,
+      corrections: toFields(value['corrections']),
+      unknownFields: toFields(value['unknown_fields']),
+      questionType,
+      reason:
+        typeof value['reason'] === 'string'
+          ? value['reason'].trim().slice(0, 300)
+          : '',
+    };
+  }
+
+  /**
    * Generate AI response based on chat history
    */
   async generateResponse(
@@ -274,22 +479,24 @@ export class AIService {
    * most modern shape first and fall back only on HTTP 400 errors.
    */
   private async createChatCompletion(
-    messages: Array<{ role: string; content: string }>
+    messages: Array<{ role: string; content: string }>,
+    maxTokens: number = this.config.maxTokens,
+    temperature: number | undefined = this.config.temperature
   ): Promise<any> {
     const base = { model: this.config.model, messages };
     const attempts: Array<Record<string, unknown>> = [
       {
         ...base,
-        max_completion_tokens: this.config.maxTokens,
-        temperature: this.config.temperature,
+        max_completion_tokens: maxTokens,
+        ...(temperature === undefined ? {} : { temperature }),
       },
-      { ...base, max_completion_tokens: this.config.maxTokens },
+      { ...base, max_completion_tokens: maxTokens },
       {
         ...base,
-        max_tokens: this.config.maxTokens,
-        temperature: this.config.temperature,
+        max_tokens: maxTokens,
+        ...(temperature === undefined ? {} : { temperature }),
       },
-      { ...base, max_tokens: this.config.maxTokens },
+      { ...base, max_tokens: maxTokens },
     ];
 
     let lastError: unknown;

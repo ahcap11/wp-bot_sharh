@@ -3,9 +3,13 @@ import { PersistenceService } from './persistence.service';
 import { SalesPlaybookService, ObjectionTopic } from './sales-playbook.service';
 import { LeadScoringService } from './lead-scoring.service';
 import { ConversationSummaryService } from './conversation-summary.service';
+import type {
+  SalesMessageInterpretation,
+  SalesMessageClassification,
+} from './sales-message-intelligence.types';
 
 const PERSISTENCE_NAMESPACE = 'leadStates';
-const STATE_VERSION = 6;
+const STATE_VERSION = 8;
 const MAX_PROCESSED_MESSAGE_IDS = 500;
 
 export type LeadInquiryPurpose = 'buying' | 'selling';
@@ -113,6 +117,7 @@ export interface FunnelDirective {
   markOnSend?: 'question_sent' | 'terms_presented' | undefined;
   markReviewNoticeOnSend?: boolean | undefined;
   markQualificationNoticeOnSend?: boolean | undefined;
+  markInputIssueHandledOnSend?: boolean | undefined;
 }
 
 interface LeadCaptureState {
@@ -156,6 +161,16 @@ interface LeadCaptureState {
   expectedField?: LeadField | undefined;
   pendingObjection?: ObjectionTopic | undefined;
   objectionsDetected: ObjectionTopic[];
+  suggestedSellingPriceAed?: string | undefined;
+  lastPromptField?: LeadField | undefined;
+  promptRepeatCount: number;
+  invalidAttempts: Partial<Record<LeadField, number>>;
+  lastInputClassification?: SalesMessageClassification | undefined;
+  lastInputIssue?: string | undefined;
+  pendingConfirmation?:
+    | { field: LeadField; value: string; reason: string }
+    | undefined;
+  priceGuidanceCount: number;
   messageCount: number;
   processedMessageIds: Set<string>;
 }
@@ -303,6 +318,12 @@ export class LeadCaptureService {
           Boolean(serialized.reviewNoticeSent && restoredStatus === 'qualified') ||
           false,
         objectionsDetected: serialized.objectionsDetected || [],
+        promptRepeatCount: serialized.promptRepeatCount || 0,
+        invalidAttempts: serialized.invalidAttempts || {},
+        lastInputClassification: serialized.lastInputClassification,
+        lastInputIssue: serialized.lastInputIssue,
+        pendingConfirmation: serialized.pendingConfirmation,
+        priceGuidanceCount: serialized.priceGuidanceCount || 0,
         processedMessageIds: new Set(serialized.processedMessageIds || []),
       };
       this.leadStates.set(chatId, restored);
@@ -353,7 +374,8 @@ export class LeadCaptureService {
 
   updateFromMessage(
     chatId: string,
-    message: WhatsAppMessage
+    message: WhatsAppMessage,
+    interpretation: SalesMessageInterpretation | null = null
   ): LeadCaptureUpdate {
     const state = this.leadStates.get(chatId) ?? this.createInitialState();
 
@@ -363,6 +385,7 @@ export class LeadCaptureService {
 
     const previousStatus = state.status;
     const previousStage = state.stage;
+    const expectedBefore = state.expectedField;
 
     state.processedMessageIds.add(message.id);
     this.trimProcessedMessageIds(state);
@@ -373,11 +396,17 @@ export class LeadCaptureService {
     const fieldsUpdated: string[] = [];
     const normalizedContent = this.normalizeWhitespace(message.content);
 
-    const detectedLanguage = this.detectLanguage(
-      normalizedContent,
-      state.language,
-      state.messageCount === 1
-    );
+    const interpretedLanguage =
+      interpretation && interpretation.confidence >= 0.65
+        ? interpretation.language
+        : null;
+    const detectedLanguage =
+      interpretedLanguage ||
+      this.detectLanguage(
+        normalizedContent,
+        state.language,
+        state.messageCount === 1
+      );
     if (detectedLanguage !== state.language) {
       state.language = detectedLanguage;
       fieldsUpdated.push('language');
@@ -393,9 +422,12 @@ export class LeadCaptureService {
       fieldsUpdated.push('client_phone');
     }
 
-    // Objections are handled as objections, not accidentally stored as the
-    // answer to the current qualification question. Explicit structured values
-    // can still be extracted from a mixed answer below.
+    const confirmationHandled = this.applyPendingConfirmation(
+      state,
+      normalizedContent,
+      fieldsUpdated
+    );
+
     const objection = this.playbook.detectObjection(normalizedContent);
     if (objection) {
       state.pendingObjection = objection;
@@ -403,12 +435,108 @@ export class LeadCaptureService {
         state.objectionsDetected.push(objection);
         fieldsUpdated.push('objection_detected');
       }
-    } else {
-      // The answer to the application-owned current question has priority over
-      // broad pattern matching, which preserves details such as district names.
+    }
+
+    let intelligenceAccepted = 0;
+    if (interpretation && interpretation.confidence >= 0.5) {
+      state.lastInputClassification = interpretation.classification;
+      intelligenceAccepted = this.applyIntelligentInterpretation(
+        state,
+        interpretation,
+        fieldsUpdated
+      );
+    }
+
+    const blocksDeterministicAnswer = Boolean(
+      interpretation &&
+        interpretation.confidence >= 0.65 &&
+        ['question', 'off_topic', 'nonsense', 'abusive'].includes(
+          interpretation.classification
+        ) &&
+        intelligenceAccepted === 0
+    );
+
+    const interpretationMentionedExpected = Boolean(
+      expectedBefore &&
+        interpretation &&
+        (Object.prototype.hasOwnProperty.call(
+          interpretation.fields,
+          expectedBefore
+        ) || interpretation.unknownFields.includes(expectedBefore))
+    );
+    const interpretationProvidedOtherFields = Boolean(
+      interpretation &&
+        (Object.keys(interpretation.fields).length > 0 ||
+          interpretation.unknownFields.length > 0) &&
+        !interpretationMentionedExpected
+    );
+
+    if (
+      !confirmationHandled &&
+      !objection &&
+      !blocksDeterministicAnswer &&
+      !state.pendingConfirmation &&
+      !(
+        interpretation &&
+        interpretation.confidence >= 0.65 &&
+        interpretationProvidedOtherFields
+      )
+    ) {
+      // The current application-owned question has priority. If the AI
+      // interpreter already populated it, this is a no-op. When the user is
+      // explicitly correcting another field, do not reinterpret the same
+      // number as an answer to the currently expected field.
       this.applyExpectedField(state, normalizedContent, fieldsUpdated);
     }
-    this.applyExplicitExtractions(state, normalizedContent, fieldsUpdated);
+
+    const interpretationProvidedValidatedFields = Boolean(
+      interpretation &&
+        interpretation.confidence >= 0.65 &&
+        (Object.keys(interpretation.fields).length > 0 ||
+          interpretation.unknownFields.length > 0)
+    );
+    if (
+      !blocksDeterministicAnswer &&
+      !state.pendingConfirmation &&
+      !interpretationProvidedValidatedFields
+    ) {
+      // Deterministic extraction is a fallback when structured interpretation
+      // is unavailable. It is deliberately skipped for high-confidence
+      // multi-value messages because one unlabelled number must never be copied
+      // into several financial fields.
+      this.applyExplicitExtractions(state, normalizedContent, fieldsUpdated);
+    }
+
+    const expectedStillMissing = Boolean(
+      expectedBefore && !this.hasValue(state[FIELD_TO_STATE_KEY[expectedBefore]])
+    );
+    if (
+      expectedBefore &&
+      expectedStillMissing &&
+      !confirmationHandled &&
+      !objection &&
+      !this.looksLikeQuestion(normalizedContent) &&
+      !this.isExplicitUnknown(normalizedContent)
+    ) {
+      const classification = interpretation?.classification;
+      if (
+        !classification ||
+        ['valid_answer', 'multiple_answers', 'correction', 'nonsense', 'off_topic', 'abusive'].includes(
+          classification
+        )
+      ) {
+        this.registerInvalidAttempt(
+          state,
+          expectedBefore,
+          interpretation?.reason || 'The answer could not be validated.'
+        );
+      }
+    } else if (
+      expectedBefore &&
+      this.hasValue(state[FIELD_TO_STATE_KEY[expectedBefore]])
+    ) {
+      state.lastInputIssue = undefined;
+    }
 
     const reviewReason = this.detectEarlyEscalationReason(normalizedContent);
     if (reviewReason) {
@@ -429,7 +557,9 @@ export class LeadCaptureService {
       fieldsUpdated.length > 0 ||
       statusChanged ||
       stageChanged ||
-      state.messageCount === 1;
+      state.messageCount === 1 ||
+      Boolean(state.lastInputIssue) ||
+      Boolean(state.pendingConfirmation);
 
     if (!shouldPersist) {
       return { shouldPersist: false };
@@ -444,6 +574,37 @@ export class LeadCaptureService {
   /** Return the next application-owned action for the conversation. */
   getDirective(chatId: string): FunnelDirective {
     const state = this.leadStates.get(chatId) ?? this.createInitialState();
+
+    if (state.pendingConfirmation) {
+      return {
+        stage: state.stage,
+        owner: state.owner,
+        shouldRespond: true,
+        directResponse: this.confirmationQuestion(
+          state.language,
+          state.pendingConfirmation
+        ),
+        expectedField: state.pendingConfirmation.field,
+        markOnSend: 'question_sent',
+      };
+    }
+
+    if (state.lastInputIssue && state.expectedField) {
+      return {
+        stage: state.stage,
+        owner: state.owner,
+        shouldRespond: true,
+        directResponse: this.invalidAnswerResponse(
+          state.language,
+          state.expectedField,
+          state.invalidAttempts[state.expectedField] || 1,
+          state.lastInputClassification
+        ),
+        expectedField: state.expectedField,
+        markOnSend: 'question_sent',
+        markInputIssueHandledOnSend: true,
+      };
+    }
 
     if (state.status === 'qualified') {
       if (!state.qualificationNoticeSent) {
@@ -510,7 +671,12 @@ export class LeadCaptureService {
         directive = this.questionDirective(
           state,
           sellerField,
-          this.questionForField(state.language, sellerField, 'selling')
+          this.questionForField(
+            state.language,
+            sellerField,
+            'selling',
+            state.lastPromptField === sellerField && state.promptRepeatCount > 0
+          )
         );
         return this.finalizeDirective(state, directive);
       }
@@ -522,7 +688,12 @@ export class LeadCaptureService {
         directive = this.questionDirective(
           state,
           buyerField,
-          this.questionForField(state.language, buyerField, 'buying')
+          this.questionForField(
+            state.language,
+            buyerField,
+            'buying',
+            state.lastPromptField === buyerField && state.promptRepeatCount > 0
+          )
         );
         return this.finalizeDirective(state, directive);
       }
@@ -544,6 +715,12 @@ export class LeadCaptureService {
 
     if (directive.expectedField) {
       state.expectedField = directive.expectedField;
+      if (state.lastPromptField === directive.expectedField) {
+        state.promptRepeatCount += 1;
+      } else {
+        state.lastPromptField = directive.expectedField;
+        state.promptRepeatCount = 1;
+      }
     }
 
     switch (directive.markOnSend) {
@@ -562,9 +739,112 @@ export class LeadCaptureService {
     if (directive.markQualificationNoticeOnSend) {
       state.qualificationNoticeSent = true;
     }
+    if (directive.markInputIssueHandledOnSend) {
+      state.lastInputIssue = undefined;
+    }
 
     state.pendingObjection = undefined;
     this.persist(chatId);
+  }
+
+  isPriceGuidanceRequest(chatId: string, content: string): boolean {
+    const state = this.leadStates.get(chatId);
+    if (!state || state.inquiryPurpose !== 'selling') return false;
+
+    const normalized = content.trim().toLowerCase();
+    const selectedGuidanceOption =
+      state.expectedField === 'desired_selling_price_aed' && normalized === '6';
+    return (
+      selectedGuidanceOption ||
+      /(?:what (?:would|do) you suggest|suggest(?:ed)? price|recommend(?:ed)? price|how much (?:should|can) i sell|what(?:'s| is) (?:it|the business) worth|give me (?:a )?(?:price|valuation)|price guidance)/i.test(content) ||
+      /(?:какую цену (?:вы )?предложите|что посоветуете|рекомендуемая цена|сколько стоит бизнес|оцените бизнес|предложите цену)/i.test(content) ||
+      /(?:ما السعر الذي تقترحه|اقترح سعراً|كم تساوي الشركة|تقييم المشروع|السعر المقترح)/u.test(content)
+    );
+  }
+
+  setSuggestedSellingPrice(chatId: string, value: string): void {
+    const state = this.leadStates.get(chatId);
+    if (!state) return;
+    state.suggestedSellingPriceAed = value;
+    state.expectedField = 'desired_selling_price_aed';
+    this.persist(chatId);
+  }
+
+  getPriceGuidanceDirective(
+    chatId: string,
+    suggestedRange?: string
+  ): FunnelDirective {
+    const state = this.leadStates.get(chatId) ?? this.createInitialState();
+
+    if (suggestedRange) {
+      const repeated =
+        state.priceGuidanceCount > 0 &&
+        state.suggestedSellingPriceAed === suggestedRange;
+      state.suggestedSellingPriceAed = suggestedRange;
+      state.priceGuidanceCount += 1;
+      this.leadStates.set(chatId, state);
+      this.persist(chatId);
+      const firstMessages: Record<ConversationLanguage, string> = {
+        en: `Based on the information recorded so far, SHARH's indicative range is ${suggestedRange}. This is a preliminary estimate, not a final valuation.
+
+1. Use this as my expected range
+2. I will enter a different price
+3. Record price as undecided`,
+        ru: `По текущим данным ориентировочный диапазон SHARH — ${suggestedRange}. Это предварительная оценка, а не финальная стоимость.
+
+1. Использовать этот диапазон как ожидаемую цену
+2. Я укажу другую цену
+3. Пока цена не определена`,
+        ar: `استناداً إلى المعلومات المسجلة حتى الآن، النطاق التقديري من SHARH هو ${suggestedRange}. هذا تقدير أولي وليس تقييماً نهائياً.
+
+1. استخدام هذا النطاق كسعري المتوقع
+2. سأدخل سعراً مختلفاً
+3. تسجيل السعر كغير محدد حالياً`,
+      };
+      const repeatMessages: Record<ConversationLanguage, string> = {
+        en: `The current indicative range remains ${suggestedRange}. Please reply with 1 to use it, 2 to enter another price, or 3 to leave the price undecided.`,
+        ru: `Текущий ориентировочный диапазон остаётся ${suggestedRange}. Ответьте 1, чтобы использовать его, 2 — указать другую цену, или 3 — пока не определять цену.`,
+        ar: `يبقى النطاق التقديري الحالي ${suggestedRange}. أجب 1 لاستخدامه، أو 2 لإدخال سعر آخر، أو 3 لترك السعر غير محدد حالياً.`,
+      };
+      const messages = repeated ? repeatMessages : firstMessages;
+      return this.questionDirective(
+        state,
+        'desired_selling_price_aed',
+        messages[state.language]
+      );
+    }
+
+    const fallback: Record<ConversationLanguage, string> = {
+      en: `I can suggest an indicative range, but I could not calculate it at this moment. Please type your own range, choose one of the options below, or reply “unknown”.
+
+1. Under AED 250,000
+2. AED 250,000–500,000
+3. AED 500,000–1,000,000
+4. AED 1,000,000–3,000,000
+5. AED 3,000,000+
+6. Try the SHARH estimate again`,
+      ru: `Я могу предложить ориентировочный диапазон, но сейчас расчёт недоступен. Укажите свой диапазон, выберите вариант ниже или ответьте «не знаю».
+
+1. До 250 000 AED
+2. 250 000–500 000 AED
+3. 500 000–1 000 000 AED
+4. 1 000 000–3 000 000 AED
+5. Более 3 000 000 AED
+6. Повторить расчёт SHARH`,
+      ar: `يمكنني اقتراح نطاق تقديري، لكن تعذر إجراء الحساب الآن. اكتب نطاقك، اختر أحد الخيارات أدناه، أو اكتب «غير معروف».
+
+1. أقل من 250,000 درهم
+2. 250,000–500,000 درهم
+3. 500,000–1,000,000 درهم
+4. 1,000,000–3,000,000 درهم
+5. أكثر من 3,000,000 درهم
+6. إعادة محاولة تقدير SHARH`,
+    };
+    return this.questionDirective(
+      state,
+      'desired_selling_price_aed',
+      fallback[state.language]
+    );
   }
 
   getConversationContext(chatId: string): string | null {
@@ -690,6 +970,9 @@ export class LeadCaptureService {
       reviewNoticeSent: false,
       qualificationNoticeSent: false,
       objectionsDetected: [],
+      promptRepeatCount: 0,
+      invalidAttempts: {},
+      priceGuidanceCount: 0,
       messageCount: 0,
       processedMessageIds: new Set<string>(),
     };
@@ -737,6 +1020,295 @@ export class LeadCaptureService {
       directResponse: response,
       markReviewNoticeOnSend: includeReviewNotice || undefined,
     };
+  }
+
+  getExpectedField(chatId: string): LeadField | undefined {
+    return this.leadStates.get(chatId)?.expectedField;
+  }
+
+  getLanguage(chatId: string): ConversationLanguage {
+    return this.leadStates.get(chatId)?.language || 'en';
+  }
+
+  private applyIntelligentInterpretation(
+    state: LeadCaptureState,
+    interpretation: SalesMessageInterpretation,
+    fieldsUpdated: string[]
+  ): number {
+    let accepted = 0;
+
+    if (interpretation.classification === 'unknown') {
+      const fields = interpretation.unknownFields.length
+        ? interpretation.unknownFields
+        : state.expectedField
+          ? [state.expectedField]
+          : [];
+      for (const field of fields) {
+        if (this.applyValidatedField(state, field, 'Unknown / to confirm', true, fieldsUpdated)) {
+          accepted += 1;
+        }
+      }
+      return accepted;
+    }
+
+    for (const field of interpretation.unknownFields) {
+      if (this.applyValidatedField(state, field, 'Unknown / to confirm', true, fieldsUpdated)) {
+        accepted += 1;
+      }
+    }
+
+    for (const [rawField, rawValue] of Object.entries(interpretation.fields)) {
+      if (!rawValue) continue;
+      const field = rawField as LeadField;
+      const overwrite =
+        interpretation.classification === 'correction' ||
+        interpretation.corrections.includes(field);
+      if (this.applyValidatedField(state, field, rawValue, overwrite, fieldsUpdated)) {
+        accepted += 1;
+      }
+    }
+
+    if (
+      accepted === 0 &&
+      ['nonsense', 'off_topic', 'abusive'].includes(interpretation.classification)
+    ) {
+      state.lastInputIssue = interpretation.reason || interpretation.classification;
+    }
+
+    return accepted;
+  }
+
+  private applyValidatedField(
+    state: LeadCaptureState,
+    field: LeadField,
+    rawValue: string,
+    overwrite: boolean,
+    fieldsUpdated: string[]
+  ): boolean {
+    const key = FIELD_TO_STATE_KEY[field];
+    if (!key || key === 'termsAccepted' || key === 'inquiryPurpose') {
+      if (field === 'seller_terms') {
+        const accepted = this.extractAcceptance(rawValue);
+        if (accepted === null) return false;
+        if (overwrite || state.termsAccepted === undefined) {
+          state.termsAccepted = accepted;
+          fieldsUpdated.push('terms_accepted');
+          state.expectedField = undefined;
+          state.lastInputIssue = undefined;
+          return true;
+        }
+      }
+      if (field === 'inquiry_purpose') {
+        const purpose = this.extractInquiryPurpose(rawValue);
+        if (!purpose) return false;
+        if (overwrite || !state.inquiryPurpose) {
+          state.inquiryPurpose = purpose;
+          fieldsUpdated.push('inquiry_purpose');
+          state.expectedField = undefined;
+          state.lastInputIssue = undefined;
+          return true;
+        }
+      }
+      return false;
+    }
+
+    const normalized = this.normalizeInterpretedValue(field, rawValue);
+    if (!normalized) return false;
+
+    const contradiction = this.findContradiction(state, field, normalized);
+    if (contradiction) {
+      state.pendingConfirmation = {
+        field,
+        value: normalized,
+        reason: contradiction,
+      };
+      state.expectedField = field;
+      state.lastInputIssue = undefined;
+      return false;
+    }
+
+    if (!overwrite && this.hasValue(state[key])) return false;
+    (state as unknown as Record<string, unknown>)[key] = normalized;
+    fieldsUpdated.push(field);
+    if (state.expectedField === field) state.expectedField = undefined;
+    if (state.pendingConfirmation?.field === field) {
+      state.pendingConfirmation = undefined;
+    }
+    state.invalidAttempts[field] = 0;
+    state.lastInputIssue = undefined;
+    return true;
+  }
+
+  private normalizeInterpretedValue(
+    field: LeadField,
+    rawValue: string
+  ): string | null {
+    if (this.isExplicitUnknown(rawValue) || rawValue === 'Unknown / to confirm') {
+      return 'Unknown / to confirm';
+    }
+
+    switch (field) {
+      case 'client_name':
+        return this.extractClientName(rawValue, true);
+      case 'business_type':
+        return this.isMeaningfulFreeText(rawValue)
+          ? this.extractBusinessType(rawValue, true)
+          : null;
+      case 'business_location':
+      case 'buyer_location':
+        return this.isMeaningfulFreeText(rawValue)
+          ? this.extractLocation(rawValue, true)
+          : null;
+      case 'annual_revenue_aed':
+      case 'desired_selling_price_aed':
+      case 'buyer_budget_aed':
+      case 'monthly_operating_expenses_aed':
+      case 'monthly_net_profit_aed': {
+        const money = this.extractMoneyExpression(rawValue);
+        const amount = money ? this.parseAedAmount(money) : null;
+        if (!money || amount === null || amount <= 0 || amount > 1_000_000_000_000) {
+          return null;
+        }
+        return money;
+      }
+      case 'year_established': {
+        const year = this.extractYearEstablished(rawValue, true);
+        if (!year || year === 'Unknown / to confirm') return year;
+        const parsed = Number(year);
+        const currentYear = new Date().getUTCFullYear();
+        return parsed >= 1900 && parsed <= currentYear ? year : null;
+      }
+      case 'employee_count': {
+        const count = this.extractEmployeeCount(rawValue, true);
+        if (!count || count === 'Unknown / to confirm') return count;
+        const parsed = Number(count);
+        return Number.isInteger(parsed) && parsed >= 0 && parsed <= 100_000
+          ? String(parsed)
+          : null;
+      }
+      case 'lease_details':
+      case 'liabilities':
+      case 'contracts_licenses':
+      case 'sale_reason_urgency':
+      case 'included_assets':
+      case 'buyer_timeline':
+      case 'buyer_involvement':
+      case 'buyer_funding_status':
+      case 'buyer_additional_comments':
+        return this.isMeaningfulFreeText(rawValue)
+          ? this.cleanFreeTextAnswer(rawValue)
+          : null;
+      case 'inquiry_purpose':
+      case 'seller_terms':
+        return null;
+      default:
+        return null;
+    }
+  }
+
+  private findContradiction(
+    state: LeadCaptureState,
+    field: LeadField,
+    value: string
+  ): string | null {
+    if (value === 'Unknown / to confirm') return null;
+    const newAmount = this.parseAedAmount(value);
+    if (newAmount === null) return null;
+
+    const revenue =
+      field === 'annual_revenue_aed'
+        ? newAmount
+        : this.parseAedAmount(state.annualRevenueAed || '');
+    const monthlyProfit =
+      field === 'monthly_net_profit_aed'
+        ? newAmount
+        : this.parseAedAmount(state.monthlyNetProfitAed || '');
+
+    if (
+      revenue !== null &&
+      monthlyProfit !== null &&
+      monthlyProfit * 12 > revenue * 1.2
+    ) {
+      return 'The stated monthly net profit is higher than the annual revenue would normally support.';
+    }
+    return null;
+  }
+
+  private applyPendingConfirmation(
+    state: LeadCaptureState,
+    content: string,
+    fieldsUpdated: string[]
+  ): boolean {
+    const pending = state.pendingConfirmation;
+    if (!pending) return false;
+    const acceptance = this.extractAcceptance(content);
+    if (acceptance === true) {
+      const key = FIELD_TO_STATE_KEY[pending.field];
+      (state as unknown as Record<string, unknown>)[key] = pending.value;
+      fieldsUpdated.push(pending.field);
+      state.pendingConfirmation = undefined;
+      state.expectedField = undefined;
+      state.invalidAttempts[pending.field] = 0;
+      return true;
+    }
+    if (acceptance === false) {
+      const key = FIELD_TO_STATE_KEY[pending.field];
+      if ((state as unknown as Record<string, unknown>)[key] === pending.value) {
+        (state as unknown as Record<string, unknown>)[key] = undefined;
+      }
+      state.pendingConfirmation = undefined;
+      state.expectedField = pending.field;
+      this.registerInvalidAttempt(
+        state,
+        pending.field,
+        'The client rejected the contradictory value.'
+      );
+      return true;
+    }
+    if (this.isExplicitUnknown(content)) {
+      const key = FIELD_TO_STATE_KEY[pending.field];
+      (state as unknown as Record<string, unknown>)[key] = 'Unknown / to confirm';
+      fieldsUpdated.push(pending.field);
+      state.pendingConfirmation = undefined;
+      state.expectedField = undefined;
+      return true;
+    }
+    return false;
+  }
+
+  private registerInvalidAttempt(
+    state: LeadCaptureState,
+    field: LeadField,
+    reason: string
+  ): void {
+    state.invalidAttempts[field] = (state.invalidAttempts[field] || 0) + 1;
+    state.lastInputIssue = reason;
+    state.lastInputClassification = state.lastInputClassification || 'nonsense';
+  }
+
+  private parseAedAmount(value: string): number | null {
+    if (!value || /unknown/i.test(value)) return null;
+    const rangeParts = value.match(/([\d,]+)(?:\s*[–-]\s*([\d,]+))?/);
+    if (!rangeParts?.[1]) return null;
+    const first = Number(rangeParts[1].replace(/,/g, ''));
+    const second = rangeParts[2]
+      ? Number(rangeParts[2].replace(/,/g, ''))
+      : null;
+    if (!Number.isFinite(first)) return null;
+    if (second !== null && Number.isFinite(second)) return (first + second) / 2;
+    return first;
+  }
+
+  private isMeaningfulFreeText(value: string): boolean {
+    const normalized = value.trim().toLowerCase();
+    if (normalized.length < 2 || normalized.length > 1000) return false;
+    if (!/[\p{L}\p{N}]/u.test(normalized)) return false;
+    if (/^(.)\1{2,}$/u.test(normalized.replace(/\s/g, ''))) return false;
+    if (/^(?:asdf|qwerty|zxcv|blah|bla|banana|bazilion|bazillion|nonsense|random|test|lol|lmao)$/i.test(normalized)) {
+      return false;
+    }
+    const letters = normalized.match(/\p{L}/gu)?.length || 0;
+    return letters >= 2 || /\d/.test(normalized);
   }
 
   private applyExplicitExtractions(
@@ -954,6 +1526,26 @@ export class LeadCaptureService {
       return;
     }
 
+    if (
+      expected === 'desired_selling_price_aed' &&
+      state.suggestedSellingPriceAed &&
+      /^(?:yes|use (?:it|that|this)|use the range|that works|ok|okay|да|используйте|подходит|نعم|استخدمه)$/iu.test(content.trim())
+    ) {
+      (state as unknown as Record<string, unknown>)[stateKey] =
+        state.suggestedSellingPriceAed;
+      fieldsUpdated.push(expected);
+      state.expectedField = undefined;
+      return;
+    }
+
+    const choiceValue = this.extractChoiceValue(expected, content, state);
+    if (choiceValue) {
+      (state as unknown as Record<string, unknown>)[stateKey] = choiceValue;
+      fieldsUpdated.push(expected);
+      state.expectedField = undefined;
+      return;
+    }
+
     if (this.looksLikeQuestion(content) && !this.isExplicitUnknown(content)) {
       return;
     }
@@ -966,6 +1558,86 @@ export class LeadCaptureService {
     (state as unknown as Record<string, unknown>)[stateKey] = extracted;
     fieldsUpdated.push(expected);
     state.expectedField = undefined;
+  }
+
+  private extractChoiceValue(
+    field: LeadField,
+    content: string,
+    state: LeadCaptureState
+  ): string | null {
+    const choice = content.trim().toLowerCase();
+
+    if (field === 'business_location' || field === 'buyer_location') {
+      const emirates: Record<string, string> = {
+        '1': 'Dubai',
+        '2': 'Abu Dhabi',
+        '3': 'Sharjah',
+        '4': 'Ajman',
+        '5': 'Ras Al Khaimah',
+        '6': 'Fujairah',
+        '7': 'Umm Al Quwain',
+      };
+      return emirates[choice] || null;
+    }
+
+    if (field === 'desired_selling_price_aed') {
+      if (choice === '1' && state.suggestedSellingPriceAed) {
+        return state.suggestedSellingPriceAed;
+      }
+      if (choice === '2' && state.suggestedSellingPriceAed) {
+        state.suggestedSellingPriceAed = undefined;
+        return null;
+      }
+      if (choice === '3' && state.suggestedSellingPriceAed) {
+        return 'Unknown / to confirm';
+      }
+      const ranges: Record<string, string> = {
+        '1': 'Under AED 250,000',
+        '2': 'AED 250,000–500,000',
+        '3': 'AED 500,000–1,000,000',
+        '4': 'AED 1,000,000–3,000,000',
+        '5': 'AED 3,000,000+',
+      };
+      return ranges[choice] || null;
+    }
+
+    if (field === 'buyer_budget_aed') {
+      const ranges: Record<string, string> = {
+        '1': 'Under AED 250,000',
+        '2': 'AED 250,000–500,000',
+        '3': 'AED 500,000–1,000,000',
+        '4': 'AED 1,000,000–3,000,000',
+        '5': 'AED 3,000,000+',
+      };
+      return ranges[choice] || null;
+    }
+
+    if (field === 'buyer_timeline') {
+      return ({
+        '1': 'Within 3 months',
+        '2': 'Within 3–6 months',
+        '3': 'Within 6–12 months',
+        '4': 'Flexible / exploring',
+      } as Record<string, string>)[choice] || null;
+    }
+
+    if (field === 'buyer_involvement') {
+      return ({
+        '1': 'Operate the business personally',
+        '2': 'Passive investment',
+        '3': 'Open to either',
+      } as Record<string, string>)[choice] || null;
+    }
+
+    if (field === 'buyer_funding_status') {
+      return ({
+        '1': 'Funds available now',
+        '2': 'Financing required',
+        '3': 'Combination of own funds and financing',
+      } as Record<string, string>)[choice] || null;
+    }
+
+    return null;
   }
 
   private extractExpectedValue(field: LeadField, content: string): string | null {
@@ -998,7 +1670,9 @@ export class LeadCaptureService {
       case 'buyer_involvement':
       case 'buyer_funding_status':
       case 'buyer_additional_comments':
-        return this.cleanFreeTextAnswer(content);
+        return this.isMeaningfulFreeText(content)
+          ? this.cleanFreeTextAnswer(content)
+          : null;
       case 'inquiry_purpose':
       case 'client_name':
       case 'seller_terms':
@@ -1044,16 +1718,16 @@ export class LeadCaptureService {
       ['businessType', 'business_type'],
       ['businessLocation', 'business_location'],
       ['annualRevenueAed', 'annual_revenue_aed'],
+      ['monthlyNetProfitAed', 'monthly_net_profit_aed'],
+      ['monthlyOperatingExpensesAed', 'monthly_operating_expenses_aed'],
       ['leaseDetails', 'lease_details'],
-      ['desiredSellingPriceAed', 'desired_selling_price_aed'],
       ['yearEstablished', 'year_established'],
       ['employeeCount', 'employee_count'],
-      ['monthlyOperatingExpensesAed', 'monthly_operating_expenses_aed'],
-      ['monthlyNetProfitAed', 'monthly_net_profit_aed'],
       ['liabilities', 'liabilities'],
       ['contractsLicenses', 'contracts_licenses'],
       ['saleReasonUrgency', 'sale_reason_urgency'],
       ['includedAssets', 'included_assets'],
+      ['desiredSellingPriceAed', 'desired_selling_price_aed'],
     ];
     return ordered.find(([key]) => !this.hasValue(state[key]))?.[1] || null;
   }
@@ -1327,6 +2001,7 @@ export class LeadCaptureService {
     'hello', 'hi', 'hey', 'yes', 'no', 'ok', 'okay', 'thanks', 'please',
     'and', 'i', 'we', 'want', 'would', 'like', 'looking', 'interested', 'need',
     'business', 'buy', 'buying', 'sell', 'selling', 'manager', 'agent',
+    'banana', 'bazilion', 'bazillion', 'asdf', 'qwerty', 'test',
     'привет', 'здравствуйте', 'да', 'нет', 'спасибо', 'и', 'я', 'мы', 'хочу',
     'бизнес', 'купить', 'продать', 'менеджер', 'агент', 'مرحبا', 'نعم', 'لا',
     'شكرا', 'أنا', 'أريد', 'مشروع',
@@ -1395,7 +2070,11 @@ export class LeadCaptureService {
     value: string,
     allowWholeAnswer: boolean = false
   ): string | null {
-    if (allowWholeAnswer) return this.cleanFreeTextAnswer(value);
+    if (allowWholeAnswer) {
+      return this.isMeaningfulFreeText(value)
+        ? this.cleanFreeTextAnswer(value)
+        : null;
+    }
 
     const emirates = value.match(
       /\b(Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\b/i
@@ -1527,6 +2206,8 @@ export class LeadCaptureService {
 
   private extractAcceptance(value: string): boolean | null {
     const normalized = value.toLowerCase().trim();
+    if (normalized === '1') return true;
+    if (normalized === '2') return false;
     const reject =
       /\b(no|not agree|do not agree|decline|reject)\b/.test(normalized) ||
       /(нет|не согласен|не согласна|отказываюсь)/i.test(value) ||
@@ -1606,6 +2287,8 @@ export class LeadCaptureService {
     state.status = 'qualified';
     state.stage = 'qualifying';
     state.expectedField = undefined;
+    state.pendingConfirmation = undefined;
+    state.lastInputIssue = undefined;
     state.qualificationNoticeSent = false;
   }
 
@@ -1660,7 +2343,9 @@ export class LeadCaptureService {
       ?.replace(/\b(?:in dubai|in abu dhabi|uae)\b/gi, '')
       .replace(/\s+/g, ' ')
       .trim();
-    if (!cleaned || cleaned.length < 2) return null;
+    if (!cleaned || cleaned.length < 2 || !this.isMeaningfulFreeText(cleaned)) {
+      return null;
+    }
     return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
   }
 
@@ -1703,15 +2388,16 @@ export class LeadCaptureService {
   private questionForField(
     language: ConversationLanguage,
     field: LeadField,
-    purpose?: LeadInquiryPurpose
+    purpose?: LeadInquiryPurpose,
+    isRetry: boolean = false
   ): string {
     const questions: Record<ConversationLanguage, Partial<Record<LeadField, string>>> = {
       en: {
         business_type: 'What does the business do, or which sector interests you?',
-        business_location: 'In which emirate and area is the business located?',
+        business_location: 'In which emirate and area is the business located? Reply with a number or type the emirate and area.\n\n1. Dubai\n2. Abu Dhabi\n3. Sharjah\n4. Ajman\n5. Ras Al Khaimah\n6. Fujairah\n7. Umm Al Quwain\n8. Other',
         annual_revenue_aed: 'What was the business’s revenue over the last 12 months?',
         lease_details: 'Is the premises leased, and what are the monthly rent and remaining lease term?',
-        desired_selling_price_aed: 'What selling price or price range do you expect?',
+        desired_selling_price_aed: 'What selling price or range do you expect? Reply with a number or type your own amount.\n\n1. Under AED 250,000\n2. AED 250,000–500,000\n3. AED 500,000–1,000,000\n4. AED 1,000,000–3,000,000\n5. AED 3,000,000+\n6. Suggest a SHARH range',
         year_established: 'In which year was the business established?',
         employee_count: 'How many employees does the business have?',
         monthly_operating_expenses_aed: 'What are the approximate monthly operating expenses?',
@@ -1720,19 +2406,19 @@ export class LeadCaptureService {
         contracts_licenses: 'Which active licences, supplier agreements, or important contracts are in place?',
         sale_reason_urgency: 'Why are you selling, and what timing do you have in mind?',
         included_assets: 'What is included in the sale, such as equipment, inventory, brand, or licences?',
-        buyer_budget_aed: 'What budget or budget range have you allocated?',
-        buyer_location: 'Which emirates or areas would you consider?',
-        buyer_timeline: 'When would you like to complete an acquisition?',
-        buyer_involvement: 'Do you want to operate the business yourself or invest more passively?',
-        buyer_funding_status: 'Are the funds available now, or will financing be required?',
+        buyer_budget_aed: 'What budget range have you allocated? Reply with a number or type your own amount.\n\n1. Under AED 250,000\n2. AED 250,000–500,000\n3. AED 500,000–1,000,000\n4. AED 1,000,000–3,000,000\n5. AED 3,000,000+\n6. Other',
+        buyer_location: 'Which emirate or area would you consider? Reply with a number or type the emirate and area.\n\n1. Dubai\n2. Abu Dhabi\n3. Sharjah\n4. Ajman\n5. Ras Al Khaimah\n6. Fujairah\n7. Umm Al Quwain\n8. Other',
+        buyer_timeline: 'When would you like to complete an acquisition?\n\n1. Within 3 months\n2. Within 3–6 months\n3. Within 6–12 months\n4. Flexible / exploring',
+        buyer_involvement: 'How would you like to be involved?\n\n1. Operate the business personally\n2. Passive investment\n3. Open to either',
+        buyer_funding_status: 'How will the acquisition be funded?\n\n1. Funds available now\n2. Financing required\n3. Combination of own funds and financing',
         buyer_additional_comments: 'Are there any other requirements I should record?',
       },
       ru: {
         business_type: 'Чем занимается бизнес или какая сфера вас интересует?',
-        business_location: 'В каком эмирате и районе находится бизнес?',
+        business_location: 'В каком эмирате и районе находится бизнес? Ответьте номером или напишите эмират и район.\n\n1. Дубай\n2. Абу-Даби\n3. Шарджа\n4. Аджман\n5. Рас-эль-Хайма\n6. Фуджейра\n7. Умм-эль-Кайвайн\n8. Другой',
         annual_revenue_aed: 'Какова выручка бизнеса за последние 12 месяцев?',
         lease_details: 'Помещение арендуется, и если да, какова месячная аренда и оставшийся срок договора?',
-        desired_selling_price_aed: 'Какую цену продажи или диапазон вы ожидаете?',
+        desired_selling_price_aed: 'Какую цену продажи или диапазон вы ожидаете? Ответьте номером или укажите свою сумму.\n\n1. До 250 000 AED\n2. 250 000–500 000 AED\n3. 500 000–1 000 000 AED\n4. 1 000 000–3 000 000 AED\n5. Более 3 000 000 AED\n6. Предложить диапазон SHARH',
         year_established: 'В каком году был основан бизнес?',
         employee_count: 'Сколько сотрудников работает в бизнесе?',
         monthly_operating_expenses_aed: 'Каковы примерные ежемесячные операционные расходы?',
@@ -1741,19 +2427,19 @@ export class LeadCaptureService {
         contracts_licenses: 'Какие действующие лицензии, договоры с поставщиками или важные контракты есть у бизнеса?',
         sale_reason_urgency: 'Почему вы продаёте бизнес и в какие сроки хотите завершить сделку?',
         included_assets: 'Что входит в продажу: оборудование, запасы, бренд, лицензии или другие активы?',
-        buyer_budget_aed: 'Какой бюджет или диапазон бюджета вы предусмотрели?',
-        buyer_location: 'Какие эмираты или районы вы рассматриваете?',
-        buyer_timeline: 'Когда вы хотели бы завершить покупку?',
-        buyer_involvement: 'Вы хотите управлять бизнесом лично или рассматриваете пассивную инвестицию?',
-        buyer_funding_status: 'Средства уже доступны или потребуется финансирование?',
+        buyer_budget_aed: 'Какой диапазон бюджета вы предусмотрели? Ответьте номером или укажите свою сумму.\n\n1. До 250 000 AED\n2. 250 000–500 000 AED\n3. 500 000–1 000 000 AED\n4. 1 000 000–3 000 000 AED\n5. Более 3 000 000 AED\n6. Другой',
+        buyer_location: 'Какой эмират или район вы рассматриваете? Ответьте номером или напишите эмират и район.\n\n1. Дубай\n2. Абу-Даби\n3. Шарджа\n4. Аджман\n5. Рас-эль-Хайма\n6. Фуджейра\n7. Умм-эль-Кайвайн\n8. Другой',
+        buyer_timeline: 'Когда вы хотели бы завершить покупку?\n\n1. В течение 3 месяцев\n2. Через 3–6 месяцев\n3. Через 6–12 месяцев\n4. Гибко / пока изучаю варианты',
+        buyer_involvement: 'Как вы хотите участвовать в бизнесе?\n\n1. Управлять лично\n2. Пассивная инвестиция\n3. Рассматриваю оба варианта',
+        buyer_funding_status: 'Как будет финансироваться покупка?\n\n1. Средства уже доступны\n2. Требуется финансирование\n3. Собственные средства и финансирование',
         buyer_additional_comments: 'Есть ли другие требования, которые нужно зафиксировать?',
       },
       ar: {
         business_type: 'ما نشاط المشروع أو القطاع الذي تهتم به؟',
-        business_location: 'في أي إمارة ومنطقة يقع المشروع؟',
+        business_location: 'في أي إمارة ومنطقة يقع المشروع؟ أجب برقم أو اكتب الإمارة والمنطقة.\n\n1. دبي\n2. أبوظبي\n3. الشارقة\n4. عجمان\n5. رأس الخيمة\n6. الفجيرة\n7. أم القيوين\n8. أخرى',
         annual_revenue_aed: 'ما إيرادات المشروع خلال آخر 12 شهراً؟',
         lease_details: 'هل الموقع مستأجر، وما قيمة الإيجار الشهري والمدة المتبقية في العقد؟',
-        desired_selling_price_aed: 'ما سعر البيع أو النطاق السعري المتوقع؟',
+        desired_selling_price_aed: 'ما سعر البيع أو النطاق السعري المتوقع؟ أجب برقم أو اكتب المبلغ.\n\n1. أقل من 250,000 درهم\n2. 250,000–500,000 درهم\n3. 500,000–1,000,000 درهم\n4. 1,000,000–3,000,000 درهم\n5. أكثر من 3,000,000 درهم\n6. اقتراح نطاق من SHARH',
         year_established: 'في أي سنة تأسس المشروع؟',
         employee_count: 'كم عدد الموظفين في المشروع؟',
         monthly_operating_expenses_aed: 'ما المصاريف التشغيلية الشهرية التقريبية؟',
@@ -1762,11 +2448,11 @@ export class LeadCaptureService {
         contracts_licenses: 'ما التراخيص والعقود المهمة أو اتفاقيات الموردين السارية؟',
         sale_reason_urgency: 'ما سبب البيع وما الإطار الزمني المطلوب لإتمام الصفقة؟',
         included_assets: 'ما الذي يشمله البيع، مثل المعدات أو المخزون أو العلامة التجارية أو التراخيص؟',
-        buyer_budget_aed: 'ما الميزانية أو نطاق الميزانية المخصص؟',
-        buyer_location: 'ما الإمارات أو المناطق التي تفضلها؟',
-        buyer_timeline: 'متى ترغب في إتمام عملية الاستحواذ؟',
-        buyer_involvement: 'هل تريد إدارة المشروع بنفسك أم تفضل استثماراً أكثر سلبية؟',
-        buyer_funding_status: 'هل الأموال متاحة الآن أم ستحتاج إلى تمويل؟',
+        buyer_budget_aed: 'ما نطاق الميزانية المخصص؟ أجب برقم أو اكتب المبلغ.\n\n1. أقل من 250,000 درهم\n2. 250,000–500,000 درهم\n3. 500,000–1,000,000 درهم\n4. 1,000,000–3,000,000 درهم\n5. أكثر من 3,000,000 درهم\n6. أخرى',
+        buyer_location: 'ما الإمارة أو المنطقة التي تفضلها؟ أجب برقم أو اكتب الإمارة والمنطقة.\n\n1. دبي\n2. أبوظبي\n3. الشارقة\n4. عجمان\n5. رأس الخيمة\n6. الفجيرة\n7. أم القيوين\n8. أخرى',
+        buyer_timeline: 'متى ترغب في إتمام عملية الاستحواذ؟\n\n1. خلال 3 أشهر\n2. خلال 3–6 أشهر\n3. خلال 6–12 شهراً\n4. مرن / ما زلت أستكشف',
+        buyer_involvement: 'كيف تريد المشاركة في المشروع؟\n\n1. إدارته شخصياً\n2. استثمار سلبي\n3. منفتح على الخيارين',
+        buyer_funding_status: 'كيف سيتم تمويل الاستحواذ؟\n\n1. الأموال متاحة الآن\n2. التمويل مطلوب\n3. مزيج من الأموال الذاتية والتمويل',
         buyer_additional_comments: 'هل توجد متطلبات أخرى تريد تسجيلها؟',
       },
     };
@@ -1785,9 +2471,113 @@ export class LeadCaptureService {
           buying: 'ما قطاع الأعمال الذي تهتم به؟',
         },
       };
-      if (purpose) return purposeQuestions[language][purpose];
+      if (purpose) {
+        const base = purposeQuestions[language][purpose];
+        return isRetry
+          ? `${this.retryPrefix(language)} ${base}`
+          : base;
+      }
     }
-    return questions[language][field] || questions.en[field] || 'Please provide the requested information.';
+    const base = questions[language][field] || questions.en[field] || 'Please provide the requested information.';
+    return isRetry ? `${this.retryPrefix(language)} ${base}` : base;
+  }
+
+  private confirmationQuestion(
+    language: ConversationLanguage,
+    pending: { field: LeadField; value: string; reason: string }
+  ): string {
+    const fieldLabels: Record<ConversationLanguage, Partial<Record<LeadField, string>>> = {
+      en: {
+        annual_revenue_aed: 'annual revenue',
+        monthly_net_profit_aed: 'monthly net profit',
+        monthly_operating_expenses_aed: 'monthly operating expenses',
+        desired_selling_price_aed: 'expected selling price',
+      },
+      ru: {
+        annual_revenue_aed: 'годовая выручка',
+        monthly_net_profit_aed: 'ежемесячная чистая прибыль',
+        monthly_operating_expenses_aed: 'ежемесячные операционные расходы',
+        desired_selling_price_aed: 'ожидаемая цена продажи',
+      },
+      ar: {
+        annual_revenue_aed: 'الإيرادات السنوية',
+        monthly_net_profit_aed: 'صافي الربح الشهري',
+        monthly_operating_expenses_aed: 'المصاريف التشغيلية الشهرية',
+        desired_selling_price_aed: 'سعر البيع المتوقع',
+      },
+    };
+    const label = fieldLabels[language][pending.field] || pending.field;
+    const messages: Record<ConversationLanguage, string> = {
+      en: `I may have understood this incorrectly. You entered ${pending.value} for ${label}, but it conflicts with another figure already provided. Should I save it anyway? Reply Yes or No.`,
+      ru: `Возможно, я понял ответ неверно. Для поля «${label}» указано ${pending.value}, но это противоречит другой ранее указанной цифре. Сохранить значение? Ответьте Да или Нет.`,
+      ar: `قد أكون فهمت الإجابة بشكل غير صحيح. أدخلت ${pending.value} لـ${label}، لكن هذا يتعارض مع رقم آخر تم تقديمه. هل أحفظه؟ أجب نعم أو لا.`,
+    };
+    return messages[language];
+  }
+
+  private invalidAnswerResponse(
+    language: ConversationLanguage,
+    field: LeadField,
+    attempts: number,
+    classification?: SalesMessageClassification
+  ): string {
+    const question = this.questionForField(language, field, undefined, false);
+    const examples: Record<ConversationLanguage, Partial<Record<LeadField, string>>> = {
+      en: {
+        annual_revenue_aed: 'Please send an approximate amount such as AED 150,000, 1.2m, or “unknown”.',
+        monthly_net_profit_aed: 'Please send an approximate monthly amount such as AED 20,000 or “unknown”.',
+        monthly_operating_expenses_aed: 'Please send an approximate monthly amount such as AED 50,000 or “unknown”.',
+        desired_selling_price_aed: 'Please send a price, choose an option, ask me for an indicative range, or reply “unknown”.',
+        buyer_budget_aed: 'Please send a budget such as AED 500,000, choose an option, or reply “unknown”.',
+        year_established: 'Please send a four-digit year such as 2018, or reply “unknown”.',
+        employee_count: 'Please send the number of employees, such as 12, or reply “unknown”.',
+      },
+      ru: {
+        annual_revenue_aed: 'Укажите примерную сумму, например 150 000 AED, 1,2 млн или «не знаю».',
+        monthly_net_profit_aed: 'Укажите примерную месячную сумму, например 20 000 AED, или «не знаю».',
+        monthly_operating_expenses_aed: 'Укажите примерную месячную сумму, например 50 000 AED, или «не знаю».',
+        desired_selling_price_aed: 'Укажите цену, выберите вариант, попросите ориентировочную оценку или ответьте «не знаю».',
+        buyer_budget_aed: 'Укажите бюджет, например 500 000 AED, выберите вариант или ответьте «не знаю».',
+        year_established: 'Укажите год из четырёх цифр, например 2018, или ответьте «не знаю».',
+        employee_count: 'Укажите количество сотрудников, например 12, или ответьте «не знаю».',
+      },
+      ar: {
+        annual_revenue_aed: 'أرسل مبلغاً تقريبياً مثل 150,000 درهم أو 1.2 مليون أو «غير معروف».',
+        monthly_net_profit_aed: 'أرسل مبلغاً شهرياً تقريبياً مثل 20,000 درهم أو «غير معروف».',
+        monthly_operating_expenses_aed: 'أرسل مبلغاً شهرياً تقريبياً مثل 50,000 درهم أو «غير معروف».',
+        desired_selling_price_aed: 'أرسل سعراً أو اختر خياراً أو اطلب نطاقاً تقديرياً أو أجب «غير معروف».',
+        buyer_budget_aed: 'أرسل ميزانية مثل 500,000 درهم أو اختر خياراً أو أجب «غير معروف».',
+        year_established: 'أرسل سنة من أربعة أرقام مثل 2018 أو أجب «غير معروف».',
+        employee_count: 'أرسل عدد الموظفين مثل 12 أو أجب «غير معروف».',
+      },
+    };
+    const generic: Record<ConversationLanguage, string> = {
+      en: attempts >= 2
+        ? 'Let’s not get stuck. A short factual answer or “unknown” is enough.'
+        : classification === 'off_topic'
+          ? 'I can help with the SHARH business sale or purchase process, but I still need this detail.'
+          : 'I could not use that as a reliable answer.',
+      ru: attempts >= 2
+        ? 'Не будем останавливаться на этом. Достаточно короткого фактического ответа или «не знаю».'
+        : classification === 'off_topic'
+          ? 'Я могу помочь с покупкой или продажей бизнеса через SHARH, но мне всё ещё нужна эта информация.'
+          : 'Я не смог надёжно распознать этот ответ.',
+      ar: attempts >= 2
+        ? 'لن نتوقف عند هذه النقطة. تكفي إجابة واقعية قصيرة أو «غير معروف».'
+        : classification === 'off_topic'
+          ? 'يمكنني المساعدة في شراء أو بيع الأعمال عبر SHARH، لكنني ما زلت بحاجة إلى هذه المعلومة.'
+          : 'لم أتمكن من اعتماد هذه الإجابة بشكل موثوق.',
+    };
+    return `${generic[language]} ${examples[language][field] || question}`;
+  }
+
+  private retryPrefix(language: ConversationLanguage): string {
+    const messages: Record<ConversationLanguage, string> = {
+      en: 'A short answer, option number, range, or “unknown” is enough.',
+      ru: 'Достаточно короткого ответа, номера варианта, диапазона или «не знаю».',
+      ar: 'تكفي إجابة قصيرة أو رقم الخيار أو نطاق أو «غير معروف».',
+    };
+    return messages[language];
   }
 
   private template(
@@ -1807,7 +2597,7 @@ export class LeadCaptureService {
           'Welcome to SHARH. We help clients buy and sell businesses across the UAE. Are you looking to buy or sell a business?',
         ask_name: 'Thank you. What name should I use?',
         seller_terms:
-          'Before we continue: your information is treated as confidential, we sign an agreement before work begins, and approved businesses may be marketed through sharh.ae and SHARH channels. Our commission is 2% for transactions above USD 500,000 and USD 10,000 for transactions below that threshold. Do you agree to these terms?',
+          'Before we continue: your information is treated as confidential, we sign an agreement before work begins, and approved businesses may be marketed through sharh.ae and SHARH channels. Our commission is 2% for transactions above USD 500,000 and USD 10,000 for transactions below that threshold. Do you agree to these terms? Reply 1 for Yes or 2 for No.',
         ask_terms_acceptance: 'Do you agree to the SHARH confidentiality, process, and commission terms?',
         terms_declined:
           'Understood. Which part of the terms would you like clarified?',
@@ -1821,7 +2611,7 @@ export class LeadCaptureService {
           'Добро пожаловать в SHARH. Мы помогаем покупать и продавать бизнес по всему ОАЭ. Вы хотите купить или продать бизнес?',
         ask_name: 'Спасибо. Как я могу к вам обращаться?',
         seller_terms:
-          'Перед продолжением: информация обрабатывается конфиденциально, до начала работы мы подписываем договор, а одобренный бизнес может продвигаться через sharh.ae и каналы SHARH. Комиссия составляет 2% для сделок свыше 500 000 USD и 10 000 USD для сделок ниже этого порога. Вы согласны с этими условиями?',
+          'Перед продолжением: информация обрабатывается конфиденциально, до начала работы мы подписываем договор, а одобренный бизнес может продвигаться через sharh.ae и каналы SHARH. Комиссия составляет 2% для сделок свыше 500 000 USD и 10 000 USD для сделок ниже этого порога. Вы согласны с этими условиями? Ответьте 1 — Да или 2 — Нет.',
         ask_terms_acceptance:
           'Вы согласны с условиями SHARH по конфиденциальности, процессу и комиссии?',
         terms_declined: 'Понял. Какую часть условий нужно уточнить?',
@@ -1835,7 +2625,7 @@ export class LeadCaptureService {
           'مرحباً بك في SHARH. نساعد العملاء على شراء وبيع المشاريع في جميع أنحاء الإمارات. هل ترغب في شراء مشروع أم بيعه؟',
         ask_name: 'شكراً. ما الاسم الذي تفضل أن أخاطبك به؟',
         seller_terms:
-          'قبل المتابعة: نتعامل مع معلوماتك بسرية، ونوقع اتفاقية قبل بدء العمل، ويمكن تسويق المشروع المعتمد عبر sharh.ae وقنوات SHARH. العمولة 2% للصفقات التي تتجاوز 500,000 دولار و10,000 دولار للصفقات الأقل من ذلك. هل توافق على هذه الشروط؟',
+          'قبل المتابعة: نتعامل مع معلوماتك بسرية، ونوقع اتفاقية قبل بدء العمل، ويمكن تسويق المشروع المعتمد عبر sharh.ae وقنوات SHARH. العمولة 2% للصفقات التي تتجاوز 500,000 دولار و10,000 دولار للصفقات الأقل من ذلك. هل توافق على هذه الشروط؟ أجب 1 للموافقة أو 2 للرفض.',
         ask_terms_acceptance:
           'هل توافق على شروط SHARH المتعلقة بالسرية والإجراءات والعمولة؟',
         terms_declined: 'مفهوم. أي جزء من الشروط تريد توضيحه؟',

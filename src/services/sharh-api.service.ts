@@ -9,6 +9,14 @@ import { logger } from '../utils/logger';
 
 export type PublicListingRow = Record<string, unknown>;
 
+export interface IndicativeValuationResult {
+  low: number;
+  mid: number;
+  high: number;
+  currency: string;
+  formattedRange: string;
+}
+
 interface ApiResult<T> {
   ok: boolean;
   status: number;
@@ -109,6 +117,83 @@ export class SharhApiService {
     return this.extractRows(result.data)
       .slice(0, 3)
       .map(row => this.filterPublicListing(row));
+  }
+
+  async calculateIndicativeValuation(
+    record: LeadCaptureRecord
+  ): Promise<IndicativeValuationResult | null> {
+    if (!this.config.enabled || record.inquiryPurpose !== 'selling') {
+      return null;
+    }
+
+    const structuredFields: Record<string, string> = {};
+    const add = (key: string, value: string): void => {
+      const clean = value.trim();
+      if (clean && !/unknown|to confirm/i.test(clean)) {
+        structuredFields[key] = clean;
+      }
+    };
+
+    add('annual_revenue', record.annualRevenueAed);
+    add('revenue', record.annualRevenueAed);
+    add('net_profit', record.monthlyNetProfitAed);
+    add('monthly_operating_expenses', record.monthlyOperatingExpensesAed);
+    add('lease', record.leaseDetails);
+    add('licenses', record.contractsLicenses);
+    add('contracts', record.contractsLicenses);
+    add('liabilities', record.liabilities);
+    add('included_assets', record.includedAssets);
+
+    const establishedYear = Number.parseInt(record.yearEstablished, 10);
+    if (Number.isFinite(establishedYear) && establishedYear >= 1900) {
+      const years = Math.max(0, new Date().getUTCFullYear() - establishedYear);
+      structuredFields['years'] = String(years);
+      structuredFields['year_established'] = String(establishedYear);
+    }
+
+    const parsedProfit = this.parseAed(record.monthlyNetProfitAed);
+    if (parsedProfit !== null) {
+      structuredFields['status'] = parsedProfit > 0 ? 'profitable' : 'active';
+    } else {
+      structuredFields['status'] = 'active';
+    }
+
+    const result = await this.request<{
+      valuation?: {
+        low?: number;
+        mid?: number;
+        high?: number;
+        currency?: string;
+      };
+    }>('POST', '/api/v1/valuation/calculate', {
+      asset_type: 'business',
+      source: 'chat',
+      asset_description: record.businessType || 'Business for sale',
+      location: record.businessLocation || null,
+      urgency: record.saleReasonUrgency || null,
+      chat_transcript: [],
+      structured_fields: structuredFields,
+    });
+
+    const valuation = result.data?.valuation;
+    if (
+      !result.ok ||
+      !valuation ||
+      typeof valuation.low !== 'number' ||
+      typeof valuation.mid !== 'number' ||
+      typeof valuation.high !== 'number'
+    ) {
+      return null;
+    }
+
+    const currency = valuation.currency || 'AED';
+    return {
+      low: valuation.low,
+      mid: valuation.mid,
+      high: valuation.high,
+      currency,
+      formattedRange: `${currency} ${valuation.low.toLocaleString('en-US')}–${valuation.high.toLocaleString('en-US')} (midpoint ${currency} ${valuation.mid.toLocaleString('en-US')})`,
+    };
   }
 
   async getConversationContext(
@@ -353,6 +438,13 @@ export class SharhApiService {
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  private parseAed(value: string): number | null {
+    const match = value.match(/([\d,.]+)/);
+    if (!match?.[1]) return null;
+    const parsed = Number.parseFloat(match[1].replace(/,/g, ''));
+    return Number.isFinite(parsed) ? parsed : null;
   }
 
   private markSuccess(): void {

@@ -656,9 +656,67 @@ export class ChatbotService {
     }
 
     try {
-      const update = this.leadCaptureService.updateFromMessage(chatId, message);
+      const interpretation = await this.aiService.interpretSalesMessage({
+        message: message.content,
+        expectedField: this.leadCaptureService.getExpectedField(chatId),
+        language: this.leadCaptureService.getLanguage(chatId),
+        knownFacts: this.leadCaptureService.getKnownFactsBlock(chatId) || '',
+        recentHistory: this.chatHistoryService
+          .getConversationContext(chatId)
+          .slice(-6)
+          .map(item => `${item.isFromBot ? 'Bot' : 'Client'}: ${item.content}`),
+      });
+      const update = this.leadCaptureService.updateFromMessage(
+        chatId,
+        message,
+        interpretation
+      );
       let record = update.record || this.leadCaptureService.getCurrentRecord(chatId);
       let directive = this.leadCaptureService.getDirective(chatId);
+
+      if (
+        record &&
+        this.leadCaptureService.isPriceGuidanceRequest(chatId, message.content)
+      ) {
+        const valuation = this.sharhApiService?.isEnabled()
+          ? await this.sharhApiService.calculateIndicativeValuation(record)
+          : null;
+        directive = this.leadCaptureService.getPriceGuidanceDirective(
+          chatId,
+          valuation?.formattedRange
+        );
+        record = this.leadCaptureService.getCurrentRecord(chatId) || record;
+        this.sharhSyncService?.enqueueAnalytics(
+          'seller_price_guidance_requested',
+          chatId,
+          {
+            valuation_available: Boolean(valuation),
+            valuation_low: valuation?.low || null,
+            valuation_mid: valuation?.mid || null,
+            valuation_high: valuation?.high || null,
+          },
+          `${message.id}-price-guidance`
+        );
+      } else if (interpretation?.classification === 'question') {
+        // Answer the client first, then naturally return to the application-owned
+        // next field. The next field stays present in leadContext.
+        directive = { ...directive, directResponse: undefined };
+      }
+
+      this.sharhSyncService?.enqueueAnalytics(
+        'sales_message_interpreted',
+        chatId,
+        {
+          classification: interpretation?.classification || 'fallback',
+          confidence: interpretation?.confidence || 0,
+          question_type: interpretation?.questionType || 'none',
+          extracted_fields: interpretation
+            ? Object.keys(interpretation.fields)
+            : [],
+          unknown_fields: interpretation?.unknownFields || [],
+        },
+        `${message.id}-interpretation`
+      );
 
       const scenario = this.leadCaptureService.getConversationContext(chatId);
       const knownFacts = this.leadCaptureService.getKnownFactsBlock(chatId);
@@ -672,6 +730,9 @@ export class ChatbotService {
         [
           scenario,
           knownFacts,
+          interpretation
+            ? `CURRENT MESSAGE INTERPRETATION (untrusted until application validation):\nclassification=${interpretation.classification}; question_type=${interpretation.questionType}; reason=${interpretation.reason || 'none'}`
+            : '',
           backendContext
             ? `SHARH CANONICAL CONTEXT (server-filtered):\n${backendContext}`
             : '',
