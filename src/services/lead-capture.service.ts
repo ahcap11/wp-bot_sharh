@@ -5,29 +5,22 @@ import { LeadScoringService } from './lead-scoring.service';
 import { ConversationSummaryService } from './conversation-summary.service';
 
 const PERSISTENCE_NAMESPACE = 'leadStates';
-const STATE_VERSION = 3;
+const STATE_VERSION = 6;
 const MAX_PROCESSED_MESSAGE_IDS = 500;
 
 export type LeadInquiryPurpose = 'buying' | 'selling';
 export type LeadEntryType = 'broker_lead' | 'seller_inbound' | 'buyer_inbound' | 'unknown';
-export type LeadCaptureStatus =
-  | 'collecting'
-  | 'qualified_lead'
-  | 'early_escalation'
-  | 'handoff_pending'
-  | 'human_owned';
+export type LeadCaptureStatus = 'new' | 'contacted' | 'qualified';
 export type FunnelStage =
   | 'new'
   | 'intent_identified'
   | 'identity_collected'
   | 'terms_presented'
   | 'terms_accepted'
-  | 'qualifying'
-  | 'handoff_pending'
-  | 'human_owned';
+  | 'qualifying';
 export type ConversationLanguage = 'en' | 'ru' | 'ar';
-export type ConversationOwner = 'bot' | 'human';
-export type HandoffReason = '' | 'qualified_lead' | 'early_escalation';
+export type ConversationOwner = 'bot';
+export type ReviewReason = '' | 'internal_review';
 export type { ObjectionTopic } from './sales-playbook.service';
 
 export type LeadField =
@@ -62,7 +55,7 @@ export interface LeadCaptureRecord {
   status: LeadCaptureStatus;
   funnelStage: FunnelStage;
   owner: ConversationOwner;
-  escalationReason: HandoffReason;
+  escalationReason: ReviewReason;
   clientName: string;
   clientPhone: string;
   language: ConversationLanguage;
@@ -103,7 +96,7 @@ export interface LeadCaptureRecord {
   nextBestActionCode: string;
   objectionsDetected: string;
   conversationSummary: string;
-  managerBrief: string;
+  reviewBrief: string;
 }
 
 export interface LeadCaptureUpdate {
@@ -115,15 +108,11 @@ export interface FunnelDirective {
   stage: FunnelStage;
   owner: ConversationOwner;
   shouldRespond: boolean;
-  requiresHandoff: boolean;
   directResponse?: string | undefined;
   expectedField?: LeadField | undefined;
-  markOnSend?:
-    | 'question_sent'
-    | 'terms_presented'
-    | 'closing_sent'
-    | 'pending_notice_sent'
-    | undefined;
+  markOnSend?: 'question_sent' | 'terms_presented' | undefined;
+  markReviewNoticeOnSend?: boolean | undefined;
+  markQualificationNoticeOnSend?: boolean | undefined;
 }
 
 interface LeadCaptureState {
@@ -160,11 +149,10 @@ interface LeadCaptureState {
   status: LeadCaptureStatus;
   stage: FunnelStage;
   owner: ConversationOwner;
-  escalationReason: HandoffReason;
+  escalationReason: ReviewReason;
   escalationNotes?: string | undefined;
-  handoffCompleted: boolean;
-  closingMessageSent: boolean;
-  pendingNoticeSent: boolean;
+  reviewNoticeSent: boolean;
+  qualificationNoticeSent: boolean;
   expectedField?: LeadField | undefined;
   pendingObjection?: ObjectionTopic | undefined;
   objectionsDetected: ObjectionTopic[];
@@ -172,8 +160,32 @@ interface LeadCaptureState {
   processedMessageIds: Set<string>;
 }
 
-type SerializedLeadState = Omit<LeadCaptureState, 'processedMessageIds'> & {
-  processedMessageIds: string[];
+type SerializedLeadState = Partial<
+  Omit<
+    LeadCaptureState,
+    | 'processedMessageIds'
+    | 'status'
+    | 'stage'
+    | 'owner'
+    | 'reviewNoticeSent'
+    | 'qualificationNoticeSent'
+  >
+> & {
+  processedMessageIds?: string[];
+  reviewNoticeSent?: boolean;
+  qualificationNoticeSent?: boolean;
+  status?:
+    | LeadCaptureStatus
+    | 'collecting'
+    | 'qualified_lead'
+    | 'early_escalation'
+    | 'handoff_pending'
+    | 'human_owned';
+  stage?: FunnelStage | 'handoff_pending' | 'human_owned';
+  owner?: ConversationOwner | 'human';
+  handoffCompleted?: boolean;
+  closingMessageSent?: boolean;
+  pendingNoticeSent?: boolean;
 };
 
 const SELLER_REQUIRED_FIELDS: Array<keyof LeadCaptureState> = [
@@ -231,7 +243,7 @@ const FIELD_TO_STATE_KEY: Record<LeadField, keyof LeadCaptureState> = {
  * Deterministic SHARH sales-funnel engine.
  *
  * The model may phrase non-standard answers, but this service owns stage,
- * required fields, qualification, handoff, and bot/human conversation control.
+ * required fields, qualification, and the information written to SHARH.
  */
 export class LeadCaptureService {
   private readonly leadStates: Map<string, LeadCaptureState> = new Map();
@@ -265,16 +277,31 @@ export class LeadCaptureService {
       }
 
       const initial = this.createInitialState();
+      const restoredStatus = this.normalizeLegacyStatus(serialized);
       const restored: LeadCaptureState = {
         ...initial,
         ...serialized,
         version: STATE_VERSION,
         entryType: serialized.entryType || 'unknown',
         language: serialized.language || 'en',
-        stage: serialized.stage || this.inferLegacyStage(serialized),
-        owner: serialized.owner || (serialized.handoffCompleted ? 'human' : 'bot'),
-        closingMessageSent: serialized.closingMessageSent || false,
-        pendingNoticeSent: serialized.pendingNoticeSent || false,
+        status: restoredStatus,
+        stage: this.normalizeLegacyStage(serialized, restoredStatus),
+        owner: 'bot',
+        escalationReason:
+          serialized.escalationReason === 'internal_review' ||
+          serialized.status === 'early_escalation' ||
+          serialized.status === 'handoff_pending'
+            ? 'internal_review'
+            : '',
+        reviewNoticeSent:
+          Boolean(serialized.reviewNoticeSent && restoredStatus !== 'qualified') ||
+          serialized.pendingNoticeSent ||
+          false,
+        qualificationNoticeSent:
+          serialized.qualificationNoticeSent ||
+          serialized.closingMessageSent ||
+          Boolean(serialized.reviewNoticeSent && restoredStatus === 'qualified') ||
+          false,
         objectionsDetected: serialized.objectionsDetected || [],
         processedMessageIds: new Set(serialized.processedMessageIds || []),
       };
@@ -282,17 +309,26 @@ export class LeadCaptureService {
     }
   }
 
-  private inferLegacyStage(
-    serialized: Partial<Omit<LeadCaptureState, 'processedMessageIds'>>
-  ): FunnelStage {
-    if (serialized.handoffCompleted) return 'human_owned';
+  private normalizeLegacyStatus(serialized: SerializedLeadState): LeadCaptureStatus {
     if (
+      serialized.status === 'qualified' ||
       serialized.status === 'qualified_lead' ||
-      serialized.status === 'early_escalation' ||
-      serialized.status === 'handoff_pending'
+      serialized.status === 'human_owned' ||
+      serialized.handoffCompleted
     ) {
-      return 'handoff_pending';
+      return 'qualified';
     }
+    if (serialized.status === 'new' && !serialized.messageCount) {
+      return 'new';
+    }
+    return 'contacted';
+  }
+
+  private normalizeLegacyStage(
+    serialized: SerializedLeadState,
+    status: LeadCaptureStatus
+  ): FunnelStage {
+    if (status === 'qualified') return 'qualifying';
     if (serialized.termsAccepted) return 'terms_accepted';
     if (serialized.termsPresented) return 'terms_presented';
     if (serialized.clientName) return 'identity_collected';
@@ -325,20 +361,17 @@ export class LeadCaptureService {
       return { shouldPersist: false };
     }
 
+    const previousStatus = state.status;
+    const previousStage = state.stage;
+
     state.processedMessageIds.add(message.id);
     this.trimProcessedMessageIds(state);
     state.messageCount += 1;
-
-    const previousStatus = state.status;
-    const previousStage = state.stage;
+    if (state.status === 'new') {
+      state.status = 'contacted';
+    }
     const fieldsUpdated: string[] = [];
     const normalizedContent = this.normalizeWhitespace(message.content);
-
-    if (state.owner === 'human') {
-      this.leadStates.set(chatId, state);
-      this.persist(chatId);
-      return { shouldPersist: false };
-    }
 
     const detectedLanguage = this.detectLanguage(
       normalizedContent,
@@ -377,18 +410,16 @@ export class LeadCaptureService {
     }
     this.applyExplicitExtractions(state, normalizedContent, fieldsUpdated);
 
-    if (!state.handoffCompleted) {
-      const earlyEscalationReason = this.detectEarlyEscalationReason(
-        normalizedContent,
-        state.inquiryPurpose
-      );
-      if (earlyEscalationReason) {
-        this.earlyEscalation(state, earlyEscalationReason);
-      }
+    const reviewReason = this.detectEarlyEscalationReason(
+      normalizedContent,
+      state.inquiryPurpose
+    );
+    if (reviewReason) {
+      this.markForReview(state, reviewReason);
     }
 
-    if (!state.handoffCompleted && this.hasRequiredLeadFields(state)) {
-      this.qualifiedLeadHandoff(state);
+    if (state.status !== 'qualified' && this.hasRequiredLeadFields(state)) {
+      this.markQualified(state);
     }
 
     this.recalculateStage(state);
@@ -417,45 +448,20 @@ export class LeadCaptureService {
   getDirective(chatId: string): FunnelDirective {
     const state = this.leadStates.get(chatId) ?? this.createInitialState();
 
-    if (state.owner === 'human' || state.stage === 'human_owned') {
-      if (!state.closingMessageSent) {
+    if (state.status === 'qualified') {
+      if (!state.qualificationNoticeSent) {
         return {
-          stage: 'human_owned',
-          owner: 'human',
-          shouldRespond: true,
-          requiresHandoff: false,
-          directResponse: this.template(state.language, 'handoff_complete'),
-          markOnSend: 'closing_sent',
-        };
-      }
-      return {
-        stage: 'human_owned',
-        owner: 'human',
-        shouldRespond: false,
-        requiresHandoff: false,
-      };
-    }
-
-    if (
-      state.status === 'qualified_lead' ||
-      state.status === 'early_escalation' ||
-      state.status === 'handoff_pending'
-    ) {
-      if (!state.pendingNoticeSent) {
-        return {
-          stage: 'handoff_pending',
+          stage: 'qualifying',
           owner: 'bot',
           shouldRespond: true,
-          requiresHandoff: true,
-          directResponse: this.template(state.language, 'handoff_pending'),
-          markOnSend: 'pending_notice_sent',
+          directResponse: this.template(state.language, 'qualification_complete'),
+          markQualificationNoticeOnSend: true,
         };
       }
       return {
-        stage: 'handoff_pending',
+        stage: 'qualifying',
         owner: 'bot',
-        shouldRespond: false,
-        requiresHandoff: true,
+        shouldRespond: true,
       };
     }
 
@@ -467,7 +473,7 @@ export class LeadCaptureService {
         'inquiry_purpose',
         this.template(state.language, 'ask_purpose')
       );
-      return this.withObjection(state, directive);
+      return this.finalizeDirective(state, directive);
     }
 
     if (!state.clientName) {
@@ -476,16 +482,15 @@ export class LeadCaptureService {
         'client_name',
         this.template(state.language, 'ask_name')
       );
-      return this.withObjection(state, directive);
+      return this.finalizeDirective(state, directive);
     }
 
     if (state.inquiryPurpose === 'selling') {
       if (!state.termsPresented) {
-        return this.withObjection(state, {
+        return this.finalizeDirective(state, {
           stage: 'identity_collected',
           owner: 'bot',
           shouldRespond: true,
-          requiresHandoff: false,
           directResponse: this.template(state.language, 'seller_terms'),
           expectedField: 'seller_terms',
           markOnSend: 'terms_presented',
@@ -500,7 +505,7 @@ export class LeadCaptureService {
             ? this.template(state.language, 'terms_declined')
             : this.template(state.language, 'ask_terms_acceptance')
         );
-        return this.withObjection(state, directive);
+        return this.finalizeDirective(state, directive);
       }
 
       const sellerField = this.nextMissingSellerField(state);
@@ -510,7 +515,7 @@ export class LeadCaptureService {
           sellerField,
           this.questionForField(state.language, sellerField, 'selling')
         );
-        return this.withObjection(state, directive);
+        return this.finalizeDirective(state, directive);
       }
     }
 
@@ -522,7 +527,7 @@ export class LeadCaptureService {
           buyerField,
           this.questionForField(state.language, buyerField, 'buying')
         );
-        return this.withObjection(state, directive);
+        return this.finalizeDirective(state, directive);
       }
     }
 
@@ -530,7 +535,6 @@ export class LeadCaptureService {
       stage: state.stage,
       owner: state.owner,
       shouldRespond: false,
-      requiresHandoff: false,
     };
   }
 
@@ -550,54 +554,19 @@ export class LeadCaptureService {
         state.termsPresented = true;
         state.stage = 'terms_presented';
         break;
-      case 'closing_sent':
-        state.closingMessageSent = true;
-        break;
-      case 'pending_notice_sent':
-        state.pendingNoticeSent = true;
-        break;
       case 'question_sent':
       default:
         break;
     }
 
+    if (directive.markReviewNoticeOnSend) {
+      state.reviewNoticeSent = true;
+    }
+    if (directive.markQualificationNoticeOnSend) {
+      state.qualificationNoticeSent = true;
+    }
+
     state.pendingObjection = undefined;
-    this.persist(chatId);
-  }
-
-  /** Transfer conversation ownership only after manager notification succeeds. */
-  markHandoffCompleted(
-    chatId: string,
-    closingMessageAlreadySent: boolean = false
-  ): void {
-    const state = this.leadStates.get(chatId);
-    if (!state) {
-      return;
-    }
-    state.handoffCompleted = true;
-    state.owner = 'human';
-    state.status = 'human_owned';
-    state.stage = 'human_owned';
-    state.expectedField = undefined;
-    state.pendingNoticeSent = false;
-    state.closingMessageSent = closingMessageAlreadySent;
-    this.persist(chatId);
-  }
-
-  /** Administrative escape hatch for a future manager console/API. */
-  releaseToBot(chatId: string): void {
-    const state = this.leadStates.get(chatId);
-    if (!state) {
-      return;
-    }
-    state.handoffCompleted = false;
-    state.owner = 'bot';
-    state.status = 'collecting';
-    state.closingMessageSent = false;
-    state.pendingNoticeSent = false;
-    state.escalationReason = '';
-    state.escalationNotes = undefined;
-    this.recalculateStage(state);
     this.persist(chatId);
   }
 
@@ -623,7 +592,7 @@ export class LeadCaptureService {
       );
     } else if (state.entryType === 'broker_lead') {
       lines.push(
-        'ENTRY SCENARIO: SHARH broker lead. Consumer qualification is disabled; manager handoff is required.'
+        'ENTRY SCENARIO: SHARH broker lead. Record the available details for internal review and answer only with verified information.'
       );
     }
 
@@ -633,6 +602,11 @@ export class LeadCaptureService {
     }
     if (directive.directResponse) {
       lines.push(`APPLICATION-OWNED NEXT MESSAGE: ${directive.directResponse}`);
+    }
+    if (state.status === 'qualified') {
+      lines.push('CONTROL: Qualification is complete. Continue safe follow-up without restarting the questionnaire.');
+    } else if (state.escalationReason === 'internal_review') {
+      lines.push('CONTROL: The conversation is flagged for internal review. Continue the normal funnel using only verified, non-sensitive guidance.');
     }
 
     return lines.join('\n');
@@ -681,12 +655,6 @@ export class LeadCaptureService {
       `- Objections detected: ${state.objectionsDetected.join(', ') || 'none'}`,
     ];
 
-    if (state.owner === 'human') {
-      lines.push(
-        'CONTROL: Human owns this conversation. The bot must not continue qualification.'
-      );
-    }
-
     return lines.join('\n');
   }
 
@@ -718,13 +686,12 @@ export class LeadCaptureService {
       entryType: 'unknown',
       language: 'en',
       termsPresented: false,
-      status: 'collecting',
+      status: 'new',
       stage: 'new',
       owner: 'bot',
       escalationReason: '',
-      handoffCompleted: false,
-      closingMessageSent: false,
-      pendingNoticeSent: false,
+      reviewNoticeSent: false,
+      qualificationNoticeSent: false,
       objectionsDetected: [],
       messageCount: 0,
       processedMessageIds: new Set<string>(),
@@ -740,26 +707,38 @@ export class LeadCaptureService {
       stage: state.stage,
       owner: state.owner,
       shouldRespond: true,
-      requiresHandoff: false,
       directResponse: response,
       expectedField: field,
       markOnSend: 'question_sent',
     };
   }
 
-  private withObjection(
+  private finalizeDirective(
     state: LeadCaptureState,
     directive: FunnelDirective
   ): FunnelDirective {
-    if (!state.pendingObjection || !directive.directResponse) {
+    let response = directive.directResponse;
+    if (!response) {
       return directive;
     }
-    return {
-      ...directive,
-      directResponse: `${this.playbook.objectionResponse(
+
+    if (state.pendingObjection) {
+      response = `${this.playbook.objectionResponse(
         state.language,
         state.pendingObjection
-      )}\n\n${directive.directResponse}`,
+      )}\n\n${response}`;
+    }
+
+    const includeReviewNotice =
+      state.escalationReason === 'internal_review' && !state.reviewNoticeSent;
+    if (includeReviewNotice) {
+      response = `${this.template(state.language, 'review_notice')}\n\n${response}`;
+    }
+
+    return {
+      ...directive,
+      directResponse: response,
+      markReviewNoticeOnSend: includeReviewNotice || undefined,
     };
   }
 
@@ -1060,10 +1039,6 @@ export class LeadCaptureService {
       );
     }
 
-    if (state.specificListingCode) {
-      return false;
-    }
-
     return BUYER_REQUIRED_FIELDS.every(field => this.hasValue(state[field]));
   }
 
@@ -1100,32 +1075,18 @@ export class LeadCaptureService {
   }
 
   private recalculateStage(state: LeadCaptureState): void {
-    if (state.owner === 'human' || state.handoffCompleted) {
-      state.stage = 'human_owned';
-      state.status = 'human_owned';
-      return;
-    }
-
-    if (
-      state.status === 'qualified_lead' ||
-      state.status === 'early_escalation' ||
-      state.status === 'handoff_pending'
-    ) {
-      state.stage = 'handoff_pending';
+    if (state.status === 'qualified') {
+      state.stage = 'qualifying';
       return;
     }
 
     if (state.inquiryPurpose === 'selling' && state.termsAccepted === true) {
-      state.stage = this.nextMissingSellerField(state)
-        ? 'qualifying'
-        : 'handoff_pending';
+      state.stage = 'qualifying';
       return;
     }
 
     if (state.inquiryPurpose === 'buying' && state.clientName) {
-      state.stage = this.nextMissingBuyerField(state)
-        ? 'qualifying'
-        : 'handoff_pending';
+      state.stage = 'qualifying';
       return;
     }
 
@@ -1208,7 +1169,7 @@ export class LeadCaptureService {
       nextBestActionCode: '',
       objectionsDetected: state.objectionsDetected.join(', '),
       conversationSummary: '',
-      managerBrief: '',
+      reviewBrief: '',
     };
     const score = this.scoring.evaluate(base);
     base.leadScore = score.score;
@@ -1219,7 +1180,7 @@ export class LeadCaptureService {
     base.nextBestAction = score.nextBestAction;
     base.nextBestActionCode = score.nextBestActionCode;
     base.conversationSummary = this.summaries.build(base);
-    base.managerBrief = this.summaries.buildManagerBrief(base);
+    base.reviewBrief = this.summaries.buildReviewBrief(base);
     return base;
   }
 
@@ -1272,7 +1233,7 @@ export class LeadCaptureService {
       const details = this.parseBrokerLeadDetails(content);
       state.brokerLeadSummary = details.summary;
       if (details.score) state.brokerLeadScore = details.score;
-      this.earlyEscalation(
+      this.markForReview(
         state,
         `SHARH broker lead discussion: ${details.summary}${
           details.score ? ` (Score ${details.score})` : ''
@@ -1618,7 +1579,7 @@ export class LeadCaptureService {
         value
       ) ||
       /(مدير|موظف|شخص حقيقي).{0,20}(تحدث|حول|اربط)|أريد مدير/i.test(value);
-    if (managerRequest) return 'Explicit client request for a live manager';
+    if (managerRequest) return 'Explicit client request for human follow-up';
 
     const aggression =
       /\b(stupid|idiot|useless|terrible|worst|damn|shit|fuck)\b/.test(
@@ -1641,40 +1602,28 @@ export class LeadCaptureService {
         value
       ) ||
       /(قانون|ضريبة|امتثال|طريقة التقييم|العناية الواجبة|بند العقد)/i.test(value);
-    if (complexQuestion) return 'Complex question requiring manager review';
+    if (complexQuestion) return 'Complex question requiring internal review';
 
-    const listingCode = this.extractListingCode(value);
-    const asksSpecificListing =
-      Boolean(listingCode) ||
-      (/\blisting\b/.test(normalized) &&
-        /\b(id|code|number|specific|#)\b/.test(normalized));
-    if (asksSpecificListing && purpose === 'buying') {
-      return listingCode
-        ? `Buyer requested specific listing ${listingCode}`
-        : 'Buyer requested details for a specific listing';
-    }
-    if (asksSpecificListing && !purpose) {
-      return listingCode
-        ? `Requested specific listing ${listingCode}`
-        : 'Requested details for a specific listing';
-    }
     return null;
   }
 
 
-  private qualifiedLeadHandoff(state: LeadCaptureState): void {
-    state.status = 'qualified_lead';
-    state.escalationReason = 'qualified_lead';
-    state.stage = 'handoff_pending';
+  private markQualified(state: LeadCaptureState): void {
+    state.status = 'qualified';
+    state.stage = 'qualifying';
     state.expectedField = undefined;
+    state.qualificationNoticeSent = false;
   }
 
-  private earlyEscalation(state: LeadCaptureState, reason: string): void {
-    state.status = 'early_escalation';
-    state.escalationReason = 'early_escalation';
+  private markForReview(state: LeadCaptureState, reason: string): void {
+    if (
+      state.escalationReason !== 'internal_review' ||
+      state.escalationNotes !== reason
+    ) {
+      state.reviewNoticeSent = false;
+    }
+    state.escalationReason = 'internal_review';
     state.escalationNotes = reason;
-    state.stage = 'handoff_pending';
-    state.expectedField = undefined;
   }
 
   private detectLanguage(
@@ -1855,8 +1804,8 @@ export class LeadCaptureService {
       | 'seller_terms'
       | 'ask_terms_acceptance'
       | 'terms_declined'
-      | 'handoff_pending'
-      | 'handoff_complete'
+      | 'review_notice'
+      | 'qualification_complete'
   ): string {
     const templates: Record<ConversationLanguage, Record<string, string>> = {
       en: {
@@ -1868,10 +1817,10 @@ export class LeadCaptureService {
         ask_terms_acceptance: 'Do you agree to the SHARH confidentiality, process, and commission terms?',
         terms_declined:
           'Understood. Which part of the terms would you like clarified?',
-        handoff_pending:
-          'Thank you. I have recorded the available details and the conversation is awaiting manager review.',
-        handoff_complete:
-          'Thank you. A SHARH manager will continue the conversation with you. You can optionally create a SHARH account later to track enquiries, documents, and deal progress.',
+        review_notice:
+          'I have recorded this for SHARH review. I can continue helping with verified information and clarify any remaining details.',
+        qualification_complete:
+          'Thank you. Your information has been recorded successfully for SHARH review. I can still help with questions or clarify any details.',
       },
       ru: {
         ask_purpose:
@@ -1882,10 +1831,10 @@ export class LeadCaptureService {
         ask_terms_acceptance:
           'Вы согласны с условиями SHARH по конфиденциальности, процессу и комиссии?',
         terms_declined: 'Понял. Какую часть условий нужно уточнить?',
-        handoff_pending:
-          'Спасибо. Доступные данные зафиксированы, и диалог ожидает рассмотрения менеджером.',
-        handoff_complete:
-          'Спасибо. Далее диалог продолжит менеджер SHARH. Позже вы сможете при желании создать аккаунт SHARH, чтобы отслеживать запросы, документы и прогресс сделки.',
+        review_notice:
+          'Я зафиксировал информацию для рассмотрения командой SHARH. Я могу продолжить отвечать на подтверждённые вопросы и уточнять детали.',
+        qualification_complete:
+          'Спасибо. Информация успешно сохранена для рассмотрения командой SHARH. Я могу продолжить отвечать на вопросы или уточнять детали.',
       },
       ar: {
         ask_purpose:
@@ -1896,10 +1845,10 @@ export class LeadCaptureService {
         ask_terms_acceptance:
           'هل توافق على شروط SHARH المتعلقة بالسرية والإجراءات والعمولة؟',
         terms_declined: 'مفهوم. أي جزء من الشروط تريد توضيحه؟',
-        handoff_pending:
-          'شكراً. تم تسجيل المعلومات المتاحة والمحادثة بانتظار مراجعة المدير.',
-        handoff_complete:
-          'شكراً. سيتابع مدير من SHARH المحادثة معك. ويمكنك لاحقاً إنشاء حساب SHARH بشكل اختياري لمتابعة الاستفسارات والمستندات وتقدم الصفقة.',
+        review_notice:
+          'تم تسجيل المعلومات لمراجعة فريق SHARH. ويمكنني الاستمرار في تقديم المعلومات الموثقة وتوضيح التفاصيل.',
+        qualification_complete:
+          'شكراً. تم حفظ معلوماتك بنجاح لمراجعة فريق SHARH. ويمكنني الاستمرار في الإجابة عن الأسئلة أو توضيح التفاصيل.',
       },
     };
     return templates[language][key] || templates.en[key] || '';

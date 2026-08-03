@@ -12,8 +12,6 @@ const MAX_RECORDS = 5000;
 
 export type OutboundMessagePurpose =
   | 'bot_reply'
-  | 'handoff_notification'
-  | 'manager_reply'
   | 'system_notice';
 
 export interface DeliveryRecord {

@@ -174,7 +174,6 @@ describe('ChatbotService', () => {
         sharhApiEnabled: false,
         sharhApiReachable: null,
         sharhSyncPending: 0,
-        activeHandoffs: 0,
         deliveryStatuses: {},
       });
     });

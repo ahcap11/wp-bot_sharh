@@ -7,7 +7,6 @@ import {
   getAccessControlConfig,
   getMessagingConfig,
   getSharhApiConfig,
-  getHandoffConfig,
   getSalesPlaybookVersion,
 } from './config';
 import { createMessagingTransport } from './services/messaging-transport.factory';
@@ -56,7 +55,6 @@ class WhatsAppAIChatbot {
       const accessControlConfig = getAccessControlConfig();
       const sharhApiConfig = getSharhApiConfig();
       const messagingConfig = getMessagingConfig();
-      const handoffConfig = getHandoffConfig();
       const salesPlaybookVersion = getSalesPlaybookVersion();
       this.webSocketPort = appConfig.healthPort;
 
@@ -139,7 +137,6 @@ class WhatsAppAIChatbot {
         accessControlService,
         sharhApiService,
         sharhSyncService,
-        handoffConfig,
         messageDeliveryService,
         funnelQualityService
       );

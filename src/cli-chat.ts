@@ -4,6 +4,7 @@ import {
   getNeonSearchConfig,
   getSharhApiConfig,
   getAppConfig,
+  getMessagingConfig,
 } from './config';
 import { WhatsAppService } from './services/whatsapp.service';
 import { WebSocketService } from './services/websocket.service';
@@ -27,7 +28,7 @@ class TerminalWhatsAppService extends WhatsAppService {
   private messageHandler: ((message: WhatsAppMessage) => void) | null = null;
 
   constructor(private readonly onReply: (text: string) => void) {
-    super();
+    super(getMessagingConfig());
   }
 
   override async initialize(): Promise<void> {
@@ -266,7 +267,7 @@ function printBanner(
   process.stdout.write('Default role : sales\n');
   process.stdout.write('-'.repeat(60) + '\n');
   process.stdout.write('The terminal starts in the deterministic sales funnel.\n');
-  process.stdout.write('Role switching follows ROLE_SWITCH_ENABLED / OPERATOR_JIDS.\n');
+  process.stdout.write('Role switching follows ROLE_SWITCH_ENABLED.\n');
   process.stdout.write('Commands: /help, /exit\n');
   process.stdout.write('='.repeat(60) + '\n\n');
 }

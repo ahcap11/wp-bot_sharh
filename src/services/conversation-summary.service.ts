@@ -25,7 +25,7 @@ export class ConversationSummaryService {
       .join(' ');
   }
 
-  buildManagerBrief(record: LeadCaptureRecord): string {
+  buildReviewBrief(record: LeadCaptureRecord): string {
     const lines = [
       `Lead score: ${record.leadScore}/100 (${record.leadGrade}, ${record.leadTemperature})`,
       `Playbook: ${record.playbookVersion}`,

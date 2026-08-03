@@ -9,7 +9,6 @@ import {
 } from './lead-capture.service';
 import { PersistenceService } from './persistence.service';
 import { AccessControlService } from './access-control.service';
-import { HandoffService, OperatorCommandResult } from './handoff.service';
 import { MessageDeliveryService } from './message-delivery.service';
 import { SharhApiService } from './sharh-api.service';
 import { SharhSyncService } from './sharh-sync.service';
@@ -20,7 +19,6 @@ import {
   ConnectionStatus,
   BotRole,
   MessagingTransport,
-  HandoffConfig,
   MessageDeliveryUpdate,
   MessagingSendResult,
 } from '../types';
@@ -54,10 +52,8 @@ export class ChatbotService {
   private leadCaptureService: LeadCaptureService | null;
   private persistence: PersistenceService | null;
   private accessControl: AccessControlService | null;
-  private handoffService: HandoffService;
   private readonly ignoreGroups: boolean;
   private readonly roleSwitchEnabled: boolean;
-  private readonly operatorJids: Set<string>;
   private readonly sharhApiService: SharhApiService | null;
   private readonly sharhSyncService: SharhSyncService | null;
   private readonly messageDeliveryService: MessageDeliveryService;
@@ -76,11 +72,6 @@ export class ChatbotService {
     accessControl: AccessControlService | null = null,
     sharhApiService: SharhApiService | null = null,
     sharhSyncService: SharhSyncService | null = null,
-    handoffConfig: HandoffConfig = {
-      jids: [],
-      retryIntervalMs: 30000,
-      maxAttempts: 12,
-    },
     messageDeliveryService: MessageDeliveryService | null = null,
     funnelQualityService: FunnelQualityService | null = null
   ) {
@@ -101,21 +92,6 @@ export class ChatbotService {
 
     this.ignoreGroups = process.env['IGNORE_GROUPS'] !== 'false';
     this.roleSwitchEnabled = process.env['ROLE_SWITCH_ENABLED'] === 'true';
-    this.operatorJids = new Set(
-      (process.env['OPERATOR_JIDS'] || '')
-        .split(',')
-        .map(value => value.trim())
-        .filter(Boolean)
-    );
-    this.handoffService = new HandoffService(
-      whatsappService,
-      handoffConfig,
-      persistence,
-      sharhApiService,
-      this.messageDeliveryService,
-      sharhSyncService
-    );
-
     this.hydrateRoles();
     this.hydrateInboundDedup();
     this.setupEventHandlers();
@@ -171,7 +147,6 @@ export class ChatbotService {
 
     this.whatsappService.onDeliveryStatus?.((update: MessageDeliveryUpdate) => {
       const record = this.messageDeliveryService.applyUpdate(update);
-      this.handoffService.handleDeliveryUpdate(update);
       this.sharhSyncService?.enqueueAnalytics(
         'whatsapp_message_delivery_status',
         record?.chatId || update.recipientId || 'unknown',
@@ -198,7 +173,6 @@ export class ChatbotService {
 
       // Initialize WhatsApp service
       await this.whatsappService.initialize();
-      this.handoffService.start();
 
       // Initialize optional Google Sheets integration
       if (this.googleSheetsService) {
@@ -353,10 +327,6 @@ export class ChatbotService {
         incomingMessage.id
       );
 
-      if (await this.handleOperatorMessage(incomingMessage)) {
-        return;
-      }
-
       // Capture lead data and resolve the application-owned funnel action.
       const salesTurn = await this.captureSalesLeadData(
         chatId,
@@ -369,7 +339,6 @@ export class ChatbotService {
           chatId,
           stage: salesTurn.directive.stage,
           owner: salesTurn.directive.owner,
-          requiresHandoff: salesTurn.directive.requiresHandoff,
         });
         return;
       }
@@ -615,11 +584,8 @@ export class ChatbotService {
   private resolveChatRole(chatId: string, messageContent: string): BotRole {
     const currentRole = this.chatRoles.get(chatId) || this.defaultRole;
 
-    // Client-triggered role switching is OFF by default. It is honored only when
-    // explicitly enabled, or when the chat belongs to a configured operator.
-    const switchingAllowed =
-      this.roleSwitchEnabled || this.operatorJids.has(chatId);
-    const requestedRole = switchingAllowed
+    // Client-triggered role switching is OFF by default.
+    const requestedRole = this.roleSwitchEnabled
       ? this.detectRequestedRole(messageContent)
       : null;
 
@@ -695,17 +661,6 @@ export class ChatbotService {
       let record = update.record || this.leadCaptureService.getCurrentRecord(chatId);
       let directive = this.leadCaptureService.getDirective(chatId);
 
-      let handoffCompletedNow = false;
-      if (directive.requiresHandoff && record) {
-        const handoff = await this.handoffService.notify(chatId, record);
-        if (handoff.accepted) {
-          this.leadCaptureService.markHandoffCompleted(chatId);
-          handoffCompletedNow = true;
-          directive = this.leadCaptureService.getDirective(chatId);
-          record = this.leadCaptureService.getCurrentRecord(chatId) || record;
-        }
-      }
-
       const scenario = this.leadCaptureService.getConversationContext(chatId);
       const knownFacts = this.leadCaptureService.getKnownFactsBlock(chatId);
       const backendContext = this.sharhApiService?.isEnabled()
@@ -725,8 +680,8 @@ export class ChatbotService {
           .filter(Boolean)
           .join('\n\n') || undefined;
 
-      const recordToPersist = handoffCompletedNow ? record : update.record;
-      if ((update.shouldPersist || handoffCompletedNow) && recordToPersist) {
+      const recordToPersist = update.record;
+      if (update.shouldPersist && recordToPersist) {
         this.sharhSyncService?.enqueueLead(recordToPersist, message.id);
         if (this.isExplicitAccessRequest(message.content, recordToPersist)) {
           this.sharhSyncService?.enqueueAccessRequest(
@@ -765,7 +720,7 @@ export class ChatbotService {
         );
       }
       if (
-        (update.shouldPersist || handoffCompletedNow) &&
+        update.shouldPersist &&
         recordToPersist &&
         this.googleSheetsService
       ) {
@@ -805,9 +760,9 @@ export class ChatbotService {
 
   private safeSalesFallback(language: 'en' | 'ru' | 'ar'): string {
     const messages = {
-      en: 'I can only provide verified SHARH information. A manager will clarify this point where needed.',
-      ru: 'Я могу сообщать только подтверждённую информацию SHARH. При необходимости этот вопрос уточнит менеджер.',
-      ar: 'يمكنني تقديم معلومات SHARH الموثقة فقط، وسيقوم المدير بتوضيح هذه النقطة عند الحاجة.',
+      en: 'I can only provide verified SHARH information. The SHARH team can review this point where needed.',
+      ru: 'Я могу сообщать только подтверждённую информацию SHARH. При необходимости этот вопрос проверит команда SHARH.',
+      ar: 'يمكنني تقديم معلومات SHARH الموثقة فقط، ويمكن لفريق SHARH مراجعة هذه النقطة عند الحاجة.',
     };
     return messages[language];
   }
@@ -826,101 +781,6 @@ export class ChatbotService {
     return /(?:\b(?:nda|data\s*room|dataroom|access|documents?|full\s+financials|confidential\s+(?:details|information))\b|(?:доступ|дата\s*рум|документ|финансов\w*\s+данн|соглашен\w*\s+о\s+неразглаш)|(?:اتفاقية\s+عدم\s+الإفشاء|وصول|غرفة\s+البيانات|مستندات|بيانات\s+مالية))/iu.test(
       content
     );
-  }
-
-  private async handleOperatorMessage(
-    message: WhatsAppMessage
-  ): Promise<boolean> {
-    if (!this.isOperator(message.from)) return false;
-    const command = await this.handoffService.executeOperatorCommand(
-      message.from,
-      message.content
-    );
-    if (!command.handled) return false;
-
-    if (command.targetChatId && command.transition) {
-      await this.applyOperatorTransition(command);
-      this.sharhSyncService?.enqueueAnalytics(
-        `handoff_${command.transition}`,
-        command.targetChatId,
-        { operator_jid: message.from },
-        `${message.id}-${command.transition}`
-      );
-    }
-
-    if (command.reply) {
-      const result = await this.sendDetailed(message.from, command.reply);
-      this.messageDeliveryService.recordAccepted(
-        `operator-command-${message.id}`,
-        message.from,
-        command.reply,
-        'system_notice',
-        result
-      );
-    }
-    return true;
-  }
-
-  private async applyOperatorTransition(
-    command: OperatorCommandResult
-  ): Promise<void> {
-    const targetChatId = command.targetChatId;
-    if (!targetChatId || !command.transition) return;
-
-    if (command.transition === 'accepted') {
-      this.leadCaptureService?.markHandoffCompleted(targetChatId, true);
-    } else if (command.transition === 'released') {
-      this.leadCaptureService?.releaseToBot(targetChatId);
-      this.chatRoles.set(targetChatId, 'support');
-      this.persistRole(targetChatId, 'support');
-    } else if (command.transition === 'closed') {
-      this.leadCaptureService?.markHandoffCompleted(targetChatId, true);
-    }
-
-    if (command.customerMessage) {
-      const result = await this.sendDetailed(
-        targetChatId,
-        command.customerMessage
-      );
-      const localId =
-        result.providerMessageIds[0] ||
-        `handoff-transition-${command.transition}-${Date.now()}`;
-      this.messageDeliveryService.recordAccepted(
-        localId,
-        targetChatId,
-        command.customerMessage,
-        'system_notice',
-        result
-      );
-      if (result.success) {
-        const systemMessage: WhatsAppMessage = {
-          id: localId,
-          from: 'system',
-          to: targetChatId,
-          timestamp: Date.now(),
-          type: 'text',
-          content: command.customerMessage,
-          isGroup: false,
-          senderName: 'SHARH',
-          isFromBot: true,
-        };
-        this.chatHistoryService.addMessage(targetChatId, systemMessage);
-        this.sharhSyncService?.enqueueMessage(
-          targetChatId,
-          'outbound',
-          systemMessage,
-          command.transition === 'released' ? 'support' : 'sales'
-        );
-      }
-    }
-  }
-
-  private isOperator(jid: string): boolean {
-    const normalized = jid.split('@')[0]?.replace(/\D/g, '') || '';
-    return [...this.operatorJids].some(operator => {
-      const operatorNumber = operator.split('@')[0]?.replace(/\D/g, '') || '';
-      return Boolean(normalized && operatorNumber === normalized);
-    });
   }
 
   private async sendDetailed(
@@ -958,7 +818,6 @@ export class ChatbotService {
     sharhApiEnabled: boolean;
     sharhApiReachable: boolean | null;
     sharhSyncPending: number;
-    activeHandoffs: number;
     deliveryStatuses: Record<string, number>;
   } {
     const sharhStatus = this.sharhApiService?.getRuntimeStatus();
@@ -972,7 +831,6 @@ export class ChatbotService {
       sharhApiEnabled: sharhStatus?.enabled || false,
       sharhApiReachable: sharhStatus?.reachable ?? null,
       sharhSyncPending: this.sharhSyncService?.getPendingCount() || 0,
-      activeHandoffs: this.handoffService.getActiveCount(),
       deliveryStatuses: this.messageDeliveryService.countByStatus(),
     };
   }
@@ -1042,7 +900,6 @@ export class ChatbotService {
     logger.info('Shutting down chatbot...');
 
     try {
-      this.handoffService.stop();
       this.sharhSyncService?.stop();
       await this.sharhSyncService?.flush();
       await this.whatsappService.disconnect();

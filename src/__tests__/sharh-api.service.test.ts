@@ -7,7 +7,6 @@ const config = (overrides: Partial<SharhApiConfig> = {}): SharhApiConfig => ({
   serviceToken: 'service-token',
   timeoutMs: 5000,
   botId: 'whatsapp-funnel',
-  requireHandoffPersistence: true,
   allowNeonFallback: false,
   publicListingFields: ['public_code', 'title', 'sector', 'price'],
   syncIntervalMs: 30000,

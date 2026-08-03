@@ -169,15 +169,19 @@ export class LeadScoringService {
     record: LeadCaptureRecord,
     riskFlags: string[]
   ): { code: string; label: string } {
-    if (record.owner === 'human') {
-      return { code: 'human_follow_up', label: 'Assigned manager should continue the conversation.' };
-    }
-    if (record.funnelStage === 'handoff_pending') {
+    if (record.status === 'qualified' || record.completionPercent >= 100) {
       return {
-        code: 'manager_review_and_accept',
-        label: record.inquiryPurpose === 'selling'
-          ? 'Manager should review the seller brief, validate financials, and accept the handoff.'
-          : 'Manager should review buyer fit, funding readiness, and accept the handoff.',
+        code: 'review_qualified_lead',
+        label:
+          record.inquiryPurpose === 'selling'
+            ? 'Review the qualified seller information in SHARH and validate critical financial data before follow-up.'
+            : 'Review the qualified buyer information in SHARH and validate fit and funding before follow-up.',
+      };
+    }
+    if (record.escalationReason === 'internal_review') {
+      return {
+        code: 'review_flagged_conversation',
+        label: 'Review the flagged conversation in SHARH and decide whether human follow-up is needed.',
       };
     }
     if (record.nextField) {

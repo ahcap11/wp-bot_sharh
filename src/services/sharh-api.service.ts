@@ -45,10 +45,6 @@ export class SharhApiService {
     return this.config.enabled;
   }
 
-  requiresHandoffPersistence(): boolean {
-    return this.config.enabled && this.config.requireHandoffPersistence;
-  }
-
   getConfig(): SharhApiConfig {
     return this.config;
   }
@@ -217,62 +213,6 @@ export class SharhApiService {
         requested_data_classes: ['confidential_listing_details'],
         source: 'whatsapp_bot',
         requested_at: record.timestamp,
-      },
-      idempotencyKey
-    );
-    return result.ok;
-  }
-
-  async createHandoff(
-    record: LeadCaptureRecord,
-    idempotencyKey: string,
-    metadata: {
-      handoffReference?: string | undefined;
-      assignedManagerJid?: string | null | undefined;
-    } = {}
-  ): Promise<boolean> {
-    if (!this.config.enabled) {
-      return true;
-    }
-
-    const result = await this.request<unknown>(
-      'POST',
-      '/api/v1/bot/handoffs',
-      {
-        external_chat_id: record.chatId,
-        source_jid: record.sourceJid,
-        client_phone: record.clientPhone || null,
-        client_name: record.clientName || null,
-        inquiry_purpose: record.inquiryPurpose || null,
-        listing_public_code: record.specificListingCode || null,
-        reason: record.escalationReason || record.status,
-        status: record.status,
-        funnel_stage: record.funnelStage,
-        completion_percent: record.completionPercent,
-        handoff_reference: metadata.handoffReference || null,
-        assigned_manager_jid: metadata.assignedManagerJid || null,
-        summary: this.toLeadPayload(record),
-      },
-      idempotencyKey
-    );
-    return result.ok;
-  }
-
-  async recordHandoffEvent(
-    handoffReference: string,
-    event: 'notified' | 'accepted' | 'released' | 'closed',
-    operatorJid: string,
-    idempotencyKey: string
-  ): Promise<boolean> {
-    if (!this.config.enabled) return false;
-    const result = await this.request<unknown>(
-      'POST',
-      `/api/v1/bot/handoffs/${encodeURIComponent(handoffReference)}/events`,
-      {
-        event,
-        operator_jid: operatorJid,
-        occurred_at: new Date().toISOString(),
-        source: 'whatsapp_bot',
       },
       idempotencyKey
     );
@@ -616,7 +556,7 @@ export class SharhApiService {
           ? record.objectionsDetected.split(',').map(value => value.trim()).filter(Boolean)
           : [],
         conversation_summary: record.conversationSummary,
-        manager_brief: record.managerBrief,
+        review_brief: record.reviewBrief,
       },
       next_field: record.nextField || null,
       fields_updated: record.fieldsUpdated

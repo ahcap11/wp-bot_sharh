@@ -5,7 +5,6 @@ import {
   getNeonSearchConfig,
   getSharhApiConfig,
   getMessagingConfig,
-  getHandoffConfig,
 } from '../config';
 
 /**
@@ -250,23 +249,6 @@ describe('config', () => {
     });
   });
 
-  describe('getHandoffConfig', () => {
-    it('parses manager recipients and retry settings', () => {
-      process.env['AI_PROVIDER'] = 'openai';
-      process.env['OPENAI_API_KEY'] = 'sk-test';
-      process.env['HANDOFF_WHATSAPP_JIDS'] =
-        '971502106179@s.whatsapp.net, manager-2@s.whatsapp.net';
-      process.env['HANDOFF_RETRY_INTERVAL_MS'] = '45000';
-      process.env['HANDOFF_MAX_ATTEMPTS'] = '20';
-
-      const config = getHandoffConfig();
-
-      expect(config.jids).toHaveLength(2);
-      expect(config.retryIntervalMs).toBe(45000);
-      expect(config.maxAttempts).toBe(20);
-    });
-  });
-
   describe('getSharhApiConfig', () => {
     it('parses canonical integration settings', () => {
       process.env['AI_PROVIDER'] = 'openai';
@@ -281,7 +263,6 @@ describe('config', () => {
       expect(config.enabled).toBe(true);
       expect(config.baseUrl).toBe('https://sharh.example.com');
       expect(config.serviceToken).toBe('service-token');
-      expect(config.requireHandoffPersistence).toBe(true);
       expect(config.allowNeonFallback).toBe(false);
       expect(config.publicListingFields).toContain('public_code');
     });

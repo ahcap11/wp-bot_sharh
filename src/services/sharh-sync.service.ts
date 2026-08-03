@@ -117,28 +117,6 @@ export class SharhSyncService {
     this.enqueue('access_request', idempotencyKey, { record });
   }
 
-  enqueueHandoffEvent(
-    handoffReference: string,
-    event: 'notified' | 'accepted' | 'released' | 'closed',
-    operatorJid: string
-  ): void {
-    if (!this.api.isEnabled()) {
-      return;
-    }
-
-    const idempotencyKey = this.api.buildIdempotencyKey(
-      'handoff-event',
-      handoffReference,
-      event,
-      operatorJid
-    );
-    this.enqueue('handoff_event', idempotencyKey, {
-      handoffReference,
-      event,
-      operatorJid,
-    });
-  }
-
   enqueueProviderWebhook(rawBody: Buffer | string): void {
     if (!this.api.isEnabled()) {
       return;
@@ -298,30 +276,6 @@ export class SharhSyncService {
           return true;
         }
         return this.api.createAccessRequest(record, operation.idempotencyKey);
-      }
-      case 'handoff_event': {
-        const handoffReference = this.readString(
-          operation.payload,
-          'handoffReference'
-        );
-        const event = this.readString(operation.payload, 'event');
-        const operatorJid = this.readString(operation.payload, 'operatorJid');
-        if (
-          !handoffReference ||
-          !operatorJid ||
-          (event !== 'notified' &&
-            event !== 'accepted' &&
-            event !== 'released' &&
-            event !== 'closed')
-        ) {
-          return true;
-        }
-        return this.api.recordHandoffEvent(
-          handoffReference,
-          event,
-          operatorJid,
-          operation.idempotencyKey
-        );
       }
       case 'provider_event': {
         return this.api.forwardWhatsAppProviderEvent(

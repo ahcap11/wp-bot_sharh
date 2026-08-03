@@ -59,7 +59,7 @@ const SHEET_HEADERS = [
   'next_best_action_code',
   'objections_detected',
   'conversation_summary',
-  'manager_brief',
+  'review_brief',
 ];
 
 interface ServiceAccountCredentials {
@@ -404,8 +404,8 @@ export class GoogleSheetsService {
         return this.normalizeCell(record.objectionsDetected);
       case 'conversation_summary':
         return this.normalizeCell(record.conversationSummary);
-      case 'manager_brief':
-        return this.normalizeCell(record.managerBrief);
+      case 'review_brief':
+        return this.normalizeCell(record.reviewBrief);
       default:
         return '';
     }
@@ -483,7 +483,7 @@ export class GoogleSheetsService {
       record.nextBestActionCode,
       record.objectionsDetected,
       record.conversationSummary,
-      record.managerBrief,
+      record.reviewBrief,
     ].map(cell => this.normalizeCell(cell));
   }
 

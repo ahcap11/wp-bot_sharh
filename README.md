@@ -29,8 +29,8 @@ A sophisticated WhatsApp AI chatbot built with Node.js, TypeScript, and OpenAI o
 - **⚡ Auto-Reply**: Instant responses to incoming messages
 - **🧭 Deterministic SHARH Funnel**: Application-owned buyer and seller stages, required fields, and next actions
 - **🌍 Multilingual Qualification**: English, Russian, and Arabic conversation and field normalization
-- **🤝 Reliable Manager Handoff**: Retryable delivery, manager summaries, and bot suppression after ownership transfer
-- **🎭 Controlled Role Switching**: Support/sales switching is disabled for clients by default and can be limited to operators
+- **🗂️ SHARH Lead Sync**: Qualified conversations, structured answers, scoring, risks, and transcripts are saved through the scoped SHARH API
+- **🎭 Controlled Role Switching**: Support/sales switching is disabled for clients by default
 - **📄 Google Sheets Lead Sync**: Writes structured funnel snapshots as an optional reporting export
 - **🔧 Configurable**: Easy environment-based configuration
 - **📊 Logging**: Comprehensive logging with Winston
@@ -141,10 +141,9 @@ src/
 │   ├── chat-history.service.ts # Message history
 │   ├── websocket.service.ts    # Real-time communication
 │   ├── lead-capture.service.ts # Deterministic SHARH funnel and qualification state
-│   ├── handoff.service.ts      # Durable assignment, acceptance and takeover
 │   ├── message-delivery.service.ts # Provider delivery/read/failure tracking
 │   ├── google-sheets.service.ts# Optional lead snapshot export
-│   └── chatbot.service.ts      # Main orchestrator and ownership enforcement
+│   └── chatbot.service.ts      # Main funnel and messaging orchestrator
 ├── types/          # TypeScript type definitions
 ├── utils/          # Utilities (logging, etc.)
 └── index.ts        # Application entry point
@@ -196,45 +195,19 @@ When enabled, the bot writes structured sales lead snapshots whenever key data i
 
 ### SHARH Sales Funnel
 
-The sales role is controlled by `LeadCaptureService`, not by the language model. The application determines the current stage, the one next required field, qualification completion, escalation, and conversation ownership. Standard funnel questions are sent without an AI request. AI is retained for approved objection handling and non-standard support/fallback turns.
+The sales role is controlled by `LeadCaptureService`, not by the language model. The application determines the current stage, the next required field, and qualification completion. Standard funnel questions are sent without an AI request. AI is retained for approved objection handling and safe follow-up turns.
 
 Seller flow:
 
 ```text
-intent → name → terms → qualification → handoff pending → human owned
+intent → name → terms → qualification → saved in SHARH
 ```
 
 Seller qualification captures business activity, location, annual revenue, lease, expected price, establishment year, employee count, monthly operating expenses, monthly net profit, liabilities, licences/contracts, sale reason/timing, and included assets. Explicit acceptance of the SHARH terms is required before seller qualification.
 
-Buyer qualification captures sector, budget, location, acquisition timeline, operating involvement, funding status, and additional requirements. A request containing a public listing code such as `SH-0042` is escalated instead of exposing arbitrary database fields.
+Buyer qualification captures sector, budget, location, acquisition timeline, operating involvement, funding status, and additional requirements. A request containing a public listing code such as `SH-0042` is resolved through SHARH’s server-filtered public listing endpoint; confidential requests create a pending access request.
 
-The bot mirrors English, Russian, or Arabic and keeps the selected language across neutral answers such as numbers, locations, and brand names. Registration is not required to begin; it is offered only after value has been created and a manager handoff is complete.
-
-### Manager Handoff
-
-Configure the production manager and durable retry policy:
-
-```env
-HANDOFF_WHATSAPP_JIDS=971502106179@s.whatsapp.net
-HANDOFF_RETRY_INTERVAL_MS=30000
-HANDOFF_MAX_ATTEMPTS=12
-OPERATOR_JIDS=971502106179@s.whatsapp.net
-```
-
-A successful notification creates a `HF-...` reference but does **not** transfer ownership by itself. The manager explicitly accepts the conversation:
-
-```text
-/accept HF-XXXXXXXXXX   # accept and pause the bot
-/reply HF-XXXXXXXXXX <message>
-/status HF-XXXXXXXXXX
-/resume HF-XXXXXXXXXX   # release to the bot in support mode
-/close HF-XXXXXXXXXX
-/handoffs
-```
-
-Manager notifications survive restarts and retry with exponential backoff. Baileys send results and provider message IDs are persisted. Official `delivered`, `read`, and `failed` callback states are not available during the temporary Baileys pilot.
-
-`PERSISTENCE_PATH` is suitable for the current single-instance bot deployment and must be mounted on durable storage. When the SHARH repository is connected, these local records will be mapped to the canonical PostgreSQL handoff and conversation entities.
+The bot mirrors English, Russian, or Arabic and keeps the selected language across neutral answers such as numbers, locations, and brand names. After qualification, the information is saved in SHARH and the bot remains available for safe follow-up questions.
 
 ### Temporary Baileys pilot transport
 
@@ -259,7 +232,7 @@ The official Cloud API adapter remains available for the later rework, but no Me
 
 ### AI behavior boundaries
 
-The language model does not own funnel progression, qualification completion, listing eligibility, confidential access, or human takeover. Code supplies the current stage, known facts, approved listing context, and next allowed action. AI is used for controlled interpretation, objection handling, and non-standard support replies. It must remain concise, factual, and in the client’s language; it cannot invent demand, valuations, buyers, policy, or timing.
+The language model does not own funnel progression, qualification completion, listing eligibility, confidential access. Code supplies the current stage, known facts, approved listing context, and next allowed action. AI is used for controlled interpretation, objection handling, and non-standard support replies. It must remain concise, factual, and in the client’s language; it cannot invent demand, valuations, buyers, policy, or timing.
 
 ## 🔧 Usage
 
@@ -277,15 +250,7 @@ The bot supports two conversation roles per chat:
 - `support`: Troubleshooting and guidance focused responses
 - `sales`: Benefit/value focused responses with clear next steps
 
-The bot runs in `sales` mode by default. `ROLE_SWITCH_ENABLED=false` does not disable sales behavior; it prevents ordinary clients from changing the bot to `support` mode and bypassing the funnel. Authorized operator WhatsApp IDs in `OPERATOR_JIDS` can still use `/role support`, `/role sales`, `support mode`, and `sales mode`.
-
-Configured manager/operator:
-
-```env
-HANDOFF_WHATSAPP_JIDS=971502106179@s.whatsapp.net
-OPERATOR_JIDS=971502106179@s.whatsapp.net
-ROLE_SWITCH_ENABLED=false
-```
+The bot runs in `sales` mode by default. `ROLE_SWITCH_ENABLED=false` prevents clients from changing the bot to `support` mode and bypassing the funnel.
 
 ### WebSocket Monitoring
 
@@ -399,8 +364,8 @@ For issues and questions:
 
 ## SHARH canonical backend integration
 
-Batch 2 adds a service-account API connection for canonical conversation, seller intake, buyer enquiry, listing, access-request, handoff, and analytics data. Configure the `SHARH_API_*` variables from `env.example` only after the backend routes in `SHARH_BOT_API_CONTRACT.md` are deployed. Direct Neon lookup is now a temporary read-only fallback and should be disabled in production after migration.
+Batch 2 adds a service-account API connection for canonical conversation, seller intake, buyer enquiry, listing, access-request, and analytics data. Direct Neon lookup is now a temporary read-only fallback and should be disabled in production after migration.
 
 ## SHARH sales intelligence
 
-The sales funnel uses a versioned application-owned playbook, deterministic objection handling, explainable lead scoring, next-best-action selection, manager summaries, and a fail-closed outbound quality guard. Set `SALES_PLAYBOOK_VERSION=sharh-sales-v1`. See `BATCH_4_IMPLEMENTATION.md`.
+The sales funnel uses a versioned application-owned playbook, deterministic objection handling, explainable lead scoring, next-best-action selection, internal review summaries, and a fail-closed outbound quality guard. Set `SALES_PLAYBOOK_VERSION=sharh-sales-v1`.

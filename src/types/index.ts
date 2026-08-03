@@ -218,16 +218,6 @@ export interface NeonSearchConfig {
 }
 
 /**
- * Manager handoff configuration. `jids` are the WhatsApp ids that receive lead
- * notifications. When empty, handoff notifications are disabled (logged only).
- */
-export interface HandoffConfig {
-  jids: string[];
-  retryIntervalMs: number;
-  maxAttempts: number;
-}
-
-/**
  * SHARH backend service-account integration. The bot never connects to the
  * production database directly; all canonical reads/writes go through these
  * scoped HTTP endpoints.
@@ -238,7 +228,6 @@ export interface SharhApiConfig {
   serviceToken: string;
   timeoutMs: number;
   botId: string;
-  requireHandoffPersistence: boolean;
   allowNeonFallback: boolean;
   publicListingFields: string[];
   syncIntervalMs: number;
@@ -251,7 +240,6 @@ export type SharhSyncOperationKind =
   | 'message'
   | 'lead_snapshot'
   | 'access_request'
-  | 'handoff_event'
   | 'provider_event'
   | 'analytics';
 

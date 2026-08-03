@@ -51,7 +51,7 @@ describe('LeadCaptureService', () => {
     };
   };
 
-  it('runs a seller through every required qualification field before handoff', () => {
+  it('runs a seller through every required qualification field and keeps the bot active', () => {
     const chatId = 'seller-complete';
 
     expect(turn(chatId, 's1', 'I want to sell my business').directive.expectedField)
@@ -78,7 +78,7 @@ describe('LeadCaptureService', () => {
 
     for (const [id, answer, expectedNext] of answers) {
       const result = turn(chatId, id, answer);
-      expect(result.status).toBe('collecting');
+      expect(result.status).toBe('contacted');
       expect(result.directive.expectedField).toBe(expectedNext);
     }
 
@@ -89,8 +89,8 @@ describe('LeadCaptureService', () => {
       false
     );
 
-    expect(final.status).toBe('qualified_lead');
-    expect(final.directive.requiresHandoff).toBe(true);
+    expect(final.status).toBe('qualified');
+    expect(final.directive.directResponse).toContain('recorded successfully');
 
     const record = service.getCurrentRecord(chatId);
     expect(record).toMatchObject({
@@ -101,12 +101,12 @@ describe('LeadCaptureService', () => {
       annualRevenueAed: 'AED 5,000,000',
       desiredSellingPriceAed: 'AED 4,200,000',
       completionPercent: 100,
-      funnelStage: 'handoff_pending',
+      funnelStage: 'qualifying',
       owner: 'bot',
       leadGrade: 'A',
       leadTemperature: 'hot',
       playbookVersion: '1.0.0',
-      nextBestActionCode: 'manager_review_and_accept',
+      nextBestActionCode: 'review_qualified_lead',
     });
     expect(record?.leadScore).toBeGreaterThanOrEqual(80);
     expect(record?.conversationSummary).toContain('Recommended action');
@@ -119,7 +119,7 @@ describe('LeadCaptureService', () => {
     turn(chatId, 'b3', 'Healthcare');
     const result = turn(chatId, 'b4', 'AED 3 million');
 
-    expect(result.status).toBe('collecting');
+    expect(result.status).toBe('contacted');
     expect(result.directive.expectedField).toBe('buyer_location');
     expect(service.getCurrentRecord(chatId)?.completionPercent).toBeLessThan(100);
   });
@@ -141,8 +141,8 @@ describe('LeadCaptureService', () => {
       false
     );
 
-    expect(result.status).toBe('qualified_lead');
-    expect(result.directive.requiresHandoff).toBe(true);
+    expect(result.status).toBe('qualified');
+    expect(result.directive.directResponse).toContain('recorded successfully');
     expect(service.getCurrentRecord(chatId)).toMatchObject({
       inquiryPurpose: 'buying',
       buyerBudgetAed: 'AED 3,000,000–5,000,000',
@@ -151,7 +151,7 @@ describe('LeadCaptureService', () => {
     });
   });
 
-  it('escalates a specific listing request without exposing listing data', () => {
+  it('keeps a specific listing buyer inside the qualification funnel', () => {
     const update = service.updateFromMessage(
       'specific-listing',
       buildMessage('l1', 'I want to buy listing SH-0042. Send me the financials.')
@@ -159,12 +159,12 @@ describe('LeadCaptureService', () => {
     const directive = service.getDirective('specific-listing');
 
     expect(update.record).toMatchObject({
-      status: 'early_escalation',
+      status: 'contacted',
       specificListingCode: 'SH-0042',
       inquiryPurpose: 'buying',
     });
-    expect(update.record?.notes).toContain('SH-0042');
-    expect(directive.requiresHandoff).toBe(true);
+    expect(directive.expectedField).toBe('client_name');
+    expect(directive.directResponse).not.toContain('financials');
   });
 
   it('keeps Russian language and asks deterministic Russian questions', () => {
@@ -188,28 +188,31 @@ describe('LeadCaptureService', () => {
     expect(objection.directive.expectedField).toBe('seller_terms');
   });
 
-  it('changes ownership only after a successful handoff and then suppresses the bot', () => {
-    const chatId = 'human-owned';
+  it('flags a human request for review without pausing the bot', () => {
+    const chatId = 'human-review';
     service.updateFromMessage(
       chatId,
       buildMessage('h1', 'Please connect me to a live manager now')
     );
 
-    expect(service.getDirective(chatId).requiresHandoff).toBe(true);
-    service.markHandoffCompleted(chatId);
-
-    const closing = service.getDirective(chatId);
-    expect(closing.owner).toBe('human');
-    expect(closing.shouldRespond).toBe(true);
-    service.confirmDirectiveSent(chatId, closing);
-
-    const suppressed = service.getDirective(chatId);
-    expect(suppressed).toMatchObject({
-      owner: 'human',
-      stage: 'human_owned',
-      shouldRespond: false,
-      requiresHandoff: false,
+    const notice = service.getDirective(chatId);
+    expect(notice).toMatchObject({
+      owner: 'bot',
+      shouldRespond: true,
+      expectedField: 'inquiry_purpose',
+      markReviewNoticeOnSend: true,
     });
+    expect(notice.directResponse).toContain('SHARH review');
+    expect(notice.directResponse).toContain('Are you looking to buy or sell');
+    service.confirmDirectiveSent(chatId, notice);
+
+    const followUp = service.getDirective(chatId);
+    expect(followUp).toMatchObject({
+      owner: 'bot',
+      shouldRespond: true,
+      expectedField: 'inquiry_purpose',
+    });
+    expect(followUp.markReviewNoticeOnSend).toBeUndefined();
   });
 
   it('does not advance the expected field until the outbound question is confirmed sent', () => {

@@ -19,7 +19,7 @@ export class FunnelQualityService {
   evaluate(
     response: string,
     record?: LeadCaptureRecord,
-    directive?: FunnelDirective
+    _directive?: FunnelDirective
   ): FunnelQualityResult {
     const issues: QualityIssue[] = [];
     const trimmed = response.trim();
@@ -54,7 +54,6 @@ export class FunnelQualityService {
     }
     if (
       record &&
-      record.funnelStage !== 'human_owned' &&
       record.completionPercent < 100 &&
       /create (?:an? )?account|sign up now|register now|создайте аккаунт|зарегистрируйтесь|أنشئ حساب/u.test(trimmed)
     ) {
@@ -64,14 +63,6 @@ export class FunnelQualityService {
         detail: 'Registration was promoted before qualification and value delivery were complete.',
       });
     }
-    if (record?.owner === 'human' && directive?.shouldRespond === false) {
-      issues.push({
-        code: 'human_ownership_violation',
-        severity: 'critical',
-        detail: 'Bot attempted to respond while a human owns the conversation.',
-      });
-    }
-
     const critical = issues.filter(issue => issue.severity === 'critical').length;
     const warnings = issues.length - critical;
     return {

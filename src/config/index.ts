@@ -9,7 +9,6 @@ import {
   PersistenceConfig,
   AccessControlConfig,
   MessagingConfig,
-  HandoffConfig,
   SharhApiConfig,
 } from '../types';
 
@@ -114,11 +113,7 @@ const envSchema = Joi.object({
   BAILEYS_RECONNECT_MAX_DELAY_MS: Joi.number().integer().min(5000).max(600000).default(120000),
   QR_ACCESS_TOKEN: Joi.string().allow(''),
   NEON_PUBLIC_COLUMNS: Joi.string().allow(''),
-  HANDOFF_WHATSAPP_JIDS: Joi.string().allow(''),
-  HANDOFF_RETRY_INTERVAL_MS: Joi.number().integer().min(5000).max(300000).default(30000),
-  HANDOFF_MAX_ATTEMPTS: Joi.number().integer().min(1).max(100).default(12),
   ROLE_SWITCH_ENABLED: booleanFlag().default(false),
-  OPERATOR_JIDS: Joi.string().allow(''),
   IGNORE_GROUPS: booleanFlag().default(true),
   SHARH_API_ENABLED: booleanFlag().default(false),
   SHARH_API_BASE_URL: Joi.string()
@@ -145,7 +140,6 @@ const envSchema = Joi.object({
     }),
   SHARH_API_TIMEOUT_MS: Joi.number().integer().min(1000).max(60000).default(8000),
   SHARH_API_BOT_ID: Joi.string().default('whatsapp-funnel'),
-  SHARH_API_REQUIRE_HANDOFF_PERSISTENCE: booleanFlag().default(true),
   SHARH_API_ALLOW_NEON_FALLBACK: booleanFlag().default(false),
   SHARH_API_PUBLIC_LISTING_FIELDS: Joi.string().default(
     'public_code,title,subtitle,sector,region,emirate,description,price,revenue,tags,ribbon,sale_type'
@@ -429,27 +423,6 @@ export const getMessagingConfig = (): MessagingConfig => {
 };
 
 /**
- * Get manager handoff configuration (WhatsApp ids notified on qualify/escalate)
- */
-export const getHandoffConfig = (): HandoffConfig => {
-  validateEnv();
-
-  const jids = (process.env['HANDOFF_WHATSAPP_JIDS'] || '')
-    .split(',')
-    .map(value => value.trim())
-    .filter(Boolean);
-
-  return {
-    jids,
-    retryIntervalMs: parseInt(
-      process.env['HANDOFF_RETRY_INTERVAL_MS'] || '30000',
-      10
-    ),
-    maxAttempts: parseInt(process.env['HANDOFF_MAX_ATTEMPTS'] || '12', 10),
-  };
-};
-
-/**
  * Get SHARH backend API configuration.
  */
 export const getSalesPlaybookVersion = (): string => {
@@ -476,10 +449,6 @@ export const getSharhApiConfig = (): SharhApiConfig => {
     serviceToken: process.env['SHARH_API_SERVICE_TOKEN'] || '',
     timeoutMs: parseInt(process.env['SHARH_API_TIMEOUT_MS'] || '8000', 10),
     botId: process.env['SHARH_API_BOT_ID'] || 'whatsapp-funnel',
-    requireHandoffPersistence: parseBoolean(
-      process.env['SHARH_API_REQUIRE_HANDOFF_PERSISTENCE'],
-      true
-    ),
     allowNeonFallback: parseBoolean(
       process.env['SHARH_API_ALLOW_NEON_FALLBACK'],
       !enabled

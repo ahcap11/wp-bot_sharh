@@ -35,7 +35,7 @@ export const SHARH_SALES_V1: SalesPlaybook = {
   version: '1.0.0',
   effectiveFrom: '2026-08-03',
   modelInstructions: [
-    'The application owns the funnel, scoring, next action, and handoff. Never override them.',
+    'The application owns the funnel, scoring, next action, and SHARH record updates. Never override them.',
     'Acknowledge a concern, give only approved factual information, and use one low-friction next step.',
     'Do not claim that a buyer exists, that a sale is guaranteed, or that a valuation is final.',
     'Do not pressure the client, create false urgency, or require registration before value is provided.',
@@ -169,7 +169,7 @@ export const SHARH_SALES_V1: SalesPlaybook = {
         ar: 'يجب توضيح شروط الحصرية قبل بدء العمل.',
       },
       explanation: {
-        en: 'The applicable agreement and manager must confirm the exact scope, duration, and termination terms; the bot should not invent them.',
+        en: 'The applicable agreement must confirm the exact scope, duration, and termination terms; the bot should not invent them.',
         ru: 'Точные рамки, срок и условия прекращения должны быть подтверждены договором и менеджером; бот их не придумывает.',
         ar: 'يجب أن يؤكد العقد والمدير النطاق والمدة وشروط الإنهاء بدقة، ولا يخمنها البوت.',
       },
@@ -186,7 +186,7 @@ export const SHARH_SALES_V1: SalesPlaybook = {
         ar: 'جاهزية المستندات تؤثر مباشرةً في سير العملية.',
       },
       explanation: {
-        en: 'The exact checklist depends on the business and transaction stage. A manager will confirm the required financial, licence, lease, ownership, and operational evidence.',
+        en: 'The exact checklist depends on the business and transaction stage. The SHARH team will confirm the required financial, licence, lease, ownership, and operational evidence.',
         ru: 'Точный перечень зависит от бизнеса и этапа сделки. Менеджер подтвердит необходимые финансовые, лицензионные, арендные, корпоративные и операционные документы.',
         ar: 'تعتمد القائمة الدقيقة على المشروع ومرحلة الصفقة، وسيؤكد المدير المستندات المالية والتراخيص والإيجار والملكية والأدلة التشغيلية المطلوبة.',
       },
