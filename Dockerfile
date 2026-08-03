@@ -1,22 +1,29 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.7
 
-# ---------- Build stage ----------
-FROM node:20-alpine AS builder
+FROM node:20-bookworm-slim AS builder
 
-# Avoid downloading Chromium for the (currently unused) puppeteer dependency.
 ENV PUPPETEER_SKIP_DOWNLOAD=true
-
 WORKDIR /app
 
+# Baileys includes public GitHub dependencies. Install Git and rewrite
+# SSH-style GitHub URLs to HTTPS so Railway does not need an SSH deploy key.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates git openssh-client python3 make g++ \
+    && git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" \
+    && git config --global --add url."https://github.com/".insteadOf "git@github.com:" \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY package*.json ./
-RUN npm ci
+RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
 
 COPY tsconfig.json ./
 COPY src ./src
-RUN npm run build
+RUN npm run build \
+    && npm prune --omit=dev \
+    && npm cache clean --force
 
-# ---------- Runtime stage ----------
-FROM node:20-alpine AS runtime
+FROM node:20-bookworm-slim AS runtime
 
 ENV NODE_ENV=production
 ENV PUPPETEER_SKIP_DOWNLOAD=true
@@ -25,27 +32,19 @@ ENV HEALTH_PORT=3001
 
 WORKDIR /app
 
-# Install only production dependencies.
-COPY package*.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy compiled output from the build stage.
+COPY --from=builder /app/package.json /app/package-lock.json ./
+COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 
-# Persisted WhatsApp session and app state live here; mount volumes to keep
-# them across restarts/redeploys. /app/data is the mount point for the Railway
-# volume (WHATSAPP_AUTH_DIR + PERSISTENCE_PATH live under it).
-RUN mkdir -p /app/.whatsapp-session /app/.state /app/logs /app/data
-
-# NOTE: We run as root. Railway mounts volumes owned by root, so a non-root
-# user cannot create directories inside the mount (EACCES). Running as root
-# avoids that. Railway containers are isolated, so this is acceptable here.
+RUN mkdir -p /app/data /app/logs
 
 EXPOSE 8080 3001
 
-
-# Liveness check against the built-in health server (now on $PORT).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD wget -qO- "http://127.0.0.1:${PORT}/health" || exit 1
+  CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 8080) + '/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
 CMD ["node", "dist/index.js"]
