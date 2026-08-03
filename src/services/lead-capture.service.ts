@@ -410,10 +410,7 @@ export class LeadCaptureService {
     }
     this.applyExplicitExtractions(state, normalizedContent, fieldsUpdated);
 
-    const reviewReason = this.detectEarlyEscalationReason(
-      normalizedContent,
-      state.inquiryPurpose
-    );
+    const reviewReason = this.detectEarlyEscalationReason(normalizedContent);
     if (reviewReason) {
       this.markForReview(state, reviewReason);
     }
@@ -1566,10 +1563,7 @@ export class LeadCaptureService {
     return trimmed.startsWith('+') ? `+${digitsOnly}` : digitsOnly;
   }
 
-  private detectEarlyEscalationReason(
-    value: string,
-    purpose?: LeadInquiryPurpose
-  ): string | null {
+  private detectEarlyEscalationReason(value: string): string | null {
     const normalized = value.toLowerCase();
     const managerRequest =
       /(connect|transfer|speak|talk).{0,25}(manager|human|agent|representative|consultant)|live manager|human agent/i.test(
