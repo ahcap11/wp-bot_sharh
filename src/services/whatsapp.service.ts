@@ -108,13 +108,29 @@ export class WhatsAppService implements MessagingTransport {
 
         for (const msg of upsert.messages) {
           if (!msg || msg.key.fromMe || !msg.message) continue;
-          if (!this.isSupportedRemoteJid(msg.key.remoteJid || '')) continue;
 
-          const whatsappMessage = this.parseMessage(msg);
-          if (!whatsappMessage) continue;
+          const routing = this.resolveMessageRouting(msg);
+          if (!routing || !this.isSupportedRemoteJid(routing.replyJid)) {
+            logger.warn('Ignoring Baileys message with unsupported sender JID', {
+              remoteJid: msg.key.remoteJid || null,
+              remoteJidAlt: this.getKeyString(msg, 'remoteJidAlt'),
+              senderPn: this.getKeyString(msg, 'senderPn'),
+            });
+            continue;
+          }
+
+          const whatsappMessage = this.parseMessage(msg, routing);
+          if (!whatsappMessage) {
+            logger.warn('Ignoring unsupported or empty Baileys message', {
+              remoteJid: msg.key.remoteJid || null,
+              messageKeys: Object.keys(msg.message || {}),
+            });
+            continue;
+          }
 
           logger.info('Message received', {
             from: whatsappMessage.from,
+            replyJid: whatsappMessage.to,
             type: whatsappMessage.type,
             length: whatsappMessage.content.length,
           });
@@ -318,27 +334,25 @@ export class WhatsAppService implements MessagingTransport {
     }
   }
 
-  private parseMessage(msg: proto.IWebMessageInfo): WhatsAppMessage | null {
+  private parseMessage(
+    msg: proto.IWebMessageInfo,
+    routing: { identityJid: string; replyJid: string; isGroup: boolean }
+  ): WhatsAppMessage | null {
     try {
-      const messageType = this.getMessageType(msg.message || undefined);
-      const content = this.extractMessageContent(msg.message || undefined);
+      const unwrapped = this.unwrapMessage(msg.message || undefined);
+      const messageType = this.getMessageType(unwrapped);
+      const content = this.extractMessageContent(unwrapped);
       if (!content) return null;
-
-      const remoteJid = msg.key.remoteJid || '';
-      const isGroup = remoteJid.endsWith('@g.us');
-      const from = isGroup
-        ? msg.key.participant || remoteJid
-        : remoteJid;
 
       return {
         id: msg.key.id || '',
-        from,
-        to: remoteJid,
+        from: routing.identityJid,
+        to: routing.replyJid,
         timestamp: this.toTimestampMs(msg.messageTimestamp),
         type: messageType,
         content,
-        isGroup,
-        ...(isGroup ? { groupId: remoteJid } : {}),
+        isGroup: routing.isGroup,
+        ...(routing.isGroup ? { groupId: routing.replyJid } : {}),
         ...(msg.pushName ? { senderName: msg.pushName } : {}),
         isFromBot: false,
       };
@@ -348,6 +362,89 @@ export class WhatsAppService implements MessagingTransport {
       });
       return null;
     }
+  }
+
+  private resolveMessageRouting(
+    msg: proto.IWebMessageInfo
+  ): { identityJid: string; replyJid: string; isGroup: boolean } | null {
+    const remoteJid = msg.key.remoteJid || '';
+    if (!remoteJid) return null;
+
+    const isGroup = remoteJid.endsWith('@g.us');
+    if (isGroup) {
+      const participant =
+        this.firstPhoneJid(
+          this.getKeyString(msg, 'participantAlt'),
+          this.getKeyString(msg, 'participantPn'),
+          this.getKeyString(msg, 'senderPn'),
+          msg.key.participant || ''
+        ) || msg.key.participant || remoteJid;
+      return { identityJid: participant, replyJid: remoteJid, isGroup: true };
+    }
+
+    // Recent WhatsApp/Baileys sessions may deliver private messages using a
+    // Linked Identity JID (@lid). Keep the actual incoming conversation JID as
+    // the reply target, but use a phone-number JID for CRM identity when the
+    // alternate PN fields are present.
+    const phoneJid = this.firstPhoneJid(
+      this.getKeyString(msg, 'remoteJidAlt'),
+      this.getKeyString(msg, 'senderPn'),
+      remoteJid
+    );
+
+    return {
+      identityJid: phoneJid || remoteJid,
+      replyJid: remoteJid,
+      isGroup: false,
+    };
+  }
+
+  private getKeyString(
+    msg: proto.IWebMessageInfo,
+    field: string
+  ): string {
+    const key = msg.key as unknown as Record<string, unknown>;
+    const value = key[field];
+    return typeof value === 'string' ? value : '';
+  }
+
+  private firstPhoneJid(...values: string[]): string | null {
+    for (const value of values) {
+      if (value.endsWith('@s.whatsapp.net')) return value;
+    }
+    return null;
+  }
+
+  private unwrapMessage(
+    message: proto.IMessage | undefined
+  ): proto.IMessage | undefined {
+    let current = message;
+    const wrappers = [
+      'ephemeralMessage',
+      'viewOnceMessage',
+      'viewOnceMessageV2',
+      'viewOnceMessageV2Extension',
+      'documentWithCaptionMessage',
+      'editedMessage',
+    ];
+
+    for (let depth = 0; current && depth < 6; depth += 1) {
+      const record = current as unknown as Record<string, unknown>;
+      let nested: proto.IMessage | undefined;
+      for (const wrapper of wrappers) {
+        const container = record[wrapper] as
+          | { message?: proto.IMessage | null }
+          | undefined;
+        if (container?.message) {
+          nested = container.message;
+          break;
+        }
+      }
+      if (!nested) break;
+      current = nested;
+    }
+
+    return current;
   }
 
   private extractMessageContent(
@@ -521,7 +618,11 @@ export class WhatsAppService implements MessagingTransport {
     if (remoteJid === 'status@broadcast' || remoteJid.endsWith('@broadcast'))
       return false;
     if (remoteJid.endsWith('@newsletter')) return false;
-    return remoteJid.endsWith('@s.whatsapp.net') || remoteJid.endsWith('@g.us');
+    return (
+      remoteJid.endsWith('@s.whatsapp.net') ||
+      remoteJid.endsWith('@lid') ||
+      remoteJid.endsWith('@g.us')
+    );
   }
 
   private toTimestampMs(value: proto.IWebMessageInfo['messageTimestamp']): number {

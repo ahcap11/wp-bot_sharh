@@ -571,11 +571,10 @@ export class ChatbotService {
    * Resolve destination for outbound replies
    */
   private getReplyTarget(message: WhatsAppMessage): string {
-    if (message.isGroup) {
-      return message.groupId || message.to;
-    }
-
-    return message.from;
+    // For direct chats, `to` is the exact conversation JID received from
+    // Baileys. It may be a modern @lid address even when `from` was normalized
+    // to the alternate phone-number JID for SHARH identity matching.
+    return message.groupId || message.to;
   }
 
   /**
