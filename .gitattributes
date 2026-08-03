@@ -1,0 +1,17 @@
+# Normalize line endings: store as LF in the repo, let Git handle checkout.
+* text=auto
+
+# Always use LF for these file types regardless of platform.
+*.ts text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+
+# Treat images and other binaries as binary.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
