@@ -96,17 +96,57 @@ export enum ConnectionStatus {
  * a WhatsApp Cloud API adapter (CloudApiTransport) implements the same contract
  * so switching backends is a config change, not a rewrite.
  */
+export type MessageDeliveryStatus =
+  | 'accepted'
+  | 'sent'
+  | 'delivered'
+  | 'read'
+  | 'failed'
+  | 'deleted'
+  | 'unknown';
+
+export interface MessagingSendResult {
+  success: boolean;
+  providerMessageIds: string[];
+  error?: string | undefined;
+}
+
+export interface MessageDeliveryUpdate {
+  providerMessageId: string;
+  status: MessageDeliveryStatus;
+  timestamp: number;
+  recipientId?: string | undefined;
+  conversationId?: string | undefined;
+  pricingCategory?: string | undefined;
+  errorCode?: string | undefined;
+  errorMessage?: string | undefined;
+}
+
+export interface MessagingWebhookResult {
+  statusCode: number;
+  body: string | Record<string, unknown>;
+}
+
 export interface MessagingTransport {
   initialize(): Promise<void>;
   sendMessage(chatId: string, message: string): Promise<boolean>;
+  sendMessageDetailed?(chatId: string, message: string): Promise<MessagingSendResult>;
   onMessage(handler: (message: WhatsAppMessage) => void): void;
   onConnectionStatusChange(handler: (status: ConnectionStatus) => void): void;
+  onDeliveryStatus?(handler: (update: MessageDeliveryUpdate) => void): void;
   getConnectionStatus(): ConnectionStatus;
   isConnected(): boolean;
   disconnect(): Promise<void>;
   getChatParticipants(chatId: string): Promise<string[]>;
   /** Latest pending QR (Baileys only); null when not applicable or linked. */
   getCurrentQr?(): string | null;
+  /** Cloud API webhook helpers; absent on socket transports. */
+  getWebhookPath?(): string;
+  verifyWebhookChallenge?(query: URLSearchParams): string | null;
+  handleWebhookRequest?(
+    rawBody: Buffer,
+    headers: Record<string, string | string[] | undefined>
+  ): Promise<MessagingWebhookResult>;
 }
 
 export type MessagingTransportKind = 'baileys' | 'cloud';
@@ -117,11 +157,20 @@ export type MessagingTransportKind = 'baileys' | 'cloud';
  */
 export interface MessagingConfig {
   kind: MessagingTransportKind;
+  /** Persistent Baileys multi-file session directory. */
+  baileysAuthDir: string;
+  baileysReconnectBaseDelayMs: number;
+  baileysReconnectMaxDelayMs: number;
   cloudPhoneNumberId: string;
   cloudAccessToken: string;
   cloudVerifyToken: string;
+  cloudAppSecret: string;
   cloudApiVersion: string;
+  cloudWebhookPath: string;
+  cloudSendTimeoutMs: number;
+  cloudWebhookMaxBodyBytes: number;
 }
+
 
 /**
  * Message processing result
@@ -174,6 +223,44 @@ export interface NeonSearchConfig {
  */
 export interface HandoffConfig {
   jids: string[];
+  retryIntervalMs: number;
+  maxAttempts: number;
+}
+
+/**
+ * SHARH backend service-account integration. The bot never connects to the
+ * production database directly; all canonical reads/writes go through these
+ * scoped HTTP endpoints.
+ */
+export interface SharhApiConfig {
+  enabled: boolean;
+  baseUrl: string;
+  serviceToken: string;
+  timeoutMs: number;
+  botId: string;
+  requireHandoffPersistence: boolean;
+  allowNeonFallback: boolean;
+  publicListingFields: string[];
+  syncIntervalMs: number;
+  syncMaxAttempts: number;
+  syncBatchSize: number;
+  contextCacheMs: number;
+}
+
+export type SharhSyncOperationKind =
+  | 'message'
+  | 'lead_snapshot'
+  | 'access_request'
+  | 'handoff_event'
+  | 'provider_event'
+  | 'analytics';
+
+export interface SharhApiRuntimeStatus {
+  enabled: boolean;
+  reachable: boolean | null;
+  lastSuccessAt?: string | undefined;
+  lastFailureAt?: string | undefined;
+  lastError?: string | undefined;
 }
 
 /**

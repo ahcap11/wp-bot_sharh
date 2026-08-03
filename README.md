@@ -86,6 +86,9 @@ A sophisticated WhatsApp AI chatbot built with Node.js, TypeScript, and OpenAI o
      LOG_LEVEL=info
      AI_MAX_TOKENS=150
      AI_TEMPERATURE=0.7
+     WHATSAPP_TRANSPORT=baileys
+     WHATSAPP_AUTH_DIR=./auth_info_baileys
+     QR_ACCESS_TOKEN=local-development-token
      ```
 
 4. **Build the project**
@@ -133,11 +136,13 @@ src/
 ├── config/         # Configuration management
 ├── services/       # Core services
 │   ├── ai.service.ts           # OpenAI/Gemini integration
-│   ├── whatsapp.service.ts     # WhatsApp connection
+│   ├── whatsapp.service.ts     # Active Baileys pilot transport
+│   ├── cloud-api.service.ts    # Retained for later official migration
 │   ├── chat-history.service.ts # Message history
 │   ├── websocket.service.ts    # Real-time communication
 │   ├── lead-capture.service.ts # Deterministic SHARH funnel and qualification state
-│   ├── handoff.service.ts      # Retryable manager handoff delivery
+│   ├── handoff.service.ts      # Durable assignment, acceptance and takeover
+│   ├── message-delivery.service.ts # Provider delivery/read/failure tracking
 │   ├── google-sheets.service.ts# Optional lead snapshot export
 │   └── chatbot.service.ts      # Main orchestrator and ownership enforcement
 ├── types/          # TypeScript type definitions
@@ -207,25 +212,54 @@ The bot mirrors English, Russian, or Arabic and keeps the selected language acro
 
 ### Manager Handoff
 
-Configure at least one production manager recipient:
+Configure the production manager and durable retry policy:
 
 ```env
 HANDOFF_WHATSAPP_JIDS=971502106179@s.whatsapp.net
+HANDOFF_RETRY_INTERVAL_MS=30000
+HANDOFF_MAX_ATTEMPTS=12
+OPERATOR_JIDS=971502106179@s.whatsapp.net
 ```
 
-A lead is marked delivered only after at least one manager notification succeeds. Failed delivery remains retryable. After successful delivery, the conversation becomes human-owned, the bot sends one closing message, and subsequent automated qualification is suppressed.
+A successful notification creates a `HF-...` reference but does **not** transfer ownership by itself. The manager explicitly accepts the conversation:
 
-`PERSISTENCE_PATH` remains suitable for a single-instance pilot. Mount it on durable storage. Multi-replica production deployment should move funnel state and handoff records into SHARH PostgreSQL in the database-integration batch.
+```text
+/accept HF-XXXXXXXXXX   # accept and pause the bot
+/reply HF-XXXXXXXXXX <message>
+/status HF-XXXXXXXXXX
+/resume HF-XXXXXXXXXX   # release to the bot in support mode
+/close HF-XXXXXXXXXX
+/handoffs
+```
 
-### AI System Prompt
+Manager notifications survive restarts and retry with exponential backoff. Baileys send results and provider message IDs are persisted. Official `delivered`, `read`, and `failed` callback states are not available during the temporary Baileys pilot.
 
-The chatbot uses a configurable system prompt that instructs the AI to:
-- Be friendly and conversational
-- Provide helpful and accurate responses
-- Keep responses concise but informative
-- Use appropriate emojis when suitable
-- Ask clarifying questions when needed
-- Maintain context from conversation history
+`PERSISTENCE_PATH` is suitable for the current single-instance bot deployment and must be mounted on durable storage. When the SHARH repository is connected, these local records will be mapped to the canonical PostgreSQL handoff and conversation entities.
+
+### Temporary Baileys pilot transport
+
+The current test deployment uses the existing linked-device transport:
+
+```env
+WHATSAPP_TRANSPORT=baileys
+WHATSAPP_AUTH_DIR=/app/data/whatsapp-auth
+QR_ACCESS_TOKEN=<random-string-at-least-24-characters>
+PERSISTENCE_PATH=/app/data/state.json
+```
+
+Mount a persistent volume at `/app/data`, run one replica, deploy, then open:
+
+```text
+https://<bot-host>/qr?token=<QR_ACCESS_TOKEN>
+```
+
+Scan the QR from WhatsApp **Linked devices**. Normal shutdown and redeploy now preserve the session instead of logging the linked device out. Railway uses `/health` for the deployment check so the service can stay alive while waiting for the first scan; `/ready` becomes healthy after WhatsApp, AI, and SHARH are connected.
+
+The official Cloud API adapter remains available for the later rework, but no Meta credentials or webhook configuration are required for this pilot. See `BAILEYS_PILOT_DEPLOYMENT.md`.
+
+### AI behavior boundaries
+
+The language model does not own funnel progression, qualification completion, listing eligibility, confidential access, or human takeover. Code supplies the current stage, known facts, approved listing context, and next allowed action. AI is used for controlled interpretation, objection handling, and non-standard support replies. It must remain concise, factual, and in the client’s language; it cannot invent demand, valuations, buyers, policy, or timing.
 
 ## 🔧 Usage
 
@@ -319,10 +353,14 @@ npm start
 
 ### Environment Setup
 
-1. Set `NODE_ENV=production`
-2. Configure production logging
-3. Set up proper error monitoring
-4. Configure backup for chat history
+1. Set `NODE_ENV=production`.
+2. Mount a persistent volume at `/app/data`.
+3. Set `WHATSAPP_TRANSPORT=baileys`, `WHATSAPP_AUTH_DIR=/app/data/whatsapp-auth`, and `PERSISTENCE_PATH=/app/data/state.json`.
+4. Set a 24+ character `QR_ACCESS_TOKEN`.
+5. Configure the scoped `SHARH_API_*` connection.
+6. Run one replica and scan the protected `/qr` page.
+
+See `BAILEYS_PILOT_DEPLOYMENT.md` for the complete deployment order.
 
 ## 🤝 Contributing
 
@@ -358,3 +396,11 @@ For issues and questions:
   
   <sub>⭐ Star this repo if you found it helpful!</sub>
 </div> 
+
+## SHARH canonical backend integration
+
+Batch 2 adds a service-account API connection for canonical conversation, seller intake, buyer enquiry, listing, access-request, handoff, and analytics data. Configure the `SHARH_API_*` variables from `env.example` only after the backend routes in `SHARH_BOT_API_CONTRACT.md` are deployed. Direct Neon lookup is now a temporary read-only fallback and should be disabled in production after migration.
+
+## SHARH sales intelligence
+
+The sales funnel uses a versioned application-owned playbook, deterministic objection handling, explainable lead scoring, next-best-action selection, manager summaries, and a fail-closed outbound quality guard. Set `SALES_PLAYBOOK_VERSION=sharh-sales-v1`. See `BATCH_4_IMPLEMENTATION.md`.

@@ -28,7 +28,7 @@ describe('ChatbotService', () => {
     jest.clearAllMocks();
 
     // Create mock instances
-    mockWhatsAppService = new WhatsAppService() as jest.Mocked<WhatsAppService>;
+    mockWhatsAppService = new WhatsAppService({} as any) as jest.Mocked<WhatsAppService>;
     mockAIService = new AIService({} as any) as jest.Mocked<AIService>;
     mockChatHistoryService =
       new ChatHistoryService() as jest.Mocked<ChatHistoryService>;
@@ -171,6 +171,11 @@ describe('ChatbotService', () => {
         isProcessing: false,
         totalChats: 0,
         totalMessages: 0,
+        sharhApiEnabled: false,
+        sharhApiReachable: null,
+        sharhSyncPending: 0,
+        activeHandoffs: 0,
+        deliveryStatuses: {},
       });
     });
   });

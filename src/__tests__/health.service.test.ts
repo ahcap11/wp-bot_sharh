@@ -58,6 +58,17 @@ describe('HealthService', () => {
       expect(service.isReady()).toBe(false);
     });
 
+    it('reports unhealthy when enabled SHARH API is unreachable', () => {
+      const service = new HealthService(0, () => ({
+        ...readySnapshot,
+        sharhApiEnabled: true,
+        sharhApiReachable: false,
+      }));
+
+      expect(service.buildStatus().status).toBe('unhealthy');
+      expect(service.isReady()).toBe(false);
+    });
+
     it('treats a missing snapshot as not ready', () => {
       const service = new HealthService(0, () => null);
       expect(service.isReady()).toBe(false);
@@ -99,7 +110,11 @@ describe('HealthService', () => {
       const result = await httpGet(port, '/ready');
       expect(result.status).toBe(200);
       expect(result.body['status']).toBe('healthy');
-      expect(result.body['dependencies']).toEqual({ whatsapp: true, ai: true });
+      expect(result.body['dependencies']).toEqual({
+        whatsapp: true,
+        ai: true,
+        sharh_api: true,
+      });
     });
 
     it('returns 503 on /ready when dependencies are down', async () => {

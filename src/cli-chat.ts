@@ -2,6 +2,7 @@ import readline from 'readline';
 import {
   getAIServiceConfig,
   getNeonSearchConfig,
+  getSharhApiConfig,
   getAppConfig,
 } from './config';
 import { WhatsAppService } from './services/whatsapp.service';
@@ -10,6 +11,8 @@ import { AIService } from './services/ai.service';
 import { ChatHistoryService } from './services/chat-history.service';
 import { ChatbotService } from './services/chatbot.service';
 import { NeonReadService } from './services/neon-read.service';
+import { SharhApiService } from './services/sharh-api.service';
+import { ListingSearchService } from './services/listing-search.service';
 import { WhatsAppMessage, ConnectionStatus } from './types';
 import { logger } from './utils/logger';
 
@@ -92,6 +95,7 @@ async function main(): Promise<void> {
   const appConfig = getAppConfig();
   const aiConfig = getAIServiceConfig();
   const neonConfig = getNeonSearchConfig();
+  const sharhApiConfig = getSharhApiConfig();
 
   let releaseReply: (() => void) | null = null;
   const release = (): void => {
@@ -111,8 +115,14 @@ async function main(): Promise<void> {
     release();
   });
 
+  const sharhApi = new SharhApiService(sharhApiConfig);
   const neon = new NeonReadService(neonConfig);
-  const ai = new AIService(aiConfig, neon);
+  const listingSearch = new ListingSearchService(
+    sharhApi,
+    neon,
+    sharhApiConfig.allowNeonFallback
+  );
+  const ai = new AIService(aiConfig, listingSearch);
   const history = new ChatHistoryService(appConfig.maxHistoryLength);
 
   // Persistence and Google Sheets are intentionally disabled here so test
@@ -129,7 +139,12 @@ async function main(): Promise<void> {
 
   void chatbot;
 
-  printBanner(aiConfig.provider, aiConfig.model, neonConfig.enabled);
+  printBanner(
+    aiConfig.provider,
+    aiConfig.model,
+    sharhApiConfig.enabled,
+    sharhApiConfig.allowNeonFallback && neonConfig.enabled
+  );
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -235,19 +250,23 @@ async function main(): Promise<void> {
 function printBanner(
   provider: string,
   model: string,
-  neonEnabled: boolean
+  sharhApiEnabled: boolean,
+  neonFallbackEnabled: boolean
 ): void {
   process.stdout.write('\n' + '='.repeat(60) + '\n');
   process.stdout.write('💬 WhatsApp AI Agent — Terminal Test Chat\n');
   process.stdout.write('='.repeat(60) + '\n');
-  process.stdout.write(`AI provider : ${provider} (${model})\n`);
+  process.stdout.write(`AI provider  : ${provider} (${model})\n`);
   process.stdout.write(
-    `Neon search : ${neonEnabled ? 'enabled (sales role)' : 'disabled'}\n`
+    `SHARH API    : ${sharhApiEnabled ? 'enabled' : 'disabled'}\n`
   );
-  process.stdout.write('Default role: support\n');
+  process.stdout.write(
+    `Neon fallback: ${neonFallbackEnabled ? 'enabled' : 'disabled'}\n`
+  );
+  process.stdout.write('Default role : sales\n');
   process.stdout.write('-'.repeat(60) + '\n');
-  process.stdout.write('Tips: type "switch to sales" to enter sales mode,\n');
-  process.stdout.write('      then ask e.g. "show me vegan F&B businesses".\n');
+  process.stdout.write('The terminal starts in the deterministic sales funnel.\n');
+  process.stdout.write('Role switching follows ROLE_SWITCH_ENABLED / OPERATOR_JIDS.\n');
   process.stdout.write('Commands: /help, /exit\n');
   process.stdout.write('='.repeat(60) + '\n\n');
 }
@@ -256,11 +275,9 @@ function printHelp(): void {
   process.stdout.write('\nCommands:\n');
   process.stdout.write('  /help            Show this help\n');
   process.stdout.write('  /exit, /quit     End the chat\n');
-  process.stdout.write('\nRole switching (handled by the bot):\n');
-  process.stdout.write(
-    '  "switch to sales"    Enter sales mode (Neon listing search)\n'
-  );
-  process.stdout.write('  "switch to support"  Back to support mode\n\n');
+  process.stdout.write('\nOperator role switching, when authorized:\n');
+  process.stdout.write('  "switch to sales"    Enter the sales funnel\n');
+  process.stdout.write('  "switch to support"  Enter support mode\n\n');
 }
 
 main().catch(error => {

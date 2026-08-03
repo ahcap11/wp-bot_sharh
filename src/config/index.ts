@@ -10,6 +10,7 @@ import {
   AccessControlConfig,
   MessagingConfig,
   HandoffConfig,
+  SharhApiConfig,
 } from '../types';
 
 // Load environment variables
@@ -103,13 +104,65 @@ const envSchema = Joi.object({
   WHATSAPP_CLOUD_PHONE_NUMBER_ID: Joi.string().allow(''),
   WHATSAPP_CLOUD_ACCESS_TOKEN: Joi.string().allow(''),
   WHATSAPP_CLOUD_VERIFY_TOKEN: Joi.string().allow(''),
-  WHATSAPP_CLOUD_API_VERSION: Joi.string().default('v21.0'),
+  WHATSAPP_CLOUD_APP_SECRET: Joi.string().allow(''),
+  WHATSAPP_CLOUD_API_VERSION: Joi.string().default('v26.0'),
+  WHATSAPP_CLOUD_WEBHOOK_PATH: Joi.string().default('/webhooks/whatsapp'),
+  WHATSAPP_CLOUD_SEND_TIMEOUT_MS: Joi.number().integer().min(1000).max(60000).default(10000),
+  WHATSAPP_CLOUD_WEBHOOK_MAX_BODY_BYTES: Joi.number().integer().min(1024).max(10485760).default(1048576),
   WHATSAPP_AUTH_DIR: Joi.string().default('./auth_info_baileys'),
+  BAILEYS_RECONNECT_BASE_DELAY_MS: Joi.number().integer().min(1000).max(60000).default(5000),
+  BAILEYS_RECONNECT_MAX_DELAY_MS: Joi.number().integer().min(5000).max(600000).default(120000),
+  QR_ACCESS_TOKEN: Joi.string().allow(''),
   NEON_PUBLIC_COLUMNS: Joi.string().allow(''),
   HANDOFF_WHATSAPP_JIDS: Joi.string().allow(''),
+  HANDOFF_RETRY_INTERVAL_MS: Joi.number().integer().min(5000).max(300000).default(30000),
+  HANDOFF_MAX_ATTEMPTS: Joi.number().integer().min(1).max(100).default(12),
   ROLE_SWITCH_ENABLED: booleanFlag().default(false),
   OPERATOR_JIDS: Joi.string().allow(''),
   IGNORE_GROUPS: booleanFlag().default(true),
+  SHARH_API_ENABLED: booleanFlag().default(false),
+  SHARH_API_BASE_URL: Joi.string()
+    .allow('')
+    .when('SHARH_API_ENABLED', {
+      is: true,
+      then: Joi.string().uri({ scheme: ['http', 'https'] }).required().messages({
+        'any.required':
+          'SHARH_API_BASE_URL is required when SHARH_API_ENABLED=true',
+        'string.empty':
+          'SHARH_API_BASE_URL is required when SHARH_API_ENABLED=true',
+      }),
+    }),
+  SHARH_API_SERVICE_TOKEN: Joi.string()
+    .allow('')
+    .when('SHARH_API_ENABLED', {
+      is: true,
+      then: Joi.string().min(1).required().messages({
+        'any.required':
+          'SHARH_API_SERVICE_TOKEN is required when SHARH_API_ENABLED=true',
+        'string.empty':
+          'SHARH_API_SERVICE_TOKEN is required when SHARH_API_ENABLED=true',
+      }),
+    }),
+  SHARH_API_TIMEOUT_MS: Joi.number().integer().min(1000).max(60000).default(8000),
+  SHARH_API_BOT_ID: Joi.string().default('whatsapp-funnel'),
+  SHARH_API_REQUIRE_HANDOFF_PERSISTENCE: booleanFlag().default(true),
+  SHARH_API_ALLOW_NEON_FALLBACK: booleanFlag().default(false),
+  SHARH_API_PUBLIC_LISTING_FIELDS: Joi.string().default(
+    'public_code,title,subtitle,sector,region,emirate,description,price,revenue,tags,ribbon,sale_type'
+  ),
+  SHARH_API_SYNC_INTERVAL_MS: Joi.number()
+    .integer()
+    .min(5000)
+    .max(300000)
+    .default(30000),
+  SHARH_API_SYNC_MAX_ATTEMPTS: Joi.number().integer().min(1).max(50).default(12),
+  SHARH_API_SYNC_BATCH_SIZE: Joi.number().integer().min(1).max(100).default(20),
+  SALES_PLAYBOOK_VERSION: Joi.string().valid('sharh-sales-v1', '1.0.0').default('sharh-sales-v1'),
+  SHARH_API_CONTEXT_CACHE_MS: Joi.number()
+    .integer()
+    .min(0)
+    .max(300000)
+    .default(30000),
 }).unknown();
 
 /**
@@ -135,6 +188,62 @@ const validateEnv = (): void => {
         'Environment validation error: GOOGLE_SHEETS_CREDENTIALS_JSON or GOOGLE_SHEETS_CREDENTIALS_PATH is required when GOOGLE_SHEETS_ENABLED=true'
       );
     }
+  }
+
+  const cloudEnabled = process.env['WHATSAPP_TRANSPORT'] === 'cloud';
+  const baileysEnabled = !cloudEnabled;
+  if (cloudEnabled) {
+    const required = [
+      'WHATSAPP_CLOUD_PHONE_NUMBER_ID',
+      'WHATSAPP_CLOUD_ACCESS_TOKEN',
+      'WHATSAPP_CLOUD_VERIFY_TOKEN',
+      'WHATSAPP_CLOUD_APP_SECRET',
+    ].filter(name => !(process.env[name] || '').trim());
+    if (required.length > 0) {
+      throw new Error(
+        `Environment validation error: ${required.join(', ')} required when WHATSAPP_TRANSPORT=cloud`
+      );
+    }
+    const webhookPath = process.env['WHATSAPP_CLOUD_WEBHOOK_PATH'] || '/webhooks/whatsapp';
+    if (!webhookPath.startsWith('/')) {
+      throw new Error(
+        'Environment validation error: WHATSAPP_CLOUD_WEBHOOK_PATH must start with /'
+      );
+    }
+  }
+
+  if (baileysEnabled && process.env['NODE_ENV'] === 'production') {
+    const qrAccessToken = (process.env['QR_ACCESS_TOKEN'] || '').trim();
+    if (qrAccessToken.length < 24) {
+      throw new Error(
+        'Environment validation error: QR_ACCESS_TOKEN must be at least 24 characters when WHATSAPP_TRANSPORT=baileys in production'
+      );
+    }
+  }
+
+  const sharhApiEnabled = parseBoolean(
+    process.env['SHARH_API_ENABLED'],
+    false
+  );
+  const persistenceEnabled = parseBoolean(
+    process.env['PERSISTENCE_ENABLED'],
+    true
+  );
+  if (sharhApiEnabled && !persistenceEnabled) {
+    throw new Error(
+      'Environment validation error: PERSISTENCE_ENABLED must remain true when SHARH_API_ENABLED=true so failed writes have a durable outbox'
+    );
+  }
+
+  const baseUrl = process.env['SHARH_API_BASE_URL'] || '';
+  if (
+    sharhApiEnabled &&
+    process.env['NODE_ENV'] === 'production' &&
+    !baseUrl.startsWith('https://')
+  ) {
+    throw new Error(
+      'Environment validation error: SHARH_API_BASE_URL must use HTTPS in production'
+    );
   }
 };
 
@@ -281,7 +390,7 @@ export const getAccessControlConfig = (): AccessControlConfig => {
 };
 
 /**
- * Get messaging transport configuration (backend selection + Cloud API creds)
+ * Get messaging transport configuration (Baileys pilot + future Cloud API)
  */
 export const getMessagingConfig = (): MessagingConfig => {
   validateEnv();
@@ -291,10 +400,31 @@ export const getMessagingConfig = (): MessagingConfig => {
 
   return {
     kind,
+    baileysAuthDir:
+      process.env['WHATSAPP_AUTH_DIR'] || './auth_info_baileys',
+    baileysReconnectBaseDelayMs: parseInt(
+      process.env['BAILEYS_RECONNECT_BASE_DELAY_MS'] || '5000',
+      10
+    ),
+    baileysReconnectMaxDelayMs: parseInt(
+      process.env['BAILEYS_RECONNECT_MAX_DELAY_MS'] || '120000',
+      10
+    ),
     cloudPhoneNumberId: process.env['WHATSAPP_CLOUD_PHONE_NUMBER_ID'] || '',
     cloudAccessToken: process.env['WHATSAPP_CLOUD_ACCESS_TOKEN'] || '',
     cloudVerifyToken: process.env['WHATSAPP_CLOUD_VERIFY_TOKEN'] || '',
-    cloudApiVersion: process.env['WHATSAPP_CLOUD_API_VERSION'] || 'v21.0',
+    cloudAppSecret: process.env['WHATSAPP_CLOUD_APP_SECRET'] || '',
+    cloudApiVersion: process.env['WHATSAPP_CLOUD_API_VERSION'] || 'v26.0',
+    cloudWebhookPath:
+      process.env['WHATSAPP_CLOUD_WEBHOOK_PATH'] || '/webhooks/whatsapp',
+    cloudSendTimeoutMs: parseInt(
+      process.env['WHATSAPP_CLOUD_SEND_TIMEOUT_MS'] || '10000',
+      10
+    ),
+    cloudWebhookMaxBodyBytes: parseInt(
+      process.env['WHATSAPP_CLOUD_WEBHOOK_MAX_BODY_BYTES'] || '1048576',
+      10
+    ),
   };
 };
 
@@ -309,7 +439,69 @@ export const getHandoffConfig = (): HandoffConfig => {
     .map(value => value.trim())
     .filter(Boolean);
 
-  return { jids };
+  return {
+    jids,
+    retryIntervalMs: parseInt(
+      process.env['HANDOFF_RETRY_INTERVAL_MS'] || '30000',
+      10
+    ),
+    maxAttempts: parseInt(process.env['HANDOFF_MAX_ATTEMPTS'] || '12', 10),
+  };
+};
+
+/**
+ * Get SHARH backend API configuration.
+ */
+export const getSalesPlaybookVersion = (): string => {
+  validateEnv();
+  return process.env['SALES_PLAYBOOK_VERSION'] || 'sharh-sales-v1';
+};
+
+export const getSharhApiConfig = (): SharhApiConfig => {
+  validateEnv();
+
+  const publicListingFields = (
+    process.env['SHARH_API_PUBLIC_LISTING_FIELDS'] ||
+    'public_code,title,subtitle,sector,region,emirate,description,price,revenue,tags,ribbon,sale_type'
+  )
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
+
+  const enabled = parseBoolean(process.env['SHARH_API_ENABLED'], false);
+
+  return {
+    enabled,
+    baseUrl: (process.env['SHARH_API_BASE_URL'] || '').replace(/\/+$/, ''),
+    serviceToken: process.env['SHARH_API_SERVICE_TOKEN'] || '',
+    timeoutMs: parseInt(process.env['SHARH_API_TIMEOUT_MS'] || '8000', 10),
+    botId: process.env['SHARH_API_BOT_ID'] || 'whatsapp-funnel',
+    requireHandoffPersistence: parseBoolean(
+      process.env['SHARH_API_REQUIRE_HANDOFF_PERSISTENCE'],
+      true
+    ),
+    allowNeonFallback: parseBoolean(
+      process.env['SHARH_API_ALLOW_NEON_FALLBACK'],
+      !enabled
+    ),
+    publicListingFields,
+    syncIntervalMs: parseInt(
+      process.env['SHARH_API_SYNC_INTERVAL_MS'] || '30000',
+      10
+    ),
+    syncMaxAttempts: parseInt(
+      process.env['SHARH_API_SYNC_MAX_ATTEMPTS'] || '12',
+      10
+    ),
+    syncBatchSize: parseInt(
+      process.env['SHARH_API_SYNC_BATCH_SIZE'] || '20',
+      10
+    ),
+    contextCacheMs: parseInt(
+      process.env['SHARH_API_CONTEXT_CACHE_MS'] || '30000',
+      10
+    ),
+  };
 };
 
 /**

@@ -6,6 +6,9 @@ import {
   getPersistenceConfig,
   getAccessControlConfig,
   getMessagingConfig,
+  getSharhApiConfig,
+  getHandoffConfig,
+  getSalesPlaybookVersion,
 } from './config';
 import { createMessagingTransport } from './services/messaging-transport.factory';
 import { AIService } from './services/ai.service';
@@ -18,6 +21,12 @@ import { NeonReadService } from './services/neon-read.service';
 import { HealthService } from './services/health.service';
 import { PersistenceService } from './services/persistence.service';
 import { AccessControlService } from './services/access-control.service';
+import { SharhApiService } from './services/sharh-api.service';
+import { ListingSearchService } from './services/listing-search.service';
+import { SharhSyncService } from './services/sharh-sync.service';
+import { MessageDeliveryService } from './services/message-delivery.service';
+import { SalesPlaybookService } from './services/sales-playbook.service';
+import { FunnelQualityService } from './services/funnel-quality.service';
 import { logger } from './utils/logger';
 
 /**
@@ -45,6 +54,10 @@ class WhatsAppAIChatbot {
       const neonSearchConfig = getNeonSearchConfig();
       const persistenceConfig = getPersistenceConfig();
       const accessControlConfig = getAccessControlConfig();
+      const sharhApiConfig = getSharhApiConfig();
+      const messagingConfig = getMessagingConfig();
+      const handoffConfig = getHandoffConfig();
+      const salesPlaybookVersion = getSalesPlaybookVersion();
       this.webSocketPort = appConfig.healthPort;
 
       // Apply configured log level to the shared logger.
@@ -59,6 +72,9 @@ class WhatsAppAIChatbot {
         persistence: persistenceConfig.enabled,
         allowlist: accessControlConfig.allowlistEnabled,
         rateLimit: accessControlConfig.rateLimitEnabled,
+        sharhApi: sharhApiConfig.enabled,
+        neonFallback: sharhApiConfig.allowNeonFallback,
+        salesPlaybookVersion,
       });
 
       // Initialize durable state store (loaded before services hydrate from it).
@@ -74,9 +90,25 @@ class WhatsAppAIChatbot {
       );
 
       // Initialize services
-      const whatsappService = createMessagingTransport(getMessagingConfig());
+      const whatsappService = createMessagingTransport(messagingConfig);
+      const sharhApiService = new SharhApiService(sharhApiConfig);
       const neonReadService = new NeonReadService(neonSearchConfig);
-      const aiService = new AIService(aiConfig, neonReadService);
+      const listingSearchService = new ListingSearchService(
+        sharhApiService,
+        neonReadService,
+        sharhApiConfig.allowNeonFallback
+      );
+      const sharhSyncService = new SharhSyncService(
+        sharhApiService,
+        this.persistenceService
+      );
+      const salesPlaybookService = new SalesPlaybookService(salesPlaybookVersion);
+      const funnelQualityService = new FunnelQualityService(salesPlaybookService);
+      const aiService = new AIService(
+        aiConfig,
+        listingSearchService,
+        salesPlaybookService
+      );
       const chatHistoryService = new ChatHistoryService(
         appConfig.maxHistoryLength,
         this.persistenceService
@@ -87,6 +119,10 @@ class WhatsAppAIChatbot {
       );
       const googleSheetsService = new GoogleSheetsService(googleSheetsConfig);
       const leadCaptureService = new LeadCaptureService(
+        this.persistenceService,
+        salesPlaybookService
+      );
+      const messageDeliveryService = new MessageDeliveryService(
         this.persistenceService
       );
 
@@ -100,7 +136,12 @@ class WhatsAppAIChatbot {
         googleSheetsService,
         leadCaptureService,
         this.persistenceService,
-        accessControlService
+        accessControlService,
+        sharhApiService,
+        sharhSyncService,
+        handoffConfig,
+        messageDeliveryService,
+        funnelQualityService
       );
 
       await this.chatbotService.initialize();
@@ -110,7 +151,9 @@ class WhatsAppAIChatbot {
       this.healthService = new HealthService(
         appConfig.port,
         () => (this.chatbotService ? this.chatbotService.getStatus() : null),
-        () => whatsappService.getCurrentQr?.() ?? null
+        () => whatsappService.getCurrentQr?.() ?? null,
+        whatsappService,
+        rawBody => sharhSyncService.enqueueProviderWebhook(rawBody)
       );
       this.healthService.start();
 

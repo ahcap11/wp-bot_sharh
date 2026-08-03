@@ -5,8 +5,8 @@ import { CloudApiTransport } from './cloud-api.service';
 
 /**
  * Single switch point between messaging backends. The backend is selected by
- * config.kind (env WHATSAPP_TRANSPORT) and defaults to Baileys. Nothing else in
- * the app needs to change when switching to the Cloud API.
+ * config.kind (env WHATSAPP_TRANSPORT) and defaults to the Baileys pilot.
+ * Funnel and SHARH integration code remain transport-independent.
  */
 export function createMessagingTransport(
   config: MessagingConfig
@@ -18,6 +18,6 @@ export function createMessagingTransport(
     case 'baileys':
     default:
       logger.info('Messaging transport: Baileys (WhatsApp Web)');
-      return new WhatsAppService();
+      return new WhatsAppService(config);
   }
 }

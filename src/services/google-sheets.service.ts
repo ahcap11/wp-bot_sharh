@@ -49,6 +49,17 @@ const SHEET_HEADERS = [
   'fields_updated',
   'latest_message',
   'notes',
+  'playbook_version',
+  'lead_score',
+  'lead_grade',
+  'lead_temperature',
+  'score_reasons',
+  'risk_flags',
+  'next_best_action',
+  'next_best_action_code',
+  'objections_detected',
+  'conversation_summary',
+  'manager_brief',
 ];
 
 interface ServiceAccountCredentials {
@@ -372,6 +383,29 @@ export class GoogleSheetsService {
       case 'notes':
       case 'comment':
         return this.normalizeCell(record.notes || record.latestMessage);
+      case 'playbook_version':
+        return this.normalizeCell(record.playbookVersion);
+      case 'lead_score':
+        return this.normalizeCell(String(record.leadScore));
+      case 'lead_grade':
+        return this.normalizeCell(record.leadGrade);
+      case 'lead_temperature':
+      case 'lead_priority':
+        return this.normalizeCell(record.leadTemperature);
+      case 'score_reasons':
+        return this.normalizeCell(record.scoreReasons);
+      case 'risk_flags':
+        return this.normalizeCell(record.riskFlags);
+      case 'next_best_action':
+        return this.normalizeCell(record.nextBestAction);
+      case 'next_best_action_code':
+        return this.normalizeCell(record.nextBestActionCode);
+      case 'objections_detected':
+        return this.normalizeCell(record.objectionsDetected);
+      case 'conversation_summary':
+        return this.normalizeCell(record.conversationSummary);
+      case 'manager_brief':
+        return this.normalizeCell(record.managerBrief);
       default:
         return '';
     }
@@ -439,6 +473,17 @@ export class GoogleSheetsService {
       record.fieldsUpdated,
       record.latestMessage,
       record.notes,
+      record.playbookVersion,
+      String(record.leadScore),
+      record.leadGrade,
+      record.leadTemperature,
+      record.scoreReasons,
+      record.riskFlags,
+      record.nextBestAction,
+      record.nextBestActionCode,
+      record.objectionsDetected,
+      record.conversationSummary,
+      record.managerBrief,
     ].map(cell => this.normalizeCell(cell));
   }
 

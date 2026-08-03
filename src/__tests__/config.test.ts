@@ -3,6 +3,9 @@ import {
   getAIServiceConfig,
   getGoogleSheetsConfig,
   getNeonSearchConfig,
+  getSharhApiConfig,
+  getMessagingConfig,
+  getHandoffConfig,
 } from '../config';
 
 /**
@@ -93,6 +96,69 @@ describe('config', () => {
         /NEON_READONLY_DATABASE_URL is required/
       );
     });
+
+
+    it('requires all Cloud API security settings when cloud transport is enabled', () => {
+      process.env['AI_PROVIDER'] = 'openai';
+      process.env['OPENAI_API_KEY'] = 'sk-test';
+      process.env['WHATSAPP_TRANSPORT'] = 'cloud';
+      process.env['WHATSAPP_CLOUD_PHONE_NUMBER_ID'] = '12345';
+      process.env['WHATSAPP_CLOUD_ACCESS_TOKEN'] = 'token';
+      process.env['WHATSAPP_CLOUD_VERIFY_TOKEN'] = 'verify';
+
+      expect(() => getMessagingConfig()).toThrow(
+        /WHATSAPP_CLOUD_APP_SECRET required/
+      );
+    });
+
+    it('requires a leading slash for the Cloud API webhook path', () => {
+      process.env['AI_PROVIDER'] = 'openai';
+      process.env['OPENAI_API_KEY'] = 'sk-test';
+      process.env['WHATSAPP_TRANSPORT'] = 'cloud';
+      process.env['WHATSAPP_CLOUD_PHONE_NUMBER_ID'] = '12345';
+      process.env['WHATSAPP_CLOUD_ACCESS_TOKEN'] = 'token';
+      process.env['WHATSAPP_CLOUD_VERIFY_TOKEN'] = 'verify';
+      process.env['WHATSAPP_CLOUD_APP_SECRET'] = 'secret';
+      process.env['WHATSAPP_CLOUD_WEBHOOK_PATH'] = 'webhook';
+
+      expect(() => getMessagingConfig()).toThrow(/must start with \//);
+    });
+
+    it('throws when SHARH API is enabled without URL and token', () => {
+      process.env['AI_PROVIDER'] = 'openai';
+      process.env['OPENAI_API_KEY'] = 'sk-test';
+      process.env['SHARH_API_ENABLED'] = 'true';
+
+      expect(() => getSharhApiConfig()).toThrow(/SHARH_API_BASE_URL is required/);
+      expect(() => getSharhApiConfig()).toThrow(
+        /SHARH_API_SERVICE_TOKEN is required/
+      );
+    });
+    it('requires persistence when SHARH API synchronization is enabled', () => {
+      process.env['AI_PROVIDER'] = 'openai';
+      process.env['OPENAI_API_KEY'] = 'sk-test';
+      process.env['SHARH_API_ENABLED'] = 'true';
+      process.env['SHARH_API_BASE_URL'] = 'https://sharh.example.com';
+      process.env['SHARH_API_SERVICE_TOKEN'] = 'service-token';
+      process.env['PERSISTENCE_ENABLED'] = 'false';
+
+      expect(() => getSharhApiConfig()).toThrow(
+        /PERSISTENCE_ENABLED must remain true/
+      );
+    });
+
+    it('requires HTTPS for SHARH API in production', () => {
+      process.env['AI_PROVIDER'] = 'openai';
+      process.env['OPENAI_API_KEY'] = 'sk-test';
+      process.env['NODE_ENV'] = 'production';
+      process.env['QR_ACCESS_TOKEN'] = 'test-qr-access-token-123456789';
+      process.env['SHARH_API_ENABLED'] = 'true';
+      process.env['SHARH_API_BASE_URL'] = 'http://sharh.example.com';
+      process.env['SHARH_API_SERVICE_TOKEN'] = 'service-token';
+
+      expect(() => getSharhApiConfig()).toThrow(/must use HTTPS/);
+    });
+
   });
 
   describe('getAIServiceConfig', () => {
@@ -139,4 +205,93 @@ describe('config', () => {
       expect(config.databaseUrl).toBeUndefined();
     });
   });
+
+
+  describe('getMessagingConfig', () => {
+    it('defaults to the Baileys pilot transport and parses session settings', () => {
+      process.env['AI_PROVIDER'] = 'openai';
+      process.env['OPENAI_API_KEY'] = 'sk-test';
+      process.env['WHATSAPP_AUTH_DIR'] = '/app/data/whatsapp-auth';
+      process.env['BAILEYS_RECONNECT_BASE_DELAY_MS'] = '7000';
+      process.env['BAILEYS_RECONNECT_MAX_DELAY_MS'] = '90000';
+
+      const config = getMessagingConfig();
+
+      expect(config.kind).toBe('baileys');
+      expect(config.baileysAuthDir).toBe('/app/data/whatsapp-auth');
+      expect(config.baileysReconnectBaseDelayMs).toBe(7000);
+      expect(config.baileysReconnectMaxDelayMs).toBe(90000);
+    });
+
+    it('requires a protected QR page for Baileys in production', () => {
+      process.env['AI_PROVIDER'] = 'openai';
+      process.env['OPENAI_API_KEY'] = 'sk-test';
+      process.env['NODE_ENV'] = 'production';
+      process.env['WHATSAPP_TRANSPORT'] = 'baileys';
+
+      expect(() => getMessagingConfig()).toThrow(/QR_ACCESS_TOKEN/);
+    });
+
+    it('parses the official Cloud API settings', () => {
+      process.env['AI_PROVIDER'] = 'openai';
+      process.env['OPENAI_API_KEY'] = 'sk-test';
+      process.env['WHATSAPP_TRANSPORT'] = 'cloud';
+      process.env['WHATSAPP_CLOUD_PHONE_NUMBER_ID'] = '12345';
+      process.env['WHATSAPP_CLOUD_ACCESS_TOKEN'] = 'token';
+      process.env['WHATSAPP_CLOUD_VERIFY_TOKEN'] = 'verify';
+      process.env['WHATSAPP_CLOUD_APP_SECRET'] = 'secret';
+
+      const config = getMessagingConfig();
+
+      expect(config.kind).toBe('cloud');
+      expect(config.cloudWebhookPath).toBe('/webhooks/whatsapp');
+      expect(config.cloudSendTimeoutMs).toBe(10000);
+      expect(config.cloudWebhookMaxBodyBytes).toBe(1048576);
+    });
+  });
+
+  describe('getHandoffConfig', () => {
+    it('parses manager recipients and retry settings', () => {
+      process.env['AI_PROVIDER'] = 'openai';
+      process.env['OPENAI_API_KEY'] = 'sk-test';
+      process.env['HANDOFF_WHATSAPP_JIDS'] =
+        '971502106179@s.whatsapp.net, manager-2@s.whatsapp.net';
+      process.env['HANDOFF_RETRY_INTERVAL_MS'] = '45000';
+      process.env['HANDOFF_MAX_ATTEMPTS'] = '20';
+
+      const config = getHandoffConfig();
+
+      expect(config.jids).toHaveLength(2);
+      expect(config.retryIntervalMs).toBe(45000);
+      expect(config.maxAttempts).toBe(20);
+    });
+  });
+
+  describe('getSharhApiConfig', () => {
+    it('parses canonical integration settings', () => {
+      process.env['AI_PROVIDER'] = 'openai';
+      process.env['OPENAI_API_KEY'] = 'sk-test';
+      process.env['SHARH_API_ENABLED'] = 'true';
+      process.env['SHARH_API_BASE_URL'] = 'https://sharh.example.com/';
+      process.env['SHARH_API_SERVICE_TOKEN'] = 'service-token';
+      process.env['SHARH_API_ALLOW_NEON_FALLBACK'] = 'false';
+
+      const config = getSharhApiConfig();
+
+      expect(config.enabled).toBe(true);
+      expect(config.baseUrl).toBe('https://sharh.example.com');
+      expect(config.serviceToken).toBe('service-token');
+      expect(config.requireHandoffPersistence).toBe(true);
+      expect(config.allowNeonFallback).toBe(false);
+      expect(config.publicListingFields).toContain('public_code');
+    });
+
+    it('keeps legacy fallback available while SHARH API is disabled', () => {
+      process.env['AI_PROVIDER'] = 'openai';
+      process.env['OPENAI_API_KEY'] = 'sk-test';
+
+      expect(getSharhApiConfig().allowNeonFallback).toBe(true);
+    });
+  });
+
 });

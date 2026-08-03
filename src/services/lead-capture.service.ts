@@ -1,8 +1,11 @@
 import { WhatsAppMessage } from '../types';
 import { PersistenceService } from './persistence.service';
+import { SalesPlaybookService, ObjectionTopic } from './sales-playbook.service';
+import { LeadScoringService } from './lead-scoring.service';
+import { ConversationSummaryService } from './conversation-summary.service';
 
 const PERSISTENCE_NAMESPACE = 'leadStates';
-const STATE_VERSION = 2;
+const STATE_VERSION = 3;
 const MAX_PROCESSED_MESSAGE_IDS = 500;
 
 export type LeadInquiryPurpose = 'buying' | 'selling';
@@ -25,12 +28,7 @@ export type FunnelStage =
 export type ConversationLanguage = 'en' | 'ru' | 'ar';
 export type ConversationOwner = 'bot' | 'human';
 export type HandoffReason = '' | 'qualified_lead' | 'early_escalation';
-export type ObjectionTopic =
-  | 'commission'
-  | 'confidentiality'
-  | 'registration'
-  | 'valuation'
-  | 'timeline';
+export type { ObjectionTopic } from './sales-playbook.service';
 
 export type LeadField =
   | 'inquiry_purpose'
@@ -95,6 +93,17 @@ export interface LeadCaptureRecord {
   fieldsUpdated: string;
   latestMessage: string;
   notes: string;
+  playbookVersion: string;
+  leadScore: number;
+  leadGrade: 'A' | 'B' | 'C' | 'D';
+  leadTemperature: 'hot' | 'warm' | 'nurture' | 'incomplete';
+  scoreReasons: string;
+  riskFlags: string;
+  nextBestAction: string;
+  nextBestActionCode: string;
+  objectionsDetected: string;
+  conversationSummary: string;
+  managerBrief: string;
 }
 
 export interface LeadCaptureUpdate {
@@ -158,6 +167,7 @@ interface LeadCaptureState {
   pendingNoticeSent: boolean;
   expectedField?: LeadField | undefined;
   pendingObjection?: ObjectionTopic | undefined;
+  objectionsDetected: ObjectionTopic[];
   messageCount: number;
   processedMessageIds: Set<string>;
 }
@@ -226,9 +236,18 @@ const FIELD_TO_STATE_KEY: Record<LeadField, keyof LeadCaptureState> = {
 export class LeadCaptureService {
   private readonly leadStates: Map<string, LeadCaptureState> = new Map();
   private readonly persistence: PersistenceService | null;
+  private readonly playbook: SalesPlaybookService;
+  private readonly scoring: LeadScoringService;
+  private readonly summaries: ConversationSummaryService;
 
-  constructor(persistence: PersistenceService | null = null) {
+  constructor(
+    persistence: PersistenceService | null = null,
+    playbook: SalesPlaybookService = new SalesPlaybookService()
+  ) {
     this.persistence = persistence;
+    this.playbook = playbook;
+    this.scoring = new LeadScoringService(playbook);
+    this.summaries = new ConversationSummaryService();
     this.hydrate();
   }
 
@@ -256,6 +275,7 @@ export class LeadCaptureService {
         owner: serialized.owner || (serialized.handoffCompleted ? 'human' : 'bot'),
         closingMessageSent: serialized.closingMessageSent || false,
         pendingNoticeSent: serialized.pendingNoticeSent || false,
+        objectionsDetected: serialized.objectionsDetected || [],
         processedMessageIds: new Set(serialized.processedMessageIds || []),
       };
       this.leadStates.set(chatId, restored);
@@ -340,15 +360,22 @@ export class LeadCaptureService {
       fieldsUpdated.push('client_phone');
     }
 
-    // The answer to the application-owned current question has priority over
-    // broad pattern matching, which preserves details such as district names.
-    this.applyExpectedField(state, normalizedContent, fieldsUpdated);
-    this.applyExplicitExtractions(state, normalizedContent, fieldsUpdated);
-
-    const objection = this.detectObjectionTopic(normalizedContent);
+    // Objections are handled as objections, not accidentally stored as the
+    // answer to the current qualification question. Explicit structured values
+    // can still be extracted from a mixed answer below.
+    const objection = this.playbook.detectObjection(normalizedContent);
     if (objection) {
       state.pendingObjection = objection;
+      if (!state.objectionsDetected.includes(objection)) {
+        state.objectionsDetected.push(objection);
+        fieldsUpdated.push('objection_detected');
+      }
+    } else {
+      // The answer to the application-owned current question has priority over
+      // broad pattern matching, which preserves details such as district names.
+      this.applyExpectedField(state, normalizedContent, fieldsUpdated);
     }
+    this.applyExplicitExtractions(state, normalizedContent, fieldsUpdated);
 
     if (!state.handoffCompleted) {
       const earlyEscalationReason = this.detectEarlyEscalationReason(
@@ -539,7 +566,10 @@ export class LeadCaptureService {
   }
 
   /** Transfer conversation ownership only after manager notification succeeds. */
-  markHandoffCompleted(chatId: string): void {
+  markHandoffCompleted(
+    chatId: string,
+    closingMessageAlreadySent: boolean = false
+  ): void {
     const state = this.leadStates.get(chatId);
     if (!state) {
       return;
@@ -550,6 +580,7 @@ export class LeadCaptureService {
     state.stage = 'human_owned';
     state.expectedField = undefined;
     state.pendingNoticeSent = false;
+    state.closingMessageSent = closingMessageAlreadySent;
     this.persist(chatId);
   }
 
@@ -646,6 +677,8 @@ export class LeadCaptureService {
       facts.length ? facts.join('\n') : '- None captured yet',
       `- Seller terms accepted: ${state.termsAccepted === true ? 'yes' : state.termsAccepted === false ? 'no' : 'not answered'}`,
       `- Completion: ${this.calculateCompletionPercent(state)}%`,
+      `- Playbook version: ${this.playbook.getVersion()}`,
+      `- Objections detected: ${state.objectionsDetected.join(', ') || 'none'}`,
     ];
 
     if (state.owner === 'human') {
@@ -692,6 +725,7 @@ export class LeadCaptureService {
       handoffCompleted: false,
       closingMessageSent: false,
       pendingNoticeSent: false,
+      objectionsDetected: [],
       messageCount: 0,
       processedMessageIds: new Set<string>(),
     };
@@ -722,7 +756,7 @@ export class LeadCaptureService {
     }
     return {
       ...directive,
-      directResponse: `${this.objectionResponse(
+      directResponse: `${this.playbook.objectionResponse(
         state.language,
         state.pendingObjection
       )}\n\n${directive.directResponse}`,
@@ -1120,7 +1154,7 @@ export class LeadCaptureService {
     fieldsUpdated: string[]
   ): LeadCaptureRecord {
     const nextDirective = this.getDirective(chatId);
-    return {
+    const base: LeadCaptureRecord = {
       timestamp: new Date(message.timestamp).toISOString(),
       chatId,
       sourceJid: message.from,
@@ -1164,7 +1198,29 @@ export class LeadCaptureService {
       fieldsUpdated: fieldsUpdated.join(', '),
       latestMessage: this.normalizeWhitespace(message.content),
       notes: state.escalationNotes || '',
+      playbookVersion: this.playbook.getVersion(),
+      leadScore: 0,
+      leadGrade: 'D',
+      leadTemperature: 'incomplete',
+      scoreReasons: '',
+      riskFlags: '',
+      nextBestAction: '',
+      nextBestActionCode: '',
+      objectionsDetected: state.objectionsDetected.join(', '),
+      conversationSummary: '',
+      managerBrief: '',
     };
+    const score = this.scoring.evaluate(base);
+    base.leadScore = score.score;
+    base.leadGrade = score.grade;
+    base.leadTemperature = score.temperature;
+    base.scoreReasons = score.reasons.join(' | ');
+    base.riskFlags = score.riskFlags.join(' | ');
+    base.nextBestAction = score.nextBestAction;
+    base.nextBestActionCode = score.nextBestActionCode;
+    base.conversationSummary = this.summaries.build(base);
+    base.managerBrief = this.summaries.buildManagerBrief(base);
+    return base;
   }
 
   private calculateCompletionPercent(state: LeadCaptureState): number {
@@ -1605,24 +1661,6 @@ export class LeadCaptureService {
     return null;
   }
 
-  private detectObjectionTopic(value: string): ObjectionTopic | undefined {
-    if (/commission|fee|2%|10,?000|комисси|вознагражден|عمولة|رسوم/i.test(value)) {
-      return 'commission';
-    }
-    if (/confidential|privacy|employee.*know|конфиденц|сотрудник.*узна|سرية|خصوصية/i.test(value)) {
-      return 'confidentiality';
-    }
-    if (/register|sign up|account|регистрац|аккаунт|حساب|تسجيل/i.test(value)) {
-      return 'registration';
-    }
-    if (/valuation|worth|оценк|сколько стоит|تقييم|قيمة/i.test(value)) {
-      return 'valuation';
-    }
-    if (/how long|timeline|срок|как долго|المدة|كم يستغرق/i.test(value)) {
-      return 'timeline';
-    }
-    return undefined;
-  }
 
   private qualifiedLeadHandoff(state: LeadCaptureState): void {
     state.status = 'qualified_lead';
@@ -1867,48 +1905,4 @@ export class LeadCaptureService {
     return templates[language][key] || templates.en[key] || '';
   }
 
-  private objectionResponse(
-    language: ConversationLanguage,
-    topic: ObjectionTopic
-  ): string {
-    const responses: Record<ConversationLanguage, Record<ObjectionTopic, string>> = {
-      en: {
-        commission:
-          'The commission is success-based: 2% above USD 500,000 and USD 10,000 below that threshold, documented before work begins.',
-        confidentiality:
-          'Confidentiality is built into the process. Sensitive information is not meant for public disclosure, and detailed access is handled under the agreed process.',
-        registration:
-          'Registration is not required to start the conversation. It can be offered later to track enquiries, documents, and deal progress.',
-        valuation:
-          'A reliable valuation requires verified financial and operating information. The bot does not invent or confirm a final value.',
-        timeline:
-          'Transaction timing depends on readiness, buyer fit, documentation, and due diligence, so no fixed completion date should be promised.',
-      },
-      ru: {
-        commission:
-          'Комиссия зависит от успешной сделки: 2% свыше 500 000 USD и 10 000 USD ниже этого порога; условия фиксируются до начала работы.',
-        confidentiality:
-          'Конфиденциальность встроена в процесс. Чувствительные данные не предназначены для публичного раскрытия, а детальный доступ предоставляется по согласованной процедуре.',
-        registration:
-          'Регистрация не нужна для начала диалога. Позже её можно предложить для отслеживания запросов, документов и прогресса сделки.',
-        valuation:
-          'Надёжная оценка требует подтверждённых финансовых и операционных данных. Бот не придумывает и не подтверждает итоговую стоимость.',
-        timeline:
-          'Срок зависит от готовности бизнеса, соответствия покупателя, документов и проверки, поэтому фиксированную дату обещать нельзя.',
-      },
-      ar: {
-        commission:
-          'العمولة مرتبطة بنجاح الصفقة: 2% فوق 500,000 دولار و10,000 دولار تحت هذا الحد، ويتم توثيق الشروط قبل بدء العمل.',
-        confidentiality:
-          'السرية جزء أساسي من العملية. لا تُعرض المعلومات الحساسة للعامة، ويتم الوصول التفصيلي وفق الإجراءات المتفق عليها.',
-        registration:
-          'لا يلزم التسجيل لبدء المحادثة. يمكن عرضه لاحقاً لمتابعة الاستفسارات والمستندات وتقدم الصفقة.',
-        valuation:
-          'يتطلب التقييم الموثوق معلومات مالية وتشغيلية موثقة. لا يخمن البوت قيمة نهائية ولا يؤكدها.',
-        timeline:
-          'تعتمد المدة على جاهزية المشروع وملاءمة المشتري والمستندات والعناية الواجبة، لذلك لا يمكن وعد العميل بتاريخ ثابت.',
-      },
-    };
-    return responses[language][topic];
-  }
 }

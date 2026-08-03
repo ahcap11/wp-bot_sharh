@@ -5,7 +5,8 @@ import {
   BotRole,
 } from '../types';
 import { logger } from '../utils/logger';
-import { NeonReadService } from './neon-read.service';
+import type { ListingSearchProvider } from './listing-search.service';
+import type { SalesPlaybookService } from './sales-playbook.service';
 
 // Only import OpenAI if needed (optional dependency loaded lazily).
 let OpenAI: any;
@@ -162,14 +163,17 @@ const COMMON_WORDS = new Set([
 export class AIService {
   private openai: any;
   private config: AIServiceConfig;
-  private neonReadService: NeonReadService | null;
+  private listingSearchService: ListingSearchProvider | null;
+  private salesPlaybook: SalesPlaybookService | null;
 
   constructor(
     config: AIServiceConfig,
-    neonReadService: NeonReadService | null = null
+    listingSearchService: ListingSearchProvider | null = null,
+    salesPlaybook: SalesPlaybookService | null = null
   ) {
     this.config = config;
-    this.neonReadService = neonReadService;
+    this.listingSearchService = listingSearchService;
+    this.salesPlaybook = salesPlaybook;
     if (config.provider === 'openai') {
       this.openai = new OpenAI({ apiKey: config.apiKey });
       logger.info('AI Service initialized with OpenAI');
@@ -416,7 +420,7 @@ export class AIService {
 
     if (salesKnowledgeContext) {
       parts.push(
-        `Use this read-only Neon lookup context if relevant:\n${salesKnowledgeContext}`
+        `Use this server-approved SHARH public listing context if relevant:\n${salesKnowledgeContext}`
       );
     }
 
@@ -499,7 +503,8 @@ export class AIService {
   private buildSystemPrompt(role: BotRole): string {
     // Sharh qualification playbook is the primary agent prompt (sales role).
     if (role === 'sales') {
-      return ROLE_PROMPTS.sales;
+      const versionedInstructions = this.salesPlaybook?.getModelInstructions() || '';
+      return [ROLE_PROMPTS.sales, versionedInstructions].filter(Boolean).join('\n\n');
     }
 
     // Support is an optional fallback mode, scoped to Sharh business matters.
@@ -546,33 +551,45 @@ export class AIService {
     role: BotRole,
     message: string
   ): Promise<string> {
-    if (role !== 'sales' || !this.neonReadService?.isEnabled()) {
+    if (role !== 'sales' || !this.listingSearchService?.isEnabled()) {
       return '';
     }
 
-    const rows = await this.neonReadService.searchListings(message);
+    const rows = await this.listingSearchService.searchListings(message);
     if (rows.length === 0) {
       return '';
     }
 
-    const row = rows[0] as Record<string, unknown>;
-    const fields = Object.entries(row)
-      .filter(([, value]) => value !== null && value !== undefined && value !== '')
-      .map(([key, value]) => `- ${key}: ${String(value)}`)
-      .join('\n');
+    const candidates = rows
+      .map((row, index) => {
+        const fields = Object.entries(row)
+          .filter(
+            ([, value]) =>
+              value !== null && value !== undefined && value !== ''
+          )
+          .map(([key, value]) => `- ${key}: ${String(value)}`)
+          .join('\n');
+        return fields ? `LISTING ${index + 1}\n${fields}` : '';
+      })
+      .filter(Boolean)
+      .join('\n\n');
 
-    if (!fields) {
+    if (!candidates) {
       return '';
     }
 
-    logger.info('Attached Neon sales lookup context', { resultCount: 1 });
+    logger.info('Attached SHARH public listing context', {
+      resultCount: rows.length,
+    });
 
     return [
-      'MATCHED LISTING (the only listing you may discuss in this reply).',
+      'SERVER-APPROVED PUBLIC LISTING CONTEXT.',
       'Use ONLY the fields below. Do not invent or infer any other detail',
       '(price, owner, location, financials). If the client asks for anything',
       'not listed here, say a manager will share the details.',
-      fields,
+      'When several candidates are present, ask one concise preference question',
+      'or summarize the differences without claiming an exact match.',
+      candidates,
     ].join('\n');
   }
 

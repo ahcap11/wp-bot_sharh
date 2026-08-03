@@ -103,7 +103,13 @@ describe('LeadCaptureService', () => {
       completionPercent: 100,
       funnelStage: 'handoff_pending',
       owner: 'bot',
+      leadGrade: 'A',
+      leadTemperature: 'hot',
+      playbookVersion: '1.0.0',
+      nextBestActionCode: 'manager_review_and_accept',
     });
+    expect(record?.leadScore).toBeGreaterThanOrEqual(80);
+    expect(record?.conversationSummary).toContain('Recommended action');
   });
 
   it('does not qualify a buyer after only sector and budget', () => {
@@ -168,6 +174,18 @@ describe('LeadCaptureService', () => {
     const second = turn('ru-seller', 'r2', 'Меня зовут Алексей Иванов');
     expect(second.directive.directResponse).toContain('конфиденциально');
     expect(service.getCurrentRecord('ru-seller')?.language).toBe('ru');
+  });
+
+  it('handles an objection without storing it as the requested qualification field', () => {
+    const chatId = 'seller-objection';
+    turn(chatId, 'o1', 'I want to sell my business');
+    turn(chatId, 'o2', 'Nadia Khan');
+    const objection = turn(chatId, 'o3', 'Why is the commission so high?');
+
+    expect(service.getCurrentRecord(chatId)?.termsAccepted).toBe('');
+    expect(service.getCurrentRecord(chatId)?.objectionsDetected).toContain('commission');
+    expect(objection.directive.directResponse).toContain('success-based');
+    expect(objection.directive.expectedField).toBe('seller_terms');
   });
 
   it('changes ownership only after a successful handoff and then suppresses the bot', () => {

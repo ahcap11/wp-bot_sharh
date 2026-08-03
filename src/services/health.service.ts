@@ -1,6 +1,6 @@
 import http from 'http';
 import QRCode from 'qrcode';
-import { HealthStatus } from '../types';
+import { HealthStatus, MessagingTransport } from '../types';
 import { logger } from '../utils/logger';
 
 /**
@@ -12,12 +12,16 @@ export interface HealthSnapshot {
   webSocketClients: number;
   totalChats: number;
   totalMessages: number;
+  sharhApiEnabled?: boolean | undefined;
+  sharhApiReachable?: boolean | null | undefined;
+  sharhSyncPending?: number | undefined;
 }
 
 export type HealthProvider = () => HealthSnapshot | null;
 
 /** Returns the latest pending WhatsApp QR string, or null. */
 export type QrProvider = () => string | null;
+export type VerifiedWebhookForwarder = (rawBody: Buffer) => void;
 
 /**
  * Lightweight HTTP server exposing liveness and readiness probes.
@@ -32,7 +36,9 @@ export class HealthService {
   constructor(
     private readonly port: number,
     private readonly provider: HealthProvider,
-    private readonly qrProvider: QrProvider | null = null
+    private readonly qrProvider: QrProvider | null = null,
+    private readonly webhookTransport: MessagingTransport | null = null,
+    private readonly verifiedWebhookForwarder: VerifiedWebhookForwarder | null = null
   ) {}
 
   /**
@@ -43,7 +49,9 @@ export class HealthService {
       return;
     }
 
-    this.server = http.createServer((req, res) => this.handleRequest(req, res));
+    this.server = http.createServer((req, res) => {
+      void this.handleRequest(req, res);
+    });
 
     this.server.on('error', (error: Error) => {
       logger.error('Health server error', { error: error.message });
@@ -72,8 +80,13 @@ export class HealthService {
     const snapshot = this.safeSnapshot();
     const memory = process.memoryUsage();
 
+    const sharhReady = Boolean(
+      !snapshot?.sharhApiEnabled || snapshot?.sharhApiReachable === true
+    );
     const ready = Boolean(
-      snapshot?.whatsappConnected && snapshot?.aiServiceConnected
+      snapshot?.whatsappConnected &&
+        snapshot?.aiServiceConnected &&
+        sharhReady
     );
 
     return {
@@ -94,14 +107,24 @@ export class HealthService {
    */
   isReady(): boolean {
     const snapshot = this.safeSnapshot();
-    return Boolean(snapshot?.whatsappConnected && snapshot?.aiServiceConnected);
+    return Boolean(
+      snapshot?.whatsappConnected &&
+        snapshot?.aiServiceConnected &&
+        (!snapshot?.sharhApiEnabled || snapshot?.sharhApiReachable === true)
+    );
   }
 
-  private handleRequest(
+  private async handleRequest(
     req: http.IncomingMessage,
     res: http.ServerResponse
-  ): void {
+  ): Promise<void> {
     const path = (req.url || '/').split('?')[0];
+    const webhookPath = this.webhookTransport?.getWebhookPath?.();
+
+    if (webhookPath && path === webhookPath) {
+      await this.handleMessagingWebhook(req, res);
+      return;
+    }
 
     if (req.method !== 'GET') {
       this.sendJson(res, 405, { error: 'method not allowed' });
@@ -111,7 +134,6 @@ export class HealthService {
     switch (path) {
       case '/health':
       case '/healthz':
-        // Liveness: the event loop is responding, so the process is alive.
         this.sendJson(res, 200, {
           status: 'alive',
           uptime: this.buildStatus().uptime,
@@ -126,18 +148,101 @@ export class HealthService {
           dependencies: {
             whatsapp: Boolean(snapshot?.whatsappConnected),
             ai: Boolean(snapshot?.aiServiceConnected),
+            sharh_api: snapshot?.sharhApiEnabled
+              ? snapshot?.sharhApiReachable === true
+              : true,
           },
+          sharh_sync_pending: snapshot?.sharhSyncPending ?? 0,
           chats: snapshot?.totalChats ?? 0,
           messages: snapshot?.totalMessages ?? 0,
         });
         return;
       }
       case '/qr':
-        void this.handleQrRequest(req, res);
+        await this.handleQrRequest(req, res);
         return;
       default:
         this.sendJson(res, 404, { error: 'not found' });
     }
+  }
+
+  private async handleMessagingWebhook(
+    req: http.IncomingMessage,
+    res: http.ServerResponse
+  ): Promise<void> {
+    if (!this.webhookTransport) {
+      this.sendJson(res, 404, { error: 'not found' });
+      return;
+    }
+
+    if (req.method === 'GET') {
+      const query = new URL(req.url || '/', 'http://localhost').searchParams;
+      const challenge = this.webhookTransport.verifyWebhookChallenge?.(query);
+      if (!challenge) {
+        this.sendText(res, 403, 'Forbidden');
+        return;
+      }
+      this.sendText(res, 200, challenge);
+      return;
+    }
+
+    if (req.method !== 'POST' || !this.webhookTransport.handleWebhookRequest) {
+      this.sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+
+    try {
+      const rawBody = await this.readBody(req, 10 * 1024 * 1024);
+      const result = await this.webhookTransport.handleWebhookRequest(
+        rawBody,
+        req.headers
+      );
+      if (
+        result.statusCode >= 200 &&
+        result.statusCode < 300 &&
+        this.verifiedWebhookForwarder
+      ) {
+        try {
+          this.verifiedWebhookForwarder(rawBody);
+        } catch (error) {
+          logger.warn('Unable to enqueue verified provider webhook', {
+            error: error instanceof Error ? error.message : 'unknown error',
+          });
+        }
+      }
+      if (typeof result.body === 'string') {
+        this.sendText(res, result.statusCode, result.body);
+      } else {
+        this.sendJson(res, result.statusCode, result.body);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'webhook error';
+      const status = message === 'payload too large' ? 413 : 400;
+      logger.warn('Messaging webhook request rejected', { error: message });
+      this.sendJson(res, status, { error: message });
+    }
+  }
+
+  private readBody(
+    req: http.IncomingMessage,
+    maxBytes: number
+  ): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      req.on('data', chunk => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        size += buffer.length;
+        if (size > maxBytes) {
+          reject(new Error('payload too large'));
+          req.destroy();
+          return;
+        }
+        chunks.push(buffer);
+      });
+      req.on('end', () => resolve(Buffer.concat(chunks)));
+      req.on('error', reject);
+    });
   }
 
   /**
@@ -149,6 +254,11 @@ export class HealthService {
     req: http.IncomingMessage,
     res: http.ServerResponse
   ): Promise<void> {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+
     const requiredToken = process.env['QR_ACCESS_TOKEN'] || '';
     let providedToken = '';
     try {
@@ -228,6 +338,15 @@ export class HealthService {
       });
       return null;
     }
+  }
+
+  private sendText(
+    res: http.ServerResponse,
+    statusCode: number,
+    body: string
+  ): void {
+    res.writeHead(statusCode, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(body);
   }
 
   private sendJson(
