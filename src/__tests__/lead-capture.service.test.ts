@@ -51,107 +51,85 @@ describe('LeadCaptureService', () => {
     };
   };
 
-  it('runs a seller through every required qualification field and keeps the bot active', () => {
-    const chatId = 'seller-complete';
+  it('creates a review-ready seller lead from one natural details message', () => {
+    const chatId = 'seller-minimum';
 
-    expect(turn(chatId, 's1', 'I want to sell my business').directive.expectedField)
-      .toBe('client_name');
-    expect(turn(chatId, 's2', 'My name is Sarah Lee').directive.expectedField)
-      .toBe('seller_terms');
-    expect(turn(chatId, 's3', 'Yes, I agree').directive.expectedField)
-      .toBe('business_type');
+    const first = turn(chatId, 's1', 'I want to sell my business');
+    expect(first.directive.expectedField).toBe('seller_terms');
+    expect(first.directive.directResponse).toContain('success-based');
 
-    const answers: Array<[string, string, string]> = [
-      ['s4', 'We operate a vegan restaurant chain', 'business_location'],
-      ['s5', 'Dubai Marina', 'annual_revenue_aed'],
-      ['s6', 'AED 5,000,000', 'lease_details'],
-      ['s7', 'Leased for AED 45,000 monthly, 3 years remaining', 'desired_selling_price_aed'],
-      ['s8', 'AED 4,200,000', 'year_established'],
-      ['s9', '2018', 'employee_count'],
-      ['s10', '24', 'monthly_operating_expenses_aed'],
-      ['s11', 'AED 300,000', 'monthly_net_profit_aed'],
-      ['s12', 'AED 95,000', 'liabilities'],
-      ['s13', 'No debt', 'contracts_licenses'],
-      ['s14', 'Trade licence and two supplier agreements', 'sale_reason_urgency'],
-      ['s15', 'Owner relocation; target completion within six months', 'included_assets'],
-    ];
+    const accepted = turn(chatId, 's2', '1');
+    expect(accepted.directive.expectedField).toBe('business_type');
+    expect(accepted.directive.directResponse).toContain('in one message');
 
-    for (const [id, answer, expectedNext] of answers) {
-      const result = turn(chatId, id, answer);
-      expect(result.status).toBe('contacted');
-      expect(result.directive.expectedField).toBe(expectedNext);
-    }
-
-    const final = turn(
-      chatId,
-      's16',
-      'Equipment, inventory, brand, licences and social accounts',
-      false
-    );
-
-    expect(final.status).toBe('qualified');
-    expect(final.directive.directResponse).toContain('recorded successfully');
-
-    const record = service.getCurrentRecord(chatId);
-    expect(record).toMatchObject({
-      inquiryPurpose: 'selling',
-      clientName: 'Sarah Lee',
-      clientPhone: '971501234567',
-      businessLocation: 'Dubai Marina',
-      annualRevenueAed: 'AED 5,000,000',
-      desiredSellingPriceAed: 'AED 4,200,000',
-      completionPercent: 100,
-      funnelStage: 'qualifying',
-      owner: 'bot',
-      leadGrade: 'A',
-      leadTemperature: 'hot',
-      playbookVersion: '1.0.0',
-      nextBestActionCode: 'review_qualified_lead',
-    });
-    expect(record?.leadScore).toBeGreaterThanOrEqual(80);
-    expect(record?.conversationSummary).toContain('Recommended action');
-  });
-
-  it('does not qualify a buyer after only sector and budget', () => {
-    const chatId = 'buyer-incomplete';
-    turn(chatId, 'b1', 'I want to buy a business');
-    turn(chatId, 'b2', 'John Carter');
-    turn(chatId, 'b3', 'Healthcare');
-    const result = turn(chatId, 'b4', 'AED 3 million');
-
-    expect(result.status).toBe('contacted');
-    expect(result.directive.expectedField).toBe('buyer_location');
-    expect(service.getCurrentRecord(chatId)?.completionPercent).toBeLessThan(100);
-  });
-
-  it('qualifies a buyer only after the complete buyer mandate is captured', () => {
-    const chatId = 'buyer-complete';
-    turn(chatId, 'b1', 'I am looking to acquire a business');
-    turn(chatId, 'b2', 'John Carter');
-    turn(chatId, 'b3', 'Healthcare and pharmacies');
-    turn(chatId, 'b4', 'AED 3-5 million');
-    turn(chatId, 'b5', 'Dubai or Abu Dhabi');
-    turn(chatId, 'b6', 'Within four months');
-    turn(chatId, 'b7', 'I want to operate it personally');
-    turn(chatId, 'b8', 'Funds are available now');
     const result = turn(
       chatId,
-      'b9',
-      'Prefer an established team and no major liabilities',
+      's3',
+      'Boat trading business in Dubai Marina, annual revenue around 1mln AED and asking AED 600k',
       false
     );
 
     expect(result.status).toBe('qualified');
-    expect(result.directive.directResponse).toContain('recorded successfully');
+    expect(result.directive.directResponse).toContain('initial SHARH review');
+    expect(result.directive.directResponse).toContain('Submit for review');
+
+    const record = service.getCurrentRecord(chatId);
+    expect(record).toMatchObject({
+      inquiryPurpose: 'selling',
+      clientPhone: '971501234567',
+      businessType: 'Boat trading business',
+      businessLocation: 'Dubai Marina',
+      annualRevenueAed: 'AED 1,000,000',
+      desiredSellingPriceAed: 'AED 600,000',
+      status: 'qualified',
+      funnelStage: 'ready_for_review',
+      owner: 'bot',
+      playbookVersion: '1.0.0',
+    });
+    expect(record?.completionPercent).toBeGreaterThan(0);
+  });
+
+  it('asks only for one missing seller financial anchor', () => {
+    const chatId = 'seller-missing-finance';
+    turn(chatId, 's1', 'sell');
+    turn(chatId, 's2', 'yes');
+    const result = turn(chatId, 's3', 'A dental clinic in Abu Dhabi');
+
+    expect(result.status).toBe('contacted');
+    expect(result.directive.expectedField).toBe('annual_revenue_aed');
+    expect(result.directive.directResponse).toContain('One useful figure is enough');
+  });
+
+  it('qualifies a buyer after one useful criteria message', () => {
+    const chatId = 'buyer-minimum';
+    const first = turn(chatId, 'b1', 'I want to buy a business');
+    expect(first.directive.expectedField).toBe('business_type');
+
+    const result = turn(chatId, 'b2', 'Salon in Dubai under AED 500k', false);
+    expect(result.status).toBe('qualified');
+    expect(result.directive.directResponse).toContain('open a result');
     expect(service.getCurrentRecord(chatId)).toMatchObject({
       inquiryPurpose: 'buying',
-      buyerBudgetAed: 'AED 3,000,000–5,000,000',
-      buyerLocation: 'Dubai or Abu Dhabi',
-      completionPercent: 100,
+      businessType: 'Salon',
+      buyerLocation: 'Dubai',
+      buyerBudgetAed: 'AED 500,000',
+      funnelStage: 'ready_for_review',
     });
   });
 
-  it('keeps a specific listing buyer inside the qualification funnel', () => {
+  it('can start a buyer search with category plus either location or budget', () => {
+    const chatId = 'buyer-location-only';
+    turn(chatId, 'b1', 'buy');
+    const result = turn(chatId, 'b2', 'Healthcare business in Abu Dhabi', false);
+
+    expect(result.status).toBe('qualified');
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      businessType: 'Healthcare business',
+      buyerLocation: 'Abu Dhabi',
+    });
+  });
+
+  it('keeps a specific listing buyer inside the low-friction buyer flow', () => {
     const update = service.updateFromMessage(
       'specific-listing',
       buildMessage('l1', 'I want to buy listing SH-0042. Send me the financials.')
@@ -163,24 +141,21 @@ describe('LeadCaptureService', () => {
       specificListingCode: 'SH-0042',
       inquiryPurpose: 'buying',
     });
-    expect(directive.expectedField).toBe('client_name');
+    expect(directive.expectedField).toBe('business_type');
     expect(directive.directResponse).not.toContain('financials');
   });
 
-  it('keeps Russian language and asks deterministic Russian questions', () => {
+  it('keeps Russian language while presenting the seller terms first', () => {
     const first = turn('ru-seller', 'r1', 'Я хочу продать бизнес');
-    expect(first.directive.directResponse).toContain('Как я могу к вам обращаться');
-
-    const second = turn('ru-seller', 'r2', 'Меня зовут Алексей Иванов');
-    expect(second.directive.directResponse).toContain('конфиденциально');
+    expect(first.directive.directResponse).toContain('Перед началом основные условия');
+    expect(first.directive.expectedField).toBe('seller_terms');
     expect(service.getCurrentRecord('ru-seller')?.language).toBe('ru');
   });
 
-  it('handles an objection without storing it as the requested qualification field', () => {
+  it('handles an objection without storing it as seller consent', () => {
     const chatId = 'seller-objection';
     turn(chatId, 'o1', 'I want to sell my business');
-    turn(chatId, 'o2', 'Nadia Khan');
-    const objection = turn(chatId, 'o3', 'Why is the commission so high?');
+    const objection = turn(chatId, 'o2', 'Why is the commission so high?');
 
     expect(service.getCurrentRecord(chatId)?.termsAccepted).toBe('');
     expect(service.getCurrentRecord(chatId)?.objectionsDetected).toContain('commission');
@@ -188,7 +163,7 @@ describe('LeadCaptureService', () => {
     expect(objection.directive.expectedField).toBe('seller_terms');
   });
 
-  it('flags a human request for review without pausing the bot', () => {
+  it('records a human follow-up request without pausing the bot', () => {
     const chatId = 'human-review';
     service.updateFromMessage(
       chatId,
@@ -203,25 +178,16 @@ describe('LeadCaptureService', () => {
       markReviewNoticeOnSend: true,
     });
     expect(notice.directResponse).toContain('SHARH review');
-    expect(notice.directResponse).toContain('Are you looking to buy or sell');
     service.confirmDirectiveSent(chatId, notice);
-
-    const followUp = service.getDirective(chatId);
-    expect(followUp).toMatchObject({
-      owner: 'bot',
-      shouldRespond: true,
-      expectedField: 'inquiry_purpose',
-    });
-    expect(followUp.markReviewNoticeOnSend).toBeUndefined();
   });
 
-  it('does not advance the expected field until the outbound question is confirmed sent', () => {
+  it('does not advance a question until the outbound message is confirmed sent', () => {
     service.updateFromMessage(
       'send-confirmation',
       buildMessage('c1', 'I want to sell my business')
     );
-    const askName = service.getDirective('send-confirmation');
-    expect(askName.expectedField).toBe('client_name');
+    const terms = service.getDirective('send-confirmation');
+    expect(terms.expectedField).toBe('seller_terms');
 
     // Simulate an outbound delivery failure: no confirmDirectiveSent call.
     service.updateFromMessage(
@@ -229,8 +195,8 @@ describe('LeadCaptureService', () => {
       buildMessage('c2', 'This is a restaurant in Dubai')
     );
 
-    expect(service.getCurrentRecord('send-confirmation')?.clientName).toBe('');
-    expect(service.getDirective('send-confirmation').expectedField).toBe('client_name');
+    expect(service.getCurrentRecord('send-confirmation')?.termsAccepted).toBe('');
+    expect(service.getDirective('send-confirmation').expectedField).toBe('seller_terms');
   });
 
   it('ignores duplicate provider message ids', () => {

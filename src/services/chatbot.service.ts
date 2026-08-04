@@ -31,6 +31,7 @@ const ROLES_PERSISTENCE_NAMESPACE = 'chatRoles';
 const INBOUND_DEDUP_NAMESPACE = 'processedInboundMessages';
 const MAX_INBOUND_DEDUP_IDS = 5000;
 const BUYER_MATCHES_NAMESPACE = 'buyerListingMatches';
+const BUYER_LISTING_CODES_NAMESPACE = 'buyerListingCodes';
 
 interface SalesLeadTurn {
   directive: FunnelDirective;
@@ -67,6 +68,7 @@ export class ChatbotService {
   private readonly funnelQualityService: FunnelQualityService | null;
   private readonly conversationSafetyService: ConversationSafetyService | null;
   private readonly buyerMatchFingerprints: Map<string, string> = new Map();
+  private readonly buyerListingCodes: Map<string, string[]> = new Map();
 
   constructor(
     whatsappService: MessagingTransport,
@@ -105,6 +107,7 @@ export class ChatbotService {
     this.hydrateRoles();
     this.hydrateInboundDedup();
     this.hydrateBuyerMatches();
+    this.hydrateBuyerListingCodes();
     this.setupEventHandlers();
     logger.info('Chatbot Service initialized', {
       persisted: Boolean(persistence),
@@ -145,6 +148,17 @@ export class ChatbotService {
     for (const [chatId, fingerprint] of Object.entries(stored)) {
       if (typeof fingerprint === 'string' && fingerprint) {
         this.buyerMatchFingerprints.set(chatId, fingerprint);
+      }
+    }
+  }
+
+  private hydrateBuyerListingCodes(): void {
+    if (!this.persistence) return;
+    const stored = this.persistence.getNamespace<string[]>(BUYER_LISTING_CODES_NAMESPACE);
+    for (const [chatId, codes] of Object.entries(stored)) {
+      if (Array.isArray(codes)) {
+        const clean = codes.filter(code => /^SH-\d{4,}$/i.test(code)).slice(0, 3);
+        if (clean.length) this.buyerListingCodes.set(chatId, clean);
       }
     }
   }
@@ -688,6 +702,15 @@ export class ChatbotService {
     }
 
     try {
+      const currentBefore = this.leadCaptureService.getCurrentRecord(chatId);
+      const listingSelection =
+        currentBefore?.inquiryPurpose === 'buying'
+          ? this.resolveBuyerListingSelection(chatId, message.content)
+          : null;
+      if (listingSelection) {
+        message = { ...message, content: listingSelection };
+      }
+
       const navigation = this.leadCaptureService.handleNavigationCommand(
         chatId,
         message.content
@@ -697,8 +720,16 @@ export class ChatbotService {
           this.conversationSafetyService?.resetConversation(chatId);
           this.buyerMatchFingerprints.delete(chatId);
           this.persistence?.removeItem(BUYER_MATCHES_NAMESPACE, chatId);
+          this.buyerListingCodes.delete(chatId);
+          this.persistence?.removeItem(BUYER_LISTING_CODES_NAMESPACE, chatId);
         }
         const record = this.leadCaptureService.getCurrentRecord(chatId) || undefined;
+        if (record?.inquiryPurpose) {
+          this.sharhSyncService?.enqueueLead(
+            record,
+            `${message.id}-navigation-${navigation.action || 'unknown'}`
+          );
+        }
         const continuationDirective = navigation.continueFunnel
           ? this.leadCaptureService.getDirective(chatId)
           : null;
@@ -1243,11 +1274,12 @@ export class ChatbotService {
     this.persistence?.setItem(BUYER_MATCHES_NAMESPACE, chatId, fingerprint);
 
     const nextPrompt = directive.directResponse?.trim() || '';
-    const response = this.formatBuyerListingResults(record, rows);
+    const response = this.formatBuyerListingResults(chatId, record, rows);
     return [response, nextPrompt].filter(Boolean).join('\n\n');
   }
 
   private formatBuyerListingResults(
+    chatId: string,
     record: LeadCaptureRecord,
     rows: Array<Record<string, unknown>>
   ): string {
@@ -1267,6 +1299,15 @@ export class ChatbotService {
           : 'I do not currently see an exact published match for those criteria. Your request is saved, and you can adjust the sector, emirate, or budget.';
     }
 
+    const codes = rows
+      .map(row => String(row['public_code'] || '').trim().toUpperCase())
+      .filter(code => /^SH-\d{4,}$/.test(code))
+      .slice(0, 3);
+    if (codes.length) {
+      this.buyerListingCodes.set(chatId, codes);
+      this.persistence?.setItem(BUYER_LISTING_CODES_NAMESPACE, chatId, codes);
+    }
+
     const header = language === 'ru'
       ? 'Ближайшие опубликованные варианты:'
       : language === 'ar'
@@ -1279,14 +1320,26 @@ export class ChatbotService {
       const sector = String(row['sector'] || '').trim();
       const price = String(row['asking'] || row['price'] || '').trim();
       const details = [location, sector, price].filter(Boolean).join(' · ');
-      return `${index + 1}. ${code ? `${code} — ` : ''}${title}${details ? `\n   ${details}` : ''}`;
+      const webBase = (process.env['SHARH_WEB_BASE_URL'] || 'https://sharh.ae').replace(/\/$/, '');
+      const listingId = String(row['id'] || '').trim();
+      const url = listingId ? `${webBase}/listings/${encodeURIComponent(listingId)}` : '';
+      return `${index + 1}. ${code ? `${code} — ` : ''}${title}${details ? `
+   ${details}` : ''}${url ? `
+   ${url}` : ''}`;
     });
     const footer = language === 'ru'
-      ? 'Отправьте код SH-XXXX, чтобы открыть конкретный вариант.'
+      ? 'Ответьте 1, 2 или 3 либо отправьте код SH-XXXX, чтобы открыть конкретный вариант.'
       : language === 'ar'
-        ? 'أرسل رمز SH-XXXX لعرض خيار محدد.'
-        : 'Send the SH-XXXX code to open a specific option.';
+        ? 'أجب 1 أو 2 أو 3، أو أرسل رمز SH-XXXX لعرض خيار محدد.'
+        : 'Reply 1, 2, or 3, or send the SH-XXXX code to open a specific option.';
     return [header, ...lines, footer].join('\n');
+  }
+
+  private resolveBuyerListingSelection(chatId: string, content: string): string | null {
+    const match = content.trim().match(/^([1-3])$/);
+    if (!match?.[1]) return null;
+    const index = Number.parseInt(match[1], 10) - 1;
+    return this.buyerListingCodes.get(chatId)?.[index] || null;
   }
 
   private isListingRequest(content: string): boolean {

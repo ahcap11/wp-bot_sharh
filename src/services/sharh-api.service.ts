@@ -302,6 +302,9 @@ export class SharhApiService {
     record: LeadCaptureRecord,
     idempotencyKey: string
   ): Promise<boolean> {
+    if (!this.config.enabled || !record.inquiryPurpose) {
+      return true;
+    }
     const path =
       record.inquiryPurpose === 'selling'
         ? '/api/v1/bot/seller-intakes/sync'
@@ -672,6 +675,7 @@ export class SharhApiService {
         buyer_involvement: record.buyerInvolvement || null,
         buyer_funding_status: record.buyerFundingStatus || null,
         buyer_additional_comments: record.buyerAdditionalComments || null,
+        contact_preference: record.contactPreference || null,
       },
       completion_percent: record.completionPercent,
       sales_intelligence: {
@@ -694,6 +698,7 @@ export class SharhApiService {
         review_brief: record.reviewBrief,
       },
       next_field: record.nextField || null,
+      next_step: record.nextStep || null,
       fields_updated: record.fieldsUpdated
         ? record.fieldsUpdated.split(',').map(value => value.trim()).filter(Boolean)
         : [],

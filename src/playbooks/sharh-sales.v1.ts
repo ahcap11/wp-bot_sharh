@@ -1,9 +1,9 @@
 export type SalesLanguage = 'en' | 'ru' | 'ar';
 
 export const SHARH_FEE_TERMS: Record<SalesLanguage, string> = {
-  en: 'Our fee is success-based only and is paid when the sale completes: 5% for transactions above USD 200,000 and a flat USD 10,000 for transactions at or below USD 200,000.',
-  ru: 'Наша комиссия взимается только при успешном завершении сделки: 5% для сделок свыше 200 000 USD и фиксированные 10 000 USD для сделок на сумму 200 000 USD или ниже.',
-  ar: 'تُدفع رسومنا فقط عند إتمام الصفقة بنجاح: 5% للصفقات التي تتجاوز 200,000 دولار، ومبلغ ثابت قدره 10,000 دولار للصفقات بقيمة 200,000 دولار أو أقل.',
+  en: 'Our fee is success-based only and is paid when the sale completes: 5% for deals above USD 200,000 and a flat USD 10,000 for anything below USD 200,000.',
+  ru: 'Наша комиссия выплачивается только после успешного завершения сделки: 5% для сделок свыше 200 000 USD и фиксированные 10 000 USD для сделок ниже 200 000 USD.',
+  ar: 'تُدفع رسومنا فقط عند إتمام الصفقة: 5% للصفقات التي تتجاوز 200,000 دولار، ومبلغ ثابت قدره 10,000 دولار للصفقات الأقل من 200,000 دولار.',
 };
 
 export type ObjectionTopic =

@@ -229,6 +229,7 @@ export class AIService {
       'buyer_involvement',
       'buyer_funding_status',
       'buyer_additional_comments',
+      'contact_preference',
     ] as LeadField[];
 
     const system = [
@@ -239,13 +240,15 @@ export class AIService {
       'Never answer recipes, coding, homework, entertainment, general knowledge, or other unrelated requests.',
       'Never invent, estimate, or repair a value the user did not provide.',
       'Extract every explicit field in one message, not only the expected field.',
+      'The experience is value-first and zero-friction: understand natural multi-field messages, avoid unnecessary follow-up questions, and do not behave like a rigid form.',
+      'When the user provides enough information for the minimum seller or buyer profile, acknowledge the useful summary instead of asking for every optional field.',
       'For money, normalize only clear values to strings such as AED 150,000 or AED 1,000,000–1,500,000.',
       'Words such as bazillion/bazilion, banana, asdf, random jokes, or unrelated text are not financial answers.',
       'A correction means the user explicitly changes a previously supplied fact, for example “actually revenue is 250k”.',
       'When the user says they do not know, put that field in unknown_fields and do not fabricate a value.',
-      'The official fee is success-based only, paid when the sale completes: 5% for transactions above USD 200,000 and a flat USD 10,000 for transactions at or below USD 200,000.',
+      'The official fee is success-based only, paid when the sale completes: 5% for deals above USD 200,000 and a flat USD 10,000 for anything below USD 200,000.',
       'Write reply in the user language, professional and natural for WhatsApp, normally under 450 characters and without emoji.',
-      'For a straightforward answer or correction, reply is a short acknowledgement without asking another question; the application will append the next question.',
+      'For a straightforward answer or correction, reply is a short contextual acknowledgement without repeating the previous wording; the application may append the next low-friction action.',
       'For a relevant question, answer it first. Set hold_funnel=false unless the answer itself must ask a clarification.',
       'For “what do you mean?” explain the current question naturally and ask it again in clearer wording. Set action=clarify_current_question and hold_funnel=true.',
       'When the user refuses or says no to terms, do not repeat the terms. Ask what concerns them, preferably fee, confidentiality, marketing, or another point. Set hold_funnel=true.',
