@@ -1,4 +1,11 @@
 export type SalesLanguage = 'en' | 'ru' | 'ar';
+
+export const SHARH_FEE_TERMS: Record<SalesLanguage, string> = {
+  en: 'Our fee is success-based only and is paid when the sale completes: 5% for transactions above USD 200,000 and a flat USD 10,000 for transactions at or below USD 200,000.',
+  ru: 'Наша комиссия взимается только при успешном завершении сделки: 5% для сделок свыше 200 000 USD и фиксированные 10 000 USD для сделок на сумму 200 000 USD или ниже.',
+  ar: 'تُدفع رسومنا فقط عند إتمام الصفقة بنجاح: 5% للصفقات التي تتجاوز 200,000 دولار، ومبلغ ثابت قدره 10,000 دولار للصفقات بقيمة 200,000 دولار أو أقل.',
+};
+
 export type ObjectionTopic =
   | 'commission'
   | 'confidentiality'
@@ -57,7 +64,7 @@ export const SHARH_SALES_V1: SalesPlaybook = {
   objections: {
     commission: {
       patterns: [
-        /commission|fee|2%|10,?000/i,
+        /commission|fee|2%|5%|10,?000|200,?000|500,?000/i,
         /комисси|вознагражден/iu,
         /عمولة|رسوم/u,
       ],
@@ -67,9 +74,9 @@ export const SHARH_SALES_V1: SalesPlaybook = {
         ar: 'هذه نقطة منطقية وتستحق التوضيح.',
       },
       explanation: {
-        en: 'The commission is success-based: 2% above USD 500,000 and USD 10,000 below that threshold, with the terms documented before work begins.',
-        ru: 'Комиссия зависит от успешной сделки: 2% свыше 500 000 USD и 10 000 USD ниже этого порога; условия фиксируются до начала работы.',
-        ar: 'العمولة مرتبطة بنجاح الصفقة: 2% فوق 500,000 دولار و10,000 دولار تحت هذا الحد، ويتم توثيق الشروط قبل بدء العمل.',
+        en: SHARH_FEE_TERMS.en,
+        ru: SHARH_FEE_TERMS.ru,
+        ar: SHARH_FEE_TERMS.ar,
       },
     },
     confidentiality: {

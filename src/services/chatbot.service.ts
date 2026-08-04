@@ -13,6 +13,8 @@ import { MessageDeliveryService } from './message-delivery.service';
 import { SharhApiService } from './sharh-api.service';
 import { SharhSyncService } from './sharh-sync.service';
 import { FunnelQualityService } from './funnel-quality.service';
+import { ConversationSafetyService } from './conversation-safety.service';
+import type { SalesMessageInterpretation } from './sales-message-intelligence.types';
 import {
   WhatsAppMessage,
   MessageProcessingResult,
@@ -23,15 +25,19 @@ import {
   MessagingSendResult,
 } from '../types';
 import { logger } from '../utils/logger';
+import { SHARH_FEE_TERMS } from '../playbooks/sharh-sales.v1';
 
 const ROLES_PERSISTENCE_NAMESPACE = 'chatRoles';
 const INBOUND_DEDUP_NAMESPACE = 'processedInboundMessages';
 const MAX_INBOUND_DEDUP_IDS = 5000;
+const BUYER_MATCHES_NAMESPACE = 'buyerListingMatches';
 
 interface SalesLeadTurn {
   directive: FunnelDirective;
   leadContext?: string | undefined;
   record?: LeadCaptureRecord | undefined;
+  interpretation?: SalesMessageInterpretation | undefined;
+  aiAssisted?: boolean | undefined;
 }
 
 /**
@@ -59,6 +65,8 @@ export class ChatbotService {
   private readonly messageDeliveryService: MessageDeliveryService;
   private readonly processedInboundIds: Set<string> = new Set();
   private readonly funnelQualityService: FunnelQualityService | null;
+  private readonly conversationSafetyService: ConversationSafetyService | null;
+  private readonly buyerMatchFingerprints: Map<string, string> = new Map();
 
   constructor(
     whatsappService: MessagingTransport,
@@ -73,7 +81,8 @@ export class ChatbotService {
     sharhApiService: SharhApiService | null = null,
     sharhSyncService: SharhSyncService | null = null,
     messageDeliveryService: MessageDeliveryService | null = null,
-    funnelQualityService: FunnelQualityService | null = null
+    funnelQualityService: FunnelQualityService | null = null,
+    conversationSafetyService: ConversationSafetyService | null = null
   ) {
     this.whatsappService = whatsappService;
     this.aiService = aiService;
@@ -89,11 +98,13 @@ export class ChatbotService {
     this.messageDeliveryService =
       messageDeliveryService || new MessageDeliveryService(persistence);
     this.funnelQualityService = funnelQualityService;
+    this.conversationSafetyService = conversationSafetyService;
 
     this.ignoreGroups = process.env['IGNORE_GROUPS'] !== 'false';
     this.roleSwitchEnabled = process.env['ROLE_SWITCH_ENABLED'] === 'true';
     this.hydrateRoles();
     this.hydrateInboundDedup();
+    this.hydrateBuyerMatches();
     this.setupEventHandlers();
     logger.info('Chatbot Service initialized', {
       persisted: Boolean(persistence),
@@ -126,6 +137,16 @@ export class ChatbotService {
       if (processed === true) this.processedInboundIds.add(messageId);
     }
     this.trimInboundDedup();
+  }
+
+  private hydrateBuyerMatches(): void {
+    if (!this.persistence) return;
+    const stored = this.persistence.getNamespace<string>(BUYER_MATCHES_NAMESPACE);
+    for (const [chatId, fingerprint] of Object.entries(stored)) {
+      if (typeof fingerprint === 'string' && fingerprint) {
+        this.buyerMatchFingerprints.set(chatId, fingerprint);
+      }
+    }
   }
 
   /**
@@ -343,26 +364,37 @@ export class ChatbotService {
         return;
       }
 
-      // Standard funnel questions are deterministic and do not require an AI
-      // round-trip. AI remains available for support/fallback conversations.
-      const deterministicResponse = salesTurn?.directive.directResponse;
-      const result = deterministicResponse
-        ? {
-            success: true,
-            response: deterministicResponse,
-            processingTime: Date.now() - startTime,
-          }
-        : await this.processMessage(
-            incomingMessage,
+      // Sales uses a single structured AI decision only when the local router
+      // finds genuine ambiguity. The second free-form generation call has been
+      // removed so ordinary answers and all fallbacks remain deterministic.
+      const directResponse = salesTurn?.directive.directResponse;
+      let result: MessageProcessingResult;
+      if (role === 'sales') {
+        const response =
+          directResponse ||
+          (await this.buildSalesContinuityFallback(
             chatId,
-            role,
-            salesTurn?.leadContext
-          );
+            incomingMessage.content,
+            salesTurn
+          ));
+        result = {
+          success: true,
+          response,
+          processingTime: Date.now() - startTime,
+        };
+      } else {
+        result = await this.processMessage(
+          incomingMessage,
+          chatId,
+          role,
+          salesTurn?.leadContext
+        );
+      }
 
-      if (deterministicResponse) {
+      if (directResponse) {
         this.webSocketService.sendAIResponseGenerated({
-          message: deterministicResponse,
-          confidence: 1,
+          message: directResponse,
+          confidence: salesTurn?.aiAssisted ? 0.9 : 1,
           context: [],
           timestamp: Date.now(),
           role,
@@ -373,7 +405,7 @@ export class ChatbotService {
         success: result.success,
         hasResponse: !!result.response,
         error: result.error,
-        deterministic: Boolean(deterministicResponse),
+        deterministic: !salesTurn?.aiAssisted,
       });
 
       if (result.success && result.response) {
@@ -454,7 +486,7 @@ export class ChatbotService {
             chatId,
             {
               role,
-              deterministic: Boolean(deterministicResponse),
+              deterministic: !salesTurn?.aiAssisted,
               funnel_stage: salesTurn?.directive.stage || null,
             },
             botMessage.id
@@ -656,16 +688,113 @@ export class ChatbotService {
     }
 
     try {
-      const interpretation = await this.aiService.interpretSalesMessage({
-        message: message.content,
-        expectedField: this.leadCaptureService.getExpectedField(chatId),
-        language: this.leadCaptureService.getLanguage(chatId),
-        knownFacts: this.leadCaptureService.getKnownFactsBlock(chatId) || '',
-        recentHistory: this.chatHistoryService
-          .getConversationContext(chatId)
-          .slice(-6)
-          .map(item => `${item.isFromBot ? 'Bot' : 'Client'}: ${item.content}`),
-      });
+      const navigation = this.leadCaptureService.handleNavigationCommand(
+        chatId,
+        message.content
+      );
+      if (navigation.handled) {
+        if (navigation.resetAiUsage) {
+          this.conversationSafetyService?.resetConversation(chatId);
+          this.buyerMatchFingerprints.delete(chatId);
+          this.persistence?.removeItem(BUYER_MATCHES_NAMESPACE, chatId);
+        }
+        const record = this.leadCaptureService.getCurrentRecord(chatId) || undefined;
+        const continuationDirective = navigation.continueFunnel
+          ? this.leadCaptureService.getDirective(chatId)
+          : null;
+        this.sharhSyncService?.enqueueAnalytics(
+          `conversation_navigation_${navigation.action || 'unknown'}`,
+          chatId,
+          { action: navigation.action || 'unknown' },
+          `${message.id}-navigation`
+        );
+        return {
+          directive: continuationDirective
+            ? {
+                ...continuationDirective,
+                shouldRespond: true,
+                directResponse:
+                  navigation.response ||
+                  continuationDirective.directResponse ||
+                  this.safeSalesFallback(record?.language || 'en'),
+              }
+            : {
+                stage: record?.funnelStage || 'new',
+                owner: 'bot',
+                shouldRespond: true,
+                directResponse:
+                  navigation.response ||
+                  this.safeSalesFallback(record?.language || 'en'),
+              },
+          ...(record ? { record } : {}),
+          aiAssisted: false,
+        };
+      }
+
+      const language = this.leadCaptureService.getLanguage(chatId);
+      const safety = this.conversationSafetyService?.screenMessage(
+        chatId,
+        message.content,
+        language
+      );
+      if (safety && !safety.allowed) {
+        this.sharhSyncService?.enqueueAnalytics(
+          'conversation_safety_blocked',
+          chatId,
+          { reason: safety.reason || 'unknown' },
+          `${message.id}-safety`
+        );
+        const currentRecord = this.leadCaptureService.getCurrentRecord(chatId);
+        return {
+          directive: {
+            stage: currentRecord?.funnelStage || 'new',
+            owner: 'bot',
+            shouldRespond: true,
+            directResponse: safety.response || this.safeSalesFallback(safety.language),
+          },
+          ...(currentRecord ? { record: currentRecord } : {}),
+          aiAssisted: false,
+        };
+      }
+
+      const expectedField = this.leadCaptureService.getExpectedField(chatId);
+      let interpretation: SalesMessageInterpretation | null = null;
+      let aiLimitNotice = '';
+      const shouldUseAi =
+        this.conversationSafetyService?.shouldUseAi(
+          message.content,
+          expectedField
+        ) ?? true;
+      if (shouldUseAi) {
+        const allowance = this.conversationSafetyService?.reserveAiCall(
+          chatId,
+          message.from
+        );
+        if (!allowance || allowance.allowed) {
+          interpretation = await this.aiService.interpretSalesMessage({
+            message: message.content,
+            expectedField,
+            language,
+            knownFacts: this.leadCaptureService.getKnownFactsBlock(chatId) || '',
+            recentHistory: this.chatHistoryService
+              .getConversationContext(chatId)
+              .slice(-6)
+              .map(item => `${item.isFromBot ? 'Bot' : 'Client'}: ${item.content}`),
+          });
+        } else {
+          aiLimitNotice = this.conversationSafetyService?.aiLimitResponse(
+            language,
+            allowance.reason
+          ) || '';
+          this.sharhSyncService?.enqueueAnalytics(
+            'ai_assistance_limited',
+            chatId,
+            { reason: allowance.reason || 'unknown' },
+            `${message.id}-ai-limit`
+          );
+        }
+      }
+
       const update = this.leadCaptureService.updateFromMessage(
         chatId,
         message,
@@ -697,10 +826,60 @@ export class ChatbotService {
           },
           `${message.id}-price-guidance`
         );
-      } else if (interpretation?.classification === 'question') {
-        // Answer the client first, then naturally return to the application-owned
-        // next field. The next field stays present in leadContext.
-        directive = { ...directive, directResponse: undefined };
+      } else if (record?.inquiryPurpose === 'buying') {
+        const listingResponse = await this.buildBuyerListingResponse(
+          chatId,
+          message.content,
+          record,
+          directive,
+          interpretation?.action === 'show_listings'
+        );
+        if (listingResponse) {
+          directive = { ...directive, directResponse: listingResponse };
+        }
+      }
+
+      const deterministicAcknowledgement = !shouldUseAi
+        ? this.buildDeterministicAcknowledgement(
+            expectedField,
+            record,
+            record?.language || language
+          )
+        : '';
+      if (
+        !directive.directResponse ||
+        Boolean(interpretation?.reply) ||
+        Boolean(deterministicAcknowledgement)
+      ) {
+        const contextualReply =
+          interpretation?.reply ||
+          (shouldUseAi
+            ? this.buildDeterministicContextualReply(
+                message.content,
+                record?.language || language,
+                expectedField,
+                interpretation
+              )
+            : deterministicAcknowledgement);
+        if (contextualReply) {
+          directive = {
+            ...directive,
+            directResponse: interpretation?.holdFunnel
+              ? contextualReply
+              : this.composeContextualReply(
+                  contextualReply,
+                  directive.directResponse
+                ),
+          };
+        } else if (aiLimitNotice) {
+          directive = {
+            ...directive,
+            directResponse: this.composeContextualReply(
+              aiLimitNotice,
+              directive.directResponse
+            ),
+          };
+        }
       }
 
       this.sharhSyncService?.enqueueAnalytics(
@@ -808,6 +987,8 @@ export class ChatbotService {
         directive,
         ...(leadContext ? { leadContext } : {}),
         ...(record ? { record } : {}),
+        ...(interpretation ? { interpretation } : {}),
+        aiAssisted: Boolean(interpretation),
       };
     } catch (error) {
       logger.error('Failed to process sales funnel state', {
@@ -816,6 +997,347 @@ export class ChatbotService {
       });
       return undefined;
     }
+  }
+
+  private buildDeterministicAcknowledgement(
+    expectedField: import('./lead-capture.service').LeadField | undefined,
+    record: LeadCaptureRecord | null,
+    language: 'en' | 'ru' | 'ar'
+  ): string {
+    if (!expectedField || !record) return '';
+    const updates = new Set(
+      record.fieldsUpdated
+        .split(',')
+        .map(value => value.trim())
+        .filter(Boolean)
+    );
+    const updateKey = expectedField === 'seller_terms'
+      ? 'terms_accepted'
+      : expectedField;
+    if (!updates.has(updateKey)) return '';
+
+    if (expectedField === 'client_name' && record.clientName) {
+      const messages = {
+        en: `Thank you, ${record.clientName}.`,
+        ru: `Спасибо, ${record.clientName}.`,
+        ar: `شكراً، ${record.clientName}.`,
+      } as const;
+      return messages[language];
+    }
+    if (expectedField === 'inquiry_purpose') {
+      const messages = record.inquiryPurpose === 'buying'
+        ? { en: 'Understood — you are looking to buy.', ru: 'Понял — вы хотите купить бизнес.', ar: 'مفهوم — أنت تبحث عن مشروع للشراء.' }
+        : { en: 'Understood — you are looking to sell.', ru: 'Понял — вы хотите продать бизнес.', ar: 'مفهوم — أنت ترغب في بيع مشروع.' };
+      return messages[language];
+    }
+    if (expectedField === 'seller_terms' && record.termsAccepted === 'yes') {
+      const messages = {
+        en: 'Thank you. We can continue.',
+        ru: 'Спасибо. Можем продолжить.',
+        ar: 'شكراً. يمكننا المتابعة.',
+      } as const;
+      return messages[language];
+    }
+
+    const variants: Record<'en' | 'ru' | 'ar', string[]> = {
+      en: ['Understood.', 'Noted.', 'Thank you, that helps.'],
+      ru: ['Понял.', 'Зафиксировал.', 'Спасибо, это полезно.'],
+      ar: ['مفهوم.', 'تم تسجيل ذلك.', 'شكراً، هذه معلومة مفيدة.'],
+    };
+    const stableIndex = Math.abs(expectedField.length + record.fieldsUpdated.length) % variants[language].length;
+    return variants[language][stableIndex] || variants[language][0] || '';
+  }
+
+  private composeContextualReply(reply: string, next?: string): string {
+    const first = reply.trim();
+    const second = (next || '').trim();
+    if (!second) return first;
+    if (!first) return second;
+    const normalizedFirst = first.toLowerCase().replace(/\s+/g, ' ');
+    const normalizedSecond = second.toLowerCase().replace(/\s+/g, ' ');
+    if (normalizedFirst.includes(normalizedSecond) || normalizedSecond.includes(normalizedFirst)) {
+      return first.length >= second.length ? first : second;
+    }
+    const questionCount = (first.match(/\?/g) || []).length;
+    return questionCount > 0 ? first : `${first}\n\n${second}`;
+  }
+
+  private buildDeterministicContextualReply(
+    content: string,
+    language: 'en' | 'ru' | 'ar',
+    expectedField?: import('./lead-capture.service').LeadField,
+    interpretation?: SalesMessageInterpretation | null
+  ): string {
+    const text = content.toLowerCase();
+    const asksForClarification = /what do you mean|can you explain|could you clarify|why do you need|why are you asking|что вы имеете в виду|объясните|зачем вам|почему спрашиваете|ماذا تقصد|وضح|لماذا تحتاج|لماذا تسأل/iu.test(text);
+
+    if (/\b(?:commission|fee|success fee|your fee|how much do you charge)\b|комисси|сколько.*(?:берете|стоит)|عمولة|رسوم/iu.test(text)) {
+      return SHARH_FEE_TERMS[language];
+    }
+    if (/\b(?:confidential|confidentiality|privacy|public|publish|marketing)\b|конфиденц|публич|публиков|маркетинг|سرية|خصوصية|نشر|تسويق/iu.test(text)) {
+      const messages = {
+        en: 'Sensitive information is not published publicly. Detailed access is handled through SHARH’s confidentiality and access process, and marketing is discussed before work begins. What part would you like clarified?',
+        ru: 'Чувствительная информация не публикуется открыто. Детальный доступ предоставляется по процедуре конфиденциальности SHARH, а маркетинг согласуется до начала работы. Что именно уточнить?',
+        ar: 'لا تُنشر المعلومات الحساسة للعامة. يتم الوصول التفصيلي وفق إجراءات السرية لدى SHARH، وتتم مناقشة التسويق قبل بدء العمل. ما النقطة التي تريد توضيحها؟',
+      } as const;
+      return messages[language];
+    }
+    if (/\b(?:how does (?:it|this) work|what happens next|process|steps|how long)\b|как.*(?:работает|проходит)|что дальше|процесс|срок|كيف.*(?:يعمل|تتم)|ما الخطوة التالية|العملية|المدة/iu.test(text)) {
+      const messages = {
+        en: 'We first understand the business or buyer criteria, then SHARH reviews the information, confirms the appropriate next steps, and manages access and transaction support. Timing depends on readiness, documents, and buyer fit. Which part of the process concerns you?',
+        ru: 'Сначала мы уточняем данные бизнеса или критерии покупателя, затем SHARH проверяет информацию, определяет следующие шаги и организует доступ и сопровождение сделки. Срок зависит от готовности, документов и соответствия покупателя. Какую часть процесса уточнить?',
+        ar: 'نبدأ بفهم بيانات المشروع أو معايير المشتري، ثم يراجع SHARH المعلومات ويحدد الخطوات المناسبة ويدير الوصول ودعم الصفقة. تعتمد المدة على الجاهزية والمستندات وملاءمة المشتري. ما الجزء الذي تريد توضيحه؟',
+      } as const;
+      return messages[language];
+    }
+
+    if (asksForClarification) {
+      const fieldMessages: Partial<Record<import('./lead-capture.service').LeadField, Record<'en' | 'ru' | 'ar', string>>> = {
+        client_name: {
+          en: 'I mean the name you would like me to use when speaking with you. Could I have your name, please?',
+          ru: 'Я имею в виду имя, которым мне к вам обращаться. Как я могу к вам обращаться?',
+          ar: 'أقصد الاسم الذي تفضّل أن أخاطبك به. ما الاسم المناسب؟',
+        },
+        business_type: {
+          en: 'This helps SHARH understand the business and match it with relevant buyer demand. What does the business do?',
+          ru: 'Это помогает SHARH понять бизнес и сопоставить его с подходящим спросом покупателей. Чем занимается бизнес?',
+          ar: 'يساعد ذلك SHARH على فهم المشروع ومطابقته مع طلب المشترين المناسب. ما نشاط المشروع؟',
+        },
+        business_location: {
+          en: 'Location affects buyer matching, operating context, and transfer considerations. In which emirate and area is the business located?',
+          ru: 'Локация влияет на подбор покупателей, операционные условия и передачу бизнеса. В каком эмирате и районе находится бизнес?',
+          ar: 'يؤثر الموقع في مطابقة المشترين والظروف التشغيلية ونقل المشروع. في أي إمارة ومنطقة يقع المشروع؟',
+        },
+        annual_revenue_aed: {
+          en: 'Annual revenue helps estimate the size of the business and identify suitable buyers. An approximate figure is acceptable. What was the revenue over the last 12 months?',
+          ru: 'Годовая выручка помогает оценить масштаб бизнеса и подобрать подходящих покупателей. Подойдёт приблизительная сумма. Какой была выручка за последние 12 месяцев?',
+          ar: 'تساعد الإيرادات السنوية على تقدير حجم المشروع وتحديد المشترين المناسبين. يكفي رقم تقريبي. كم بلغت الإيرادات خلال آخر 12 شهراً؟',
+        },
+        lease_details: {
+          en: 'The lease affects fixed costs and whether the premises can transfer with the business. Is the premises owned or leased, and what is the rent and remaining term if known?',
+          ru: 'Аренда влияет на постоянные расходы и возможность передачи помещения вместе с бизнесом. Помещение в собственности или аренде, и каковы аренда и оставшийся срок, если известно?',
+          ar: 'يؤثر الإيجار في التكاليف الثابتة وإمكانية نقل الموقع مع المشروع. هل الموقع مملوك أم مستأجر، وما قيمة الإيجار والمدة المتبقية إن كانت معروفة؟',
+        },
+        desired_selling_price_aed: {
+          en: 'This is only to understand your expectation; it does not set a final valuation. You can give a range, ask for an indicative SHARH range, or say it is undecided. What range do you currently have in mind?',
+          ru: 'Это нужно только для понимания ваших ожиданий и не является финальной оценкой. Можно указать диапазон, запросить ориентир SHARH или сказать, что цена пока не определена. Какой диапазон вы рассматриваете?',
+          ar: 'الغرض هو فهم توقعاتك فقط، وليس تحديد تقييم نهائي. يمكنك ذكر نطاق أو طلب نطاق تقديري من SHARH أو القول إن السعر غير محدد. ما النطاق الذي تفكر فيه حالياً؟',
+        },
+        monthly_operating_expenses_aed: {
+          en: 'Operating expenses help assess the business economics. An approximate monthly amount is enough. What are the average monthly operating expenses?',
+          ru: 'Операционные расходы нужны для оценки экономики бизнеса. Достаточно приблизительной суммы в месяц. Каковы средние ежемесячные расходы?',
+          ar: 'تساعد المصاريف التشغيلية على تقييم اقتصاديات المشروع. يكفي مبلغ شهري تقريبي. ما متوسط المصاريف التشغيلية الشهرية؟',
+        },
+        monthly_net_profit_aed: {
+          en: 'Net profit helps assess operating performance and valuation. An approximate monthly figure is acceptable. What is the average monthly net profit?',
+          ru: 'Чистая прибыль помогает оценить результаты бизнеса и стоимость. Подойдёт приблизительная сумма в месяц. Какова средняя ежемесячная чистая прибыль?',
+          ar: 'يساعد صافي الربح على تقييم الأداء والتقدير. يكفي رقم شهري تقريبي. ما متوسط صافي الربح الشهري؟',
+        },
+        liabilities: {
+          en: 'Known debts or obligations are important for transaction review. You can say none, unknown, or briefly describe them. Are there any liabilities?',
+          ru: 'Известные долги и обязательства важны для проверки сделки. Можно ответить «нет», «не знаю» или кратко описать их. Есть ли обязательства?',
+          ar: 'تُعد الديون أو الالتزامات المعروفة مهمة لمراجعة الصفقة. يمكنك قول لا يوجد أو غير معروف أو وصفها باختصار. هل توجد التزامات؟',
+        },
+        buyer_budget_aed: {
+          en: 'A budget lets SHARH show relevant published opportunities rather than unsuitable listings. A range is enough. What budget have you allocated?',
+          ru: 'Бюджет позволяет SHARH показывать подходящие опубликованные предложения, а не нерелевантные листинги. Достаточно диапазона. Какой бюджет вы выделили?',
+          ar: 'تساعد الميزانية SHARH على عرض الفرص المنشورة المناسبة بدلاً من الإعلانات غير الملائمة. يكفي نطاق. ما الميزانية المخصصة؟',
+        },
+        buyer_location: {
+          en: 'This helps filter listings by the areas you can realistically consider. Which emirate or area do you prefer?',
+          ru: 'Это помогает отфильтровать листинги по реально подходящим районам. Какой эмират или район вы предпочитаете?',
+          ar: 'يساعد ذلك على تصفية الإعلانات حسب المناطق التي تناسبك فعلياً. ما الإمارة أو المنطقة المفضلة؟',
+        },
+      };
+      const specific = expectedField ? fieldMessages[expectedField]?.[language] : undefined;
+      if (specific) return specific;
+      const generic = {
+        en: 'I am asking only for information needed to handle your SHARH request. An approximate answer, “unknown”, “back”, or “change my answer” is acceptable. What would you like clarified?',
+        ru: 'Я спрашиваю только информацию, необходимую для обработки запроса в SHARH. Можно ответить приблизительно, написать «не знаю», «назад» или «изменить ответ». Что именно уточнить?',
+        ar: 'أطلب فقط المعلومات اللازمة لمعالجة طلبك لدى SHARH. يمكنك إعطاء إجابة تقريبية أو قول غير معروف أو الرجوع أو تغيير الإجابة. ما الذي تريد توضيحه؟',
+      } as const;
+      return generic[language];
+    }
+
+    if (
+      expectedField === 'seller_terms' &&
+      /^(?:no|2|нет|لا)$/iu.test(content.trim())
+    ) {
+      return language === 'ru'
+        ? 'Понял. Что именно вас не устраивает: комиссия, конфиденциальность, возможность маркетинга бизнеса или другой пункт?'
+        : language === 'ar'
+          ? 'مفهوم. ما النقطة التي لا تناسبك: الرسوم، السرية، إمكانية تسويق المشروع، أم نقطة أخرى؟'
+          : 'Understood. What is your main concern: the fee, confidentiality, possible marketing of the business, or something else?';
+    }
+    if (interpretation?.classification === 'off_topic') {
+      return this.safeSalesFallback(language);
+    }
+    if (interpretation?.classification === 'nonsense') {
+      return language === 'ru'
+        ? 'Я не смог связать этот ответ с текущим вопросом. Достаточно короткого ответа или «не знаю».'
+        : language === 'ar'
+          ? 'لم أتمكن من ربط هذه الإجابة بالسؤال الحالي. تكفي إجابة قصيرة أو «غير معروف».'
+          : 'I could not connect that answer to the current question. A short answer or “unknown” is enough.';
+    }
+    if (/\?|почему|зачем|как|что|لماذا|كيف|ماذا/iu.test(content)) {
+      const fallback = {
+        en: 'I can help with SHARH business buying, selling, valuation, listings, confidentiality, fees, and transaction steps. Please rephrase the SHARH-related point you want clarified.',
+        ru: 'Я могу помочь по вопросам покупки и продажи бизнеса через SHARH, оценки, листингов, конфиденциальности, комиссии и этапов сделки. Переформулируйте, пожалуйста, связанный с SHARH вопрос.',
+        ar: 'يمكنني المساعدة في شراء وبيع المشاريع عبر SHARH والتقييم والإعلانات والسرية والرسوم وخطوات الصفقة. أعد صياغة النقطة المتعلقة بـ SHARH التي تريد توضيحها.',
+      } as const;
+      return fallback[language];
+    }
+    return '';
+  }
+
+  private async buildBuyerListingResponse(
+    chatId: string,
+    message: string,
+    record: LeadCaptureRecord,
+    directive: FunnelDirective,
+    force: boolean = false
+  ): Promise<string | null> {
+    if (!this.sharhApiService?.isEnabled() || record.inquiryPurpose !== 'buying') {
+      return null;
+    }
+
+    const explicitRequest = this.isListingRequest(message);
+    const changed = new Set(
+      record.fieldsUpdated
+        .split(',')
+        .map(value => value.trim())
+        .filter(Boolean)
+    );
+    const hasSearchCriteria = Boolean(
+      record.specificListingCode || record.businessType || record.buyerLocation || record.buyerBudgetAed
+    );
+    const criteriaChanged = [
+      'specific_listing_code',
+      'business_type',
+      'buyer_location',
+      'buyer_budget_aed',
+    ].some(field => changed.has(field));
+
+    if (!force && !explicitRequest && !criteriaChanged && record.status !== 'qualified') {
+      return null;
+    }
+    if (!hasSearchCriteria && !explicitRequest) {
+      return null;
+    }
+
+    const fingerprint = [
+      record.specificListingCode,
+      record.businessType.toLowerCase(),
+      record.buyerLocation.toLowerCase(),
+      record.buyerBudgetAed.toLowerCase(),
+    ].join('|');
+    if (!force && !explicitRequest && this.buyerMatchFingerprints.get(chatId) === fingerprint) {
+      return null;
+    }
+
+    const rows = record.specificListingCode
+      ? await this.sharhApiService.searchPublicListings(record.specificListingCode)
+      : await this.sharhApiService.searchBuyerMatches(record, 3);
+
+    this.buyerMatchFingerprints.set(chatId, fingerprint);
+    this.persistence?.setItem(BUYER_MATCHES_NAMESPACE, chatId, fingerprint);
+
+    const nextPrompt = directive.directResponse?.trim() || '';
+    const response = this.formatBuyerListingResults(record, rows);
+    return [response, nextPrompt].filter(Boolean).join('\n\n');
+  }
+
+  private formatBuyerListingResults(
+    record: LeadCaptureRecord,
+    rows: Array<Record<string, unknown>>
+  ): string {
+    const language = record.language;
+    if (rows.length === 0) {
+      if (record.specificListingCode) {
+        return language === 'ru'
+          ? `Листинг ${record.specificListingCode} сейчас недоступен в опубликованном маркетплейсе. Я сохранил ваш запрос.`
+          : language === 'ar'
+            ? `الإعلان ${record.specificListingCode} غير متاح حالياً في السوق المنشور. تم حفظ طلبك.`
+            : `Listing ${record.specificListingCode} is not currently available in the published marketplace. I saved your request.`;
+      }
+      return language === 'ru'
+        ? 'Сейчас я не нашёл точного опубликованного совпадения по этим критериям. Ваш запрос сохранён, и вы можете уточнить сектор, эмират или бюджет.'
+        : language === 'ar'
+          ? 'لم أجد حالياً تطابقاً منشوراً دقيقاً مع هذه المعايير. تم حفظ طلبك، ويمكنك تعديل القطاع أو الإمارة أو الميزانية.'
+          : 'I do not currently see an exact published match for those criteria. Your request is saved, and you can adjust the sector, emirate, or budget.';
+    }
+
+    const header = language === 'ru'
+      ? 'Ближайшие опубликованные варианты:'
+      : language === 'ar'
+        ? 'أقرب الخيارات المنشورة:'
+        : 'Closest published options:';
+    const lines = rows.map((row, index) => {
+      const code = String(row['public_code'] || '').trim();
+      const title = String(row['title'] || 'Business opportunity').trim();
+      const location = String(row['emirate'] || row['region'] || '').trim();
+      const sector = String(row['sector'] || '').trim();
+      const price = String(row['asking'] || row['price'] || '').trim();
+      const details = [location, sector, price].filter(Boolean).join(' · ');
+      return `${index + 1}. ${code ? `${code} — ` : ''}${title}${details ? `\n   ${details}` : ''}`;
+    });
+    const footer = language === 'ru'
+      ? 'Отправьте код SH-XXXX, чтобы открыть конкретный вариант.'
+      : language === 'ar'
+        ? 'أرسل رمز SH-XXXX لعرض خيار محدد.'
+        : 'Send the SH-XXXX code to open a specific option.';
+    return [header, ...lines, footer].join('\n');
+  }
+
+  private isListingRequest(content: string): boolean {
+    return /(?:\b(?:show|find|see|view|available|current|matching|listings?|businesses|options)\b.*\b(?:buy|listing|business|option)?\b|\bSH-\d{1,12}\b|(?:покаж|найд|листинг|вариант|бизнесы в продаже)|(?:اعرض|ابحث|إعلانات|خيارات|أعمال متاحة))/iu.test(
+      content
+    );
+  }
+
+  private async buildSalesContinuityFallback(
+    chatId: string,
+    message: string,
+    salesTurn?: SalesLeadTurn
+  ): Promise<string> {
+    const record =
+      salesTurn?.record || this.leadCaptureService?.getCurrentRecord(chatId);
+    if (record?.inquiryPurpose === 'buying') {
+      const currentDirective =
+        this.leadCaptureService?.getDirective(chatId) || salesTurn?.directive;
+      if (currentDirective) {
+        const listingResponse = await this.buildBuyerListingResponse(
+          chatId,
+          message,
+          record,
+          currentDirective,
+          this.isListingRequest(message)
+        );
+        if (listingResponse) return listingResponse;
+      }
+    }
+
+    const nextPrompt = this.leadCaptureService
+      ?.getDirective(chatId)
+      .directResponse?.trim();
+    if (nextPrompt) {
+      const prefix = record?.language === 'ru'
+        ? 'Ваш прогресс сохранён. Продолжим по имеющейся информации.'
+        : record?.language === 'ar'
+          ? 'تم حفظ تقدمك. سنواصل باستخدام المعلومات المتاحة.'
+          : 'Your progress is saved. I will continue using the available information.';
+      return `${prefix}\n\n${nextPrompt}`;
+    }
+
+    if (record?.status === 'qualified') {
+      return record.language === 'ru'
+        ? 'Ваш запрос сохранён в SHARH. Вы можете добавить требование, исправить любую цифру или отправить код SH-XXXX.'
+        : record.language === 'ar'
+          ? 'تم حفظ طلبك في SHARH. يمكنك إضافة شرط أو تصحيح أي رقم أو إرسال رمز SH-XXXX.'
+          : 'Your request is saved in SHARH. You can add a requirement, correct any figure, or send an SH-XXXX code.';
+    }
+
+    return this.safeSalesFallback(record?.language || 'en');
   }
 
   private safeSalesFallback(language: 'en' | 'ru' | 'ar'): string {

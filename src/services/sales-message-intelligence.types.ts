@@ -11,6 +11,18 @@ export type SalesMessageClassification =
   | 'nonsense'
   | 'abusive';
 
+export type SalesConversationAction =
+  | 'capture_answer'
+  | 'answer_question'
+  | 'clarify_current_question'
+  | 'handle_objection'
+  | 'correct_answer'
+  | 'continue_funnel'
+  | 'show_listings'
+  | 'price_guidance'
+  | 'redirect_scope'
+  | 'none';
+
 export type SalesQuestionType =
   | 'none'
   | 'price_guidance'
@@ -31,6 +43,9 @@ export interface SalesMessageInterpretation {
   unknownFields: LeadField[];
   questionType: SalesQuestionType;
   reason: string;
+  action?: SalesConversationAction | undefined;
+  reply?: string | undefined;
+  holdFunnel?: boolean | undefined;
 }
 
 export interface SalesMessageInterpretationInput {

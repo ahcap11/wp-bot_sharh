@@ -8,6 +8,7 @@ import {
   getMessagingConfig,
   getSharhApiConfig,
   getSalesPlaybookVersion,
+  getConversationSafetyConfig,
 } from './config';
 import { createMessagingTransport } from './services/messaging-transport.factory';
 import { AIService } from './services/ai.service';
@@ -26,6 +27,7 @@ import { SharhSyncService } from './services/sharh-sync.service';
 import { MessageDeliveryService } from './services/message-delivery.service';
 import { SalesPlaybookService } from './services/sales-playbook.service';
 import { FunnelQualityService } from './services/funnel-quality.service';
+import { ConversationSafetyService } from './services/conversation-safety.service';
 import { logger } from './utils/logger';
 
 /**
@@ -56,6 +58,7 @@ class WhatsAppAIChatbot {
       const sharhApiConfig = getSharhApiConfig();
       const messagingConfig = getMessagingConfig();
       const salesPlaybookVersion = getSalesPlaybookVersion();
+      const conversationSafetyConfig = getConversationSafetyConfig();
       this.webSocketPort = appConfig.healthPort;
 
       // Apply configured log level to the shared logger.
@@ -73,6 +76,9 @@ class WhatsAppAIChatbot {
         sharhApi: sharhApiConfig.enabled,
         neonFallback: sharhApiConfig.allowNeonFallback,
         salesPlaybookVersion,
+        smartAiRouting: conversationSafetyConfig.smartRoutingEnabled,
+        maxAiCallsPerConversation: conversationSafetyConfig.maxAiCallsPerConversation,
+        maxAiCallsPerNumberPerDay: conversationSafetyConfig.maxAiCallsPerNumberPerDay,
       });
 
       // Initialize durable state store (loaded before services hydrate from it).
@@ -123,6 +129,10 @@ class WhatsAppAIChatbot {
       const messageDeliveryService = new MessageDeliveryService(
         this.persistenceService
       );
+      const conversationSafetyService = new ConversationSafetyService(
+        conversationSafetyConfig,
+        this.persistenceService
+      );
 
       // Create and initialize chatbot service
       this.chatbotService = new ChatbotService(
@@ -138,7 +148,8 @@ class WhatsAppAIChatbot {
         sharhApiService,
         sharhSyncService,
         messageDeliveryService,
-        funnelQualityService
+        funnelQualityService,
+        conversationSafetyService
       );
 
       await this.chatbotService.initialize();

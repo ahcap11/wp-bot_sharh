@@ -119,6 +119,44 @@ export class SharhApiService {
       .map(row => this.filterPublicListing(row));
   }
 
+  async searchBuyerMatches(
+    record: LeadCaptureRecord,
+    limit: number = 3
+  ): Promise<PublicListingRow[]> {
+    if (!this.config.enabled || record.inquiryPurpose !== 'buying') {
+      return [];
+    }
+
+    const params = new URLSearchParams();
+    const cleanSector = record.businessType.trim();
+    const cleanLocation = record.buyerLocation.trim();
+    const maxBudget = this.parseAedUpperBound(record.buyerBudgetAed);
+
+    if (cleanSector) {
+      params.set('q', cleanSector);
+      params.set('sector', cleanSector);
+    }
+    if (cleanLocation && !/unknown|to confirm/i.test(cleanLocation)) {
+      params.set('emirate', cleanLocation);
+    }
+    if (maxBudget !== null) {
+      params.set('max_price_aed', String(maxBudget));
+    }
+    params.set('limit', String(Math.max(1, Math.min(3, limit))));
+
+    const result = await this.request<unknown>(
+      'GET',
+      `/api/v1/bot/listings/search?${params.toString()}`
+    );
+    if (!result.ok || result.data === undefined) {
+      return [];
+    }
+
+    return this.extractRows(result.data)
+      .slice(0, Math.max(1, Math.min(3, limit)))
+      .map(row => this.filterPublicListing(row));
+  }
+
   async calculateIndicativeValuation(
     record: LeadCaptureRecord
   ): Promise<IndicativeValuationResult | null> {
@@ -611,19 +649,24 @@ export class SharhApiService {
       qualification: {
         business_type: record.businessType || null,
         business_location: record.businessLocation || null,
-        annual_revenue_aed: record.annualRevenueAed || null,
+        annual_revenue_aed: this.parseAedRepresentative(record.annualRevenueAed),
         lease_details: record.leaseDetails || null,
-        desired_selling_price_aed: record.desiredSellingPriceAed || null,
-        year_established: record.yearEstablished || null,
-        employee_count: record.employeeCount || null,
-        monthly_operating_expenses_aed:
-          record.monthlyOperatingExpensesAed || null,
-        monthly_net_profit_aed: record.monthlyNetProfitAed || null,
+        desired_selling_price_aed: this.parseAedRepresentative(
+          record.desiredSellingPriceAed
+        ),
+        year_established: this.parseInteger(record.yearEstablished),
+        employee_count: this.parseInteger(record.employeeCount),
+        monthly_operating_expenses_aed: this.parseAedRepresentative(
+          record.monthlyOperatingExpensesAed
+        ),
+        monthly_net_profit_aed: this.parseAedRepresentative(
+          record.monthlyNetProfitAed
+        ),
         liabilities: record.liabilities || null,
         contracts_licenses: record.contractsLicenses || null,
         sale_reason_urgency: record.saleReasonUrgency || null,
         included_assets: record.includedAssets || null,
-        buyer_budget_aed: record.buyerBudgetAed || null,
+        buyer_budget_aed: this.parseAedUpperBound(record.buyerBudgetAed),
         buyer_location: record.buyerLocation || null,
         buyer_timeline: record.buyerTimeline || null,
         buyer_involvement: record.buyerInvolvement || null,
@@ -659,8 +702,71 @@ export class SharhApiService {
     };
   }
 
+  private parseInteger(value: string): number | null {
+    const match = value.match(/\d[\d,]*/);
+    if (!match) return null;
+    const parsed = Number.parseInt(match[0].replace(/,/g, ''), 10);
+    return Number.isSafeInteger(parsed) ? parsed : null;
+  }
+
+  private parseAedValues(value: string): number[] {
+    if (!value || /unknown|to confirm/i.test(value)) return [];
+    const matches = value.matchAll(/(?<!\d)(-?\d[\d,.]*)(?:\s*)(k|m|b|thousand|million|billion)?/gi);
+    const values: number[] = [];
+    for (const match of matches) {
+      const raw = match[1];
+      if (!raw) continue;
+      const normalized = raw.includes(',') && raw.includes('.')
+        ? raw.replace(/,/g, '')
+        : raw.replace(/,/g, '');
+      let parsed = Number.parseFloat(normalized);
+      if (!Number.isFinite(parsed)) continue;
+      const suffix = (match[2] || '').toLowerCase();
+      if (suffix === 'k' || suffix === 'thousand') parsed *= 1_000;
+      if (suffix === 'm' || suffix === 'million') parsed *= 1_000_000;
+      if (suffix === 'b' || suffix === 'billion') parsed *= 1_000_000_000;
+      if (Number.isSafeInteger(Math.round(parsed))) values.push(Math.round(parsed));
+    }
+    return values;
+  }
+
+  private parseAedRepresentative(value: string): number | null {
+    const values = this.parseAedValues(value);
+    if (values.length === 0) return null;
+    if (values.length === 1) return values[0] ?? null;
+    return Math.round((Math.min(...values) + Math.max(...values)) / 2);
+  }
+
+  private parseAedUpperBound(value: string): number | null {
+    const values = this.parseAedValues(value);
+    return values.length > 0 ? Math.max(...values) : null;
+  }
+
   private compactError(status: number, responseText: string): string {
-    void responseText;
-    return `HTTP ${status}`;
+    if (!responseText) return `HTTP ${status}`;
+    try {
+      const parsed = JSON.parse(responseText) as { detail?: unknown };
+      const detail = parsed.detail;
+      if (typeof detail === 'string' && detail.trim()) {
+        return `HTTP ${status}: ${detail.trim().slice(0, 500)}`;
+      }
+      if (Array.isArray(detail)) {
+        const compact = detail
+          .slice(0, 5)
+          .map(item => {
+            if (!item || typeof item !== 'object') return String(item);
+            const row = item as Record<string, unknown>;
+            const location = Array.isArray(row['loc'])
+              ? row['loc'].map(String).join('.')
+              : '';
+            return `${location}: ${String(row['msg'] || 'invalid value')}`;
+          })
+          .join('; ');
+        if (compact) return `HTTP ${status}: ${compact.slice(0, 500)}`;
+      }
+    } catch {
+      // Keep a bounded plain-text error for non-JSON responses.
+    }
+    return `HTTP ${status}: ${responseText.replace(/\s+/g, ' ').trim().slice(0, 500)}`;
   }
 }

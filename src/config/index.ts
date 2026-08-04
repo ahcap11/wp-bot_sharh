@@ -10,6 +10,7 @@ import {
   AccessControlConfig,
   MessagingConfig,
   SharhApiConfig,
+  ConversationSafetyConfig,
 } from '../types';
 
 // Load environment variables
@@ -59,6 +60,14 @@ const envSchema = Joi.object({
     .default('info'),
   AI_MAX_TOKENS: Joi.number().default(150),
   AI_TEMPERATURE: Joi.number().min(0).max(2).default(0.7),
+  AI_SMART_ROUTING_ENABLED: booleanFlag().default(true),
+  AI_MAX_CALLS_PER_CONVERSATION: Joi.number().integer().min(0).max(100).default(8),
+  AI_MAX_CALLS_PER_NUMBER_PER_DAY: Joi.number().integer().min(0).max(500).default(20),
+  AI_MAX_INPUT_CHARS: Joi.number().integer().min(200).max(10000).default(2000),
+  AI_ABUSE_COOLDOWN_MS: Joi.number().integer().min(60000).max(86400000).default(600000),
+  AI_OFFTOPIC_STRIKES_BEFORE_COOLDOWN: Joi.number().integer().min(1).max(20).default(3),
+  AI_MIN_INTERVAL_MS: Joi.number().integer().min(0).max(60000).default(1500),
+  AI_CONVERSATION_IDLE_RESET_MS: Joi.number().integer().min(60000).max(604800000).default(86400000),
   WS_AUTH_TOKEN: Joi.string().allow(''),
   GOOGLE_SHEETS_ENABLED: booleanFlag().default(false),
   // When Sheets is enabled, require a spreadsheet id and at least one credential source.
@@ -470,6 +479,24 @@ export const getSharhApiConfig = (): SharhApiConfig => {
       process.env['SHARH_API_CONTEXT_CACHE_MS'] || '30000',
       10
     ),
+  };
+};
+
+
+/**
+ * Get AI cost, scope, and abuse-protection settings.
+ */
+export const getConversationSafetyConfig = (): ConversationSafetyConfig => {
+  validateEnv();
+  return {
+    smartRoutingEnabled: parseBoolean(process.env['AI_SMART_ROUTING_ENABLED'], true),
+    maxAiCallsPerConversation: parseInt(process.env['AI_MAX_CALLS_PER_CONVERSATION'] || '8', 10),
+    maxAiCallsPerNumberPerDay: parseInt(process.env['AI_MAX_CALLS_PER_NUMBER_PER_DAY'] || '20', 10),
+    maxInputChars: parseInt(process.env['AI_MAX_INPUT_CHARS'] || '2000', 10),
+    abuseCooldownMs: parseInt(process.env['AI_ABUSE_COOLDOWN_MS'] || '600000', 10),
+    offTopicStrikesBeforeCooldown: parseInt(process.env['AI_OFFTOPIC_STRIKES_BEFORE_COOLDOWN'] || '3', 10),
+    minAiIntervalMs: parseInt(process.env['AI_MIN_INTERVAL_MS'] || '1500', 10),
+    conversationIdleResetMs: parseInt(process.env['AI_CONVERSATION_IDLE_RESET_MS'] || '86400000', 10),
   };
 };
 

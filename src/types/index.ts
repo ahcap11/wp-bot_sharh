@@ -271,6 +271,21 @@ export interface AccessControlConfig {
 }
 
 /**
+ * Cost and abuse controls for AI-assisted sales conversations.
+ * Straightforward funnel answers do not consume these allowances.
+ */
+export interface ConversationSafetyConfig {
+  smartRoutingEnabled: boolean;
+  maxAiCallsPerConversation: number;
+  maxAiCallsPerNumberPerDay: number;
+  maxInputChars: number;
+  abuseCooldownMs: number;
+  offTopicStrikesBeforeCooldown: number;
+  minAiIntervalMs: number;
+  conversationIdleResetMs: number;
+}
+
+/**
  * Logger levels
  */
 export enum LogLevel {

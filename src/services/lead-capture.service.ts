@@ -3,13 +3,14 @@ import { PersistenceService } from './persistence.service';
 import { SalesPlaybookService, ObjectionTopic } from './sales-playbook.service';
 import { LeadScoringService } from './lead-scoring.service';
 import { ConversationSummaryService } from './conversation-summary.service';
+import { SHARH_FEE_TERMS } from '../playbooks/sharh-sales.v1';
 import type {
   SalesMessageInterpretation,
   SalesMessageClassification,
 } from './sales-message-intelligence.types';
 
 const PERSISTENCE_NAMESPACE = 'leadStates';
-const STATE_VERSION = 8;
+const STATE_VERSION = 9;
 const MAX_PROCESSED_MESSAGE_IDS = 500;
 
 export type LeadInquiryPurpose = 'buying' | 'selling';
@@ -120,6 +121,14 @@ export interface FunnelDirective {
   markInputIssueHandledOnSend?: boolean | undefined;
 }
 
+export interface NavigationResult {
+  handled: boolean;
+  response?: string | undefined;
+  resetAiUsage?: boolean | undefined;
+  continueFunnel?: boolean | undefined;
+  action?: 'back' | 'change' | 'review' | 'restart' | 'switch' | 'pause' | 'resume' | 'help' | undefined;
+}
+
 interface LeadCaptureState {
   version: number;
   entryType: LeadEntryType;
@@ -171,6 +180,8 @@ interface LeadCaptureState {
     | { field: LeadField; value: string; reason: string }
     | undefined;
   priceGuidanceCount: number;
+  paused: boolean;
+  pendingRestartConfirmation: boolean;
   messageCount: number;
   processedMessageIds: Set<string>;
 }
@@ -324,6 +335,8 @@ export class LeadCaptureService {
         lastInputIssue: serialized.lastInputIssue,
         pendingConfirmation: serialized.pendingConfirmation,
         priceGuidanceCount: serialized.priceGuidanceCount || 0,
+        paused: serialized.paused || false,
+        pendingRestartConfirmation: serialized.pendingRestartConfirmation || false,
         processedMessageIds: new Set(serialized.processedMessageIds || []),
       };
       this.leadStates.set(chatId, restored);
@@ -574,6 +587,14 @@ export class LeadCaptureService {
   /** Return the next application-owned action for the conversation. */
   getDirective(chatId: string): FunnelDirective {
     const state = this.leadStates.get(chatId) ?? this.createInitialState();
+
+    if (state.paused) {
+      return {
+        stage: state.stage,
+        owner: state.owner,
+        shouldRespond: false,
+      };
+    }
 
     if (state.pendingConfirmation) {
       return {
@@ -952,6 +973,426 @@ export class LeadCaptureService {
     return this.buildRecord(chatId, synthetic, state, []);
   }
 
+  handleNavigationCommand(chatId: string, rawContent: string): NavigationResult {
+    const content = this.normalizeWhitespace(rawContent);
+    const lower = content.toLowerCase();
+    const state = this.leadStates.get(chatId) ?? this.createInitialState();
+    this.leadStates.set(chatId, state);
+
+    if (state.pendingRestartConfirmation) {
+      if (/^(?:yes|yes start over|confirm|1|да|подтверждаю|نعم|تأكيد)$/iu.test(lower)) {
+        const language = state.language;
+        const phone = state.clientPhone;
+        const fresh = this.createInitialState();
+        fresh.language = language;
+        fresh.clientPhone = phone;
+        this.leadStates.set(chatId, fresh);
+        this.persist(chatId);
+        const directive = this.getDirective(chatId);
+        return {
+          handled: true,
+          response: this.navigationPrefix(language, 'restart_done', directive.directResponse),
+          resetAiUsage: true,
+          continueFunnel: true,
+          action: 'restart',
+        };
+      }
+      if (/^(?:no|cancel|2|нет|отмена|لا|إلغاء)$/iu.test(lower)) {
+        state.pendingRestartConfirmation = false;
+        this.persist(chatId);
+        return {
+          handled: true,
+          response: this.navigationMessage(state.language, 'restart_cancelled'),
+          action: 'restart',
+        };
+      }
+    }
+
+    if (/^(?:start over|start all over again|start again|begin again|restart|reset|clear everything|начать заново|начать сначала|перезапустить|ابدأ من جديد|إعادة البدء)$/iu.test(lower)) {
+      state.pendingRestartConfirmation = true;
+      this.persist(chatId);
+      return {
+        handled: true,
+        response: this.navigationMessage(state.language, 'restart_confirm'),
+        action: 'restart',
+      };
+    }
+
+    if (/^(?:stop|pause|cancel for now|стоп|пауза|остановить|توقف|إيقاف مؤقت)$/iu.test(lower)) {
+      state.paused = true;
+      this.persist(chatId);
+      return {
+        handled: true,
+        response: this.navigationMessage(state.language, 'paused'),
+        action: 'pause',
+      };
+    }
+
+    if (state.paused) {
+      if (/^(?:resume|continue|carry on|продолжить|возобновить|تابع|استئناف)$/iu.test(lower)) {
+        state.paused = false;
+        this.persist(chatId);
+        const directive = this.getDirective(chatId);
+        return {
+          handled: true,
+          response: this.navigationPrefix(state.language, 'resumed', directive.directResponse),
+          continueFunnel: true,
+          action: 'resume',
+        };
+      }
+      return {
+        handled: true,
+        response: this.navigationMessage(state.language, 'still_paused'),
+        action: 'pause',
+      };
+    }
+
+    if (/^(?:review|review answers|review my answers|summary|show my answers|проверить ответы|покажи ответы|сводка|مراجعة|راجع إجاباتي|ملخص)$/iu.test(lower)) {
+      return {
+        handled: true,
+        response: this.buildReviewMessage(state),
+        action: 'review',
+      };
+    }
+
+    if (/^(?:back|go back|go one step back|previous|назад|вернуться|الرجوع|السابق)$/iu.test(lower)) {
+      return this.goBack(chatId, state);
+    }
+
+    const switchPurpose = this.detectPurposeSwitch(lower);
+    if (switchPurpose) {
+      this.switchPurpose(state, switchPurpose);
+      this.persist(chatId);
+      const directive = this.getDirective(chatId);
+      return {
+        handled: true,
+        response: this.navigationPrefix(state.language, switchPurpose === 'buying' ? 'switched_buying' : 'switched_selling', directive.directResponse),
+        continueFunnel: true,
+        action: 'switch',
+      };
+    }
+
+    const directChangeMatch = content.match(
+      /^(?:change|edit|update|correct|изменить|исправить|поменять|تغيير|تعديل)\s+(?:my\s+)?(.+?)\s+(?:to|=|на|إلى)\s+(.+)$/iu
+    );
+    if (directChangeMatch?.[1] && directChangeMatch[2]) {
+      let field = this.resolveFieldAlias(directChangeMatch[1]);
+      if (field === 'business_location' && state.inquiryPurpose === 'buying') {
+        field = 'buyer_location';
+      }
+      if (field) {
+        const fieldsUpdated: string[] = [];
+        const accepted = this.applyValidatedField(
+          state,
+          field,
+          directChangeMatch[2],
+          true,
+          fieldsUpdated
+        );
+        if (!accepted) {
+          return this.changeField(chatId, state, field);
+        }
+        state.status = this.hasRequiredLeadFields(state) ? 'qualified' : 'contacted';
+        state.qualificationNoticeSent = false;
+        state.lastInputIssue = undefined;
+        state.pendingConfirmation = undefined;
+        this.recalculateStage(state);
+        this.persist(chatId);
+        const directive = this.getDirective(chatId);
+        return {
+          handled: true,
+          response: this.navigationPrefix(
+            state.language,
+            'answer_updated',
+            directive.directResponse
+          ),
+          continueFunnel: true,
+          action: 'change',
+        };
+      }
+    }
+
+    const changeMatch = lower.match(/^(?:change|edit|update|correct|изменить|исправить|поменять|تغيير|تعديل)\s+(?:my\s+)?(.+?)$/iu);
+    if (changeMatch?.[1] && !/\b(?:to|into|на|в|إلى)\b/iu.test(changeMatch[1])) {
+      let field = this.resolveFieldAlias(changeMatch[1]);
+      if (field === 'business_location' && state.inquiryPurpose === 'buying') {
+        field = 'buyer_location';
+      }
+      if (field) {
+        return this.changeField(chatId, state, field);
+      }
+      return {
+        handled: true,
+        response: this.buildChangeHelp(state),
+        action: 'change',
+      };
+    }
+
+    if (/^(?:change|change my answer|edit answer|correct answer|изменить ответ|исправить ответ|تغيير الإجابة|تعديل الإجابة)$/iu.test(lower)) {
+      return {
+        handled: true,
+        response: this.buildChangeHelp(state),
+        action: 'change',
+      };
+    }
+
+    if (/^(?:help|commands|options|помощь|команды|الخيارات|مساعدة)$/iu.test(lower)) {
+      return {
+        handled: true,
+        response: this.navigationMessage(state.language, 'help'),
+        action: 'help',
+      };
+    }
+
+    return { handled: false };
+  }
+
+  private goBack(chatId: string, state: LeadCaptureState): NavigationResult {
+    const sequence: LeadField[] = state.inquiryPurpose === 'buying'
+      ? ['inquiry_purpose', 'client_name', ...BUYER_REQUIRED_FIELDS.map(key => this.stateKeyToField(key)).filter((field): field is LeadField => Boolean(field))]
+      : ['inquiry_purpose', 'client_name', 'seller_terms', ...SELLER_REQUIRED_FIELDS.map(key => this.stateKeyToField(key)).filter((field): field is LeadField => Boolean(field))];
+    const current = state.expectedField;
+    let start = current ? sequence.indexOf(current) - 1 : sequence.length - 1;
+    if (start < 0) start = sequence.length - 1;
+    let target: LeadField | undefined;
+    for (let index = start; index >= 0; index -= 1) {
+      const candidate = sequence[index];
+      if (candidate && this.fieldHasCapturedValue(state, candidate)) {
+        target = candidate;
+        break;
+      }
+    }
+    if (!target) {
+      return {
+        handled: true,
+        response: this.navigationMessage(state.language, 'nothing_to_go_back'),
+        action: 'back',
+      };
+    }
+    this.clearField(state, target);
+    state.expectedField = target;
+    state.status = 'contacted';
+    state.qualificationNoticeSent = false;
+    state.lastInputIssue = undefined;
+    state.pendingConfirmation = undefined;
+    this.recalculateStage(state);
+    this.persist(chatId);
+    const directive = this.getDirective(chatId);
+    return {
+      handled: true,
+      response: this.navigationPrefix(state.language, 'going_back', directive.directResponse),
+      continueFunnel: true,
+      action: 'back',
+    };
+  }
+
+  private changeField(chatId: string, state: LeadCaptureState, field: LeadField): NavigationResult {
+    this.clearField(state, field);
+    state.expectedField = field;
+    state.status = 'contacted';
+    state.qualificationNoticeSent = false;
+    state.lastInputIssue = undefined;
+    state.pendingConfirmation = undefined;
+    this.recalculateStage(state);
+    this.persist(chatId);
+    const directive = this.getDirective(chatId);
+    return {
+      handled: true,
+      response: this.navigationPrefix(state.language, 'change_field', directive.directResponse),
+      continueFunnel: true,
+      action: 'change',
+    };
+  }
+
+  private switchPurpose(state: LeadCaptureState, purpose: LeadInquiryPurpose): void {
+    state.inquiryPurpose = purpose;
+    state.status = 'contacted';
+    state.stage = state.clientName ? 'identity_collected' : 'intent_identified';
+    state.qualificationNoticeSent = false;
+    state.expectedField = undefined;
+    state.lastInputIssue = undefined;
+    state.pendingConfirmation = undefined;
+    state.pendingObjection = undefined;
+    state.termsPresented = false;
+    state.termsAccepted = undefined;
+    for (const key of SELLER_REQUIRED_FIELDS) Reflect.deleteProperty(state, key);
+    for (const key of BUYER_REQUIRED_FIELDS) Reflect.deleteProperty(state, key);
+  }
+
+  private detectPurposeSwitch(content: string): LeadInquiryPurpose | null {
+    if (/^(?:switch|change|move)\s+(?:me\s+)?to\s+(?:buy|buying|buyer)|^(?:i want to buy instead)|^(?:переключить|перейти)\s+на\s+покупку|^(?:хочу покупать)|(?:التحويل إلى الشراء|أريد الشراء بدلاً)/iu.test(content)) return 'buying';
+    if (/^(?:switch|change|move)\s+(?:me\s+)?to\s+(?:sell|selling|seller)|^(?:i want to sell instead)|^(?:переключить|перейти)\s+на\s+продажу|^(?:хочу продавать)|(?:التحويل إلى البيع|أريد البيع بدلاً)/iu.test(content)) return 'selling';
+    return null;
+  }
+
+  private resolveFieldAlias(value: string): LeadField | null {
+    const normalized = value.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+    const aliases: Array<[LeadField, RegExp]> = [
+      ['inquiry_purpose', /^(?:purpose|buy or sell|intent|цель|покупка или продажа|الهدف)$/iu],
+      ['client_name', /^(?:name|my name|имя|моё имя|الاسم)$/iu],
+      ['seller_terms', /^(?:terms|agreement|fee|commission|условия|комиссия|الشروط|الرسوم)$/iu],
+      ['business_type', /^(?:business|business type|sector|industry|сфера|тип бизнеса|قطاع|نوع المشروع)$/iu],
+      ['business_location', /^(?:business location|location|emirate|area|местоположение|эмират|район|موقع المشروع|الإمارة|المنطقة)$/iu],
+      ['annual_revenue_aed', /^(?:revenue|annual revenue|turnover|выручка|годовая выручка|الإيرادات)$/iu],
+      ['lease_details', /^(?:lease|rent|premises|аренда|помещение|الإيجار|الموقع)$/iu],
+      ['desired_selling_price_aed', /^(?:price|selling price|asking price|цена|цена продажи|سعر البيع|السعر)$/iu],
+      ['year_established', /^(?:year|established|founded|год|год основания|سنة التأسيس)$/iu],
+      ['employee_count', /^(?:employees|staff|team|сотрудники|персонал|الموظفون)$/iu],
+      ['monthly_operating_expenses_aed', /^(?:expenses|operating expenses|costs|расходы|операционные расходы|المصاريف)$/iu],
+      ['monthly_net_profit_aed', /^(?:profit|net profit|прибыль|чистая прибыль|صافي الربح)$/iu],
+      ['liabilities', /^(?:liabilities|debts|debt|долги|обязательства|الديون|الالتزامات)$/iu],
+      ['contracts_licenses', /^(?:contracts|licenses|licences|договоры|лицензии|العقود|التراخيص)$/iu],
+      ['sale_reason_urgency', /^(?:reason|reason for sale|timing|urgency|причина|сроки|سبب البيع|المدة)$/iu],
+      ['included_assets', /^(?:assets|included|equipment|активы|что входит|الأصول|المعدات)$/iu],
+      ['buyer_budget_aed', /^(?:budget|buyer budget|бюджет|ميزانية)$/iu],
+      ['buyer_location', /^(?:preferred location|buyer location|preferred emirate|локация покупки|эмират покупки|الموقع المفضل)$/iu],
+      ['buyer_timeline', /^(?:timeline|purchase timing|срок покупки|موعد الشراء)$/iu],
+      ['buyer_involvement', /^(?:involvement|role|participation|участие|роль|المشاركة)$/iu],
+      ['buyer_funding_status', /^(?:funding|finance|financing|финансирование|تمويل)$/iu],
+      ['buyer_additional_comments', /^(?:requirements|comments|other requirements|требования|комментарии|متطلبات|ملاحظات)$/iu],
+    ];
+    return aliases.find(([, pattern]) => pattern.test(normalized))?.[0] || null;
+  }
+
+  private stateKeyToField(key: keyof LeadCaptureState): LeadField | undefined {
+    return (Object.entries(FIELD_TO_STATE_KEY) as Array<[LeadField, keyof LeadCaptureState]>).find(([, value]) => value === key)?.[0];
+  }
+
+  private fieldHasCapturedValue(state: LeadCaptureState, field: LeadField): boolean {
+    if (field === 'seller_terms') return state.termsAccepted !== undefined;
+    if (field === 'inquiry_purpose') return Boolean(state.inquiryPurpose);
+    const key = FIELD_TO_STATE_KEY[field];
+    return Boolean(key && this.hasValue(state[key]));
+  }
+
+  private clearField(state: LeadCaptureState, field: LeadField): void {
+    if (field === 'seller_terms') {
+      state.termsAccepted = undefined;
+      state.termsPresented = true;
+      return;
+    }
+    if (field === 'inquiry_purpose') {
+      state.inquiryPurpose = undefined;
+      this.switchPurpose(state, 'selling');
+      state.inquiryPurpose = undefined;
+      state.stage = 'new';
+      return;
+    }
+    const key = FIELD_TO_STATE_KEY[field];
+    if (key) Reflect.deleteProperty(state, key);
+  }
+
+  private buildReviewMessage(state: LeadCaptureState): string {
+    const rows: string[] = [];
+    const add = (label: string, value?: string): void => {
+      if (value) rows.push(`${rows.length + 1}. ${label}: ${value}`);
+    };
+    if (state.language === 'ru') {
+      add('Цель', state.inquiryPurpose === 'buying' ? 'Покупка' : state.inquiryPurpose === 'selling' ? 'Продажа' : undefined);
+      add('Имя', state.clientName);
+      add('Сфера', state.businessType);
+      add('Локация', state.businessLocation || state.buyerLocation);
+      add('Выручка', state.annualRevenueAed);
+      add('Цена / бюджет', state.desiredSellingPriceAed || state.buyerBudgetAed);
+      add('Прибыль', state.monthlyNetProfitAed);
+      add('Срок', state.buyerTimeline || state.saleReasonUrgency);
+      return `Текущие ответы:\n${rows.length ? rows.join('\n') : 'Пока ничего не сохранено.'}\n\nНапишите, например, «изменить выручку», «назад» или «начать заново».`;
+    }
+    if (state.language === 'ar') {
+      add('الهدف', state.inquiryPurpose === 'buying' ? 'شراء' : state.inquiryPurpose === 'selling' ? 'بيع' : undefined);
+      add('الاسم', state.clientName);
+      add('القطاع', state.businessType);
+      add('الموقع', state.businessLocation || state.buyerLocation);
+      add('الإيرادات', state.annualRevenueAed);
+      add('السعر / الميزانية', state.desiredSellingPriceAed || state.buyerBudgetAed);
+      add('الربح', state.monthlyNetProfitAed);
+      add('المدة', state.buyerTimeline || state.saleReasonUrgency);
+      return `إجاباتك الحالية:\n${rows.length ? rows.join('\n') : 'لم يتم حفظ أي إجابات بعد.'}\n\nاكتب مثلاً «تغيير الإيرادات» أو «الرجوع» أو «ابدأ من جديد».`;
+    }
+    add('Purpose', state.inquiryPurpose);
+    add('Name', state.clientName);
+    add('Business / sector', state.businessType);
+    add('Location', state.businessLocation || state.buyerLocation);
+    add('Revenue', state.annualRevenueAed);
+    add('Price / budget', state.desiredSellingPriceAed || state.buyerBudgetAed);
+    add('Profit', state.monthlyNetProfitAed);
+    add('Timeline', state.buyerTimeline || state.saleReasonUrgency);
+    return `Your current answers:\n${rows.length ? rows.join('\n') : 'Nothing has been saved yet.'}\n\nYou can say “change revenue”, “back”, or “start over”.`;
+  }
+
+  private buildChangeHelp(state: LeadCaptureState): string {
+    const review = this.buildReviewMessage(state);
+    const suffix: Record<ConversationLanguage, string> = {
+      en: 'Tell me which item to change, for example “change location” or “change budget”.',
+      ru: 'Напишите, что изменить, например «изменить локацию» или «изменить бюджет».',
+      ar: 'اكتب المعلومة التي تريد تغييرها، مثل «تغيير الموقع» أو «تغيير الميزانية».',
+    };
+    return `${review}\n\n${suffix[state.language]}`;
+  }
+
+  private navigationPrefix(language: ConversationLanguage, key: 'restart_done' | 'resumed' | 'going_back' | 'change_field' | 'answer_updated' | 'switched_buying' | 'switched_selling', next?: string): string {
+    const prefixes: Record<ConversationLanguage, Record<string, string>> = {
+      en: {
+        restart_done: 'Started over.',
+        resumed: 'Continuing from where we stopped.',
+        going_back: 'Going back to the previous answer.',
+        change_field: 'No problem. Let’s update that answer.',
+        answer_updated: 'Updated.',
+        switched_buying: 'I have switched this request to buying.',
+        switched_selling: 'I have switched this request to selling.',
+      },
+      ru: {
+        restart_done: 'Начинаем заново.',
+        resumed: 'Продолжаем с места остановки.',
+        going_back: 'Возвращаемся к предыдущему ответу.',
+        change_field: 'Хорошо. Обновим этот ответ.',
+        answer_updated: 'Ответ обновлён.',
+        switched_buying: 'Запрос переключён на покупку.',
+        switched_selling: 'Запрос переключён на продажу.',
+      },
+      ar: {
+        restart_done: 'بدأنا من جديد.',
+        resumed: 'سنكمل من حيث توقفنا.',
+        going_back: 'سنعود إلى الإجابة السابقة.',
+        change_field: 'حسناً. سنحدّث هذه الإجابة.',
+        answer_updated: 'تم تحديث الإجابة.',
+        switched_buying: 'تم تحويل الطلب إلى الشراء.',
+        switched_selling: 'تم تحويل الطلب إلى البيع.',
+      },
+    };
+    return [prefixes[language][key], next].filter(Boolean).join('\n\n');
+  }
+
+  private navigationMessage(language: ConversationLanguage, key: 'restart_confirm' | 'restart_cancelled' | 'paused' | 'still_paused' | 'nothing_to_go_back' | 'help'): string {
+    const messages: Record<ConversationLanguage, Record<string, string>> = {
+      en: {
+        restart_confirm: 'Starting over will clear the active answers in this chat, while the conversation history remains recorded. Reply 1 to confirm or 2 to cancel.',
+        restart_cancelled: 'Start-over cancelled. Your current answers are unchanged.',
+        paused: 'Paused. Your progress is saved. Reply “resume” whenever you want to continue.',
+        still_paused: 'This request is paused. Reply “resume”, “review”, or “start over”.',
+        nothing_to_go_back: 'There is no earlier completed answer to return to. You can review your answers or continue.',
+        help: 'Available controls: back, change [answer], review, start over, switch to buying/selling, pause, and resume.',
+      },
+      ru: {
+        restart_confirm: 'Начать заново означает очистить активные ответы в этом чате, при этом история переписки сохранится. Ответьте 1 для подтверждения или 2 для отмены.',
+        restart_cancelled: 'Перезапуск отменён. Текущие ответы не изменены.',
+        paused: 'Процесс приостановлен, прогресс сохранён. Напишите «продолжить», когда будете готовы.',
+        still_paused: 'Запрос приостановлен. Напишите «продолжить», «проверить ответы» или «начать заново».',
+        nothing_to_go_back: 'Предыдущего заполненного ответа пока нет. Можно проверить ответы или продолжить.',
+        help: 'Команды: назад, изменить [ответ], проверить ответы, начать заново, переключить на покупку/продажу, пауза и продолжить.',
+      },
+      ar: {
+        restart_confirm: 'البدء من جديد سيمسح الإجابات النشطة في هذه المحادثة مع الاحتفاظ بسجل الرسائل. أجب 1 للتأكيد أو 2 للإلغاء.',
+        restart_cancelled: 'تم إلغاء البدء من جديد، ولم تتغير إجاباتك الحالية.',
+        paused: 'تم إيقاف الطلب مؤقتاً وحفظ تقدمك. اكتب «تابع» عندما تريد المتابعة.',
+        still_paused: 'الطلب متوقف مؤقتاً. اكتب «تابع» أو «مراجعة» أو «ابدأ من جديد».',
+        nothing_to_go_back: 'لا توجد إجابة مكتملة سابقة للرجوع إليها. يمكنك مراجعة الإجابات أو المتابعة.',
+        help: 'الأوامر المتاحة: الرجوع، تغيير [إجابة]، مراجعة، ابدأ من جديد، التحويل إلى شراء/بيع، توقف، وتابع.',
+      },
+    };
+    return messages[language][key] || messages.en[key] || '';
+  }
+
   clearLeadState(chatId: string): void {
     this.leadStates.delete(chatId);
     this.persistence?.removeItem(PERSISTENCE_NAMESPACE, chatId);
@@ -973,6 +1414,8 @@ export class LeadCaptureService {
       promptRepeatCount: 0,
       invalidAttempts: {},
       priceGuidanceCount: 0,
+      paused: false,
+      pendingRestartConfirmation: false,
       messageCount: 0,
       processedMessageIds: new Set<string>(),
     };
@@ -2595,9 +3038,9 @@ export class LeadCaptureService {
       en: {
         ask_purpose:
           'Welcome to SHARH. We help clients buy and sell businesses across the UAE. Are you looking to buy or sell a business?',
-        ask_name: 'Thank you. What name should I use?',
+        ask_name: 'Could I have your name, please?',
         seller_terms:
-          'Before we continue: your information is treated as confidential, we sign an agreement before work begins, and approved businesses may be marketed through sharh.ae and SHARH channels. Our commission is 2% for transactions above USD 500,000 and USD 10,000 for transactions below that threshold. Do you agree to these terms? Reply 1 for Yes or 2 for No.',
+          `Before we continue: your information is treated as confidential, we sign an agreement before work begins, and approved businesses may be marketed through sharh.ae and SHARH channels. ${SHARH_FEE_TERMS.en} Do you agree to these terms? Reply 1 for Yes or 2 for No.`,
         ask_terms_acceptance: 'Do you agree to the SHARH confidentiality, process, and commission terms?',
         terms_declined:
           'Understood. Which part of the terms would you like clarified?',
@@ -2611,7 +3054,7 @@ export class LeadCaptureService {
           'Добро пожаловать в SHARH. Мы помогаем покупать и продавать бизнес по всему ОАЭ. Вы хотите купить или продать бизнес?',
         ask_name: 'Спасибо. Как я могу к вам обращаться?',
         seller_terms:
-          'Перед продолжением: информация обрабатывается конфиденциально, до начала работы мы подписываем договор, а одобренный бизнес может продвигаться через sharh.ae и каналы SHARH. Комиссия составляет 2% для сделок свыше 500 000 USD и 10 000 USD для сделок ниже этого порога. Вы согласны с этими условиями? Ответьте 1 — Да или 2 — Нет.',
+          `Перед продолжением: информация обрабатывается конфиденциально, до начала работы мы подписываем договор, а одобренный бизнес может продвигаться через sharh.ae и каналы SHARH. ${SHARH_FEE_TERMS.ru} Вы согласны с этими условиями? Ответьте 1 — Да или 2 — Нет.`,
         ask_terms_acceptance:
           'Вы согласны с условиями SHARH по конфиденциальности, процессу и комиссии?',
         terms_declined: 'Понял. Какую часть условий нужно уточнить?',
@@ -2625,7 +3068,7 @@ export class LeadCaptureService {
           'مرحباً بك في SHARH. نساعد العملاء على شراء وبيع المشاريع في جميع أنحاء الإمارات. هل ترغب في شراء مشروع أم بيعه؟',
         ask_name: 'شكراً. ما الاسم الذي تفضل أن أخاطبك به؟',
         seller_terms:
-          'قبل المتابعة: نتعامل مع معلوماتك بسرية، ونوقع اتفاقية قبل بدء العمل، ويمكن تسويق المشروع المعتمد عبر sharh.ae وقنوات SHARH. العمولة 2% للصفقات التي تتجاوز 500,000 دولار و10,000 دولار للصفقات الأقل من ذلك. هل توافق على هذه الشروط؟ أجب 1 للموافقة أو 2 للرفض.',
+          `قبل المتابعة: نتعامل مع معلوماتك بسرية، ونوقع اتفاقية قبل بدء العمل، ويمكن تسويق المشروع المعتمد عبر sharh.ae وقنوات SHARH. ${SHARH_FEE_TERMS.ar} هل توافق على هذه الشروط؟ أجب 1 للموافقة أو 2 للرفض.`,
         ask_terms_acceptance:
           'هل توافق على شروط SHARH المتعلقة بالسرية والإجراءات والعمولة؟',
         terms_declined: 'مفهوم. أي جزء من الشروط تريد توضيحه؟',
