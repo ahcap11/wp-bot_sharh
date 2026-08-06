@@ -71,10 +71,10 @@ describe('conversation navigation and seller terms', () => {
   it('requires confirmation before starting over and clears only active answers', () => {
     turn('sell');
     turn('yes');
-    turn('Restaurant in Dubai with annual revenue AED 1m');
+    turn('Restaurant in Dubai, expected price AED 600k');
 
     const request = service.handleNavigationCommand(chatId, 'start over');
-    expect(request.response).toContain('Reply 1 to confirm');
+    expect(request.response).toContain('Should I start over');
     expect(service.getCurrentRecord(chatId)?.businessType).toBe('Restaurant');
 
     const confirmed = service.handleNavigationCommand(chatId, '1');
@@ -93,16 +93,50 @@ describe('conversation navigation and seller terms', () => {
     expect(service.getDirective(chatId).expectedField).toBe('seller_terms');
   });
 
-  it('supports seller submit, contact, details, website and continue-later choices', () => {
+  it('keeps seller choices to submit, optional details, or website', () => {
     turn('sell');
     turn('yes');
-    turn('Restaurant in Dubai, annual revenue AED 1m');
+    turn('Restaurant in Dubai, expected selling price AED 600k');
 
-    const details = service.handleNavigationCommand(chatId, '2');
+    const ready = service.getDirective(chatId).directResponse || '';
+    expect(ready).toContain('submit it for review');
+    expect(ready).toContain('add more details');
+    expect(ready).toContain('website link');
+    expect(ready).not.toContain('contact me');
+
+    const details = service.handleNavigationCommand(chatId, 'add more details');
     expect(details.response).toContain('additional details in one message');
 
     service.updateFromMessage(chatId, message(`m-${++sequence}`, '10 employees, no debt, monthly profit AED 30k'));
-    const contact = service.handleNavigationCommand(chatId, '3');
-    expect(contact.response).toContain('convenient time');
+    const website = service.handleNavigationCommand(chatId, 'continue on website');
+    expect(website.response).toContain('/sell/intake');
+  });
+
+  it('requires business, location, and expected selling price but keeps revenue optional', () => {
+    turn('sell');
+    turn('yes');
+    turn('Boat trading company in Dubai, expected selling price around AED 600k');
+
+    const record = service.getCurrentRecord(chatId);
+    expect(record?.status).toBe('qualified');
+    expect(record?.businessType).toContain('Boat');
+    expect(record?.businessLocation).toContain('Dubai');
+    expect(record?.desiredSellingPriceAed).toContain('600,000');
+    expect(record?.annualRevenueAed).toBe('');
+  });
+
+  it('asks for the client name only when submitting for review', () => {
+    turn('sell');
+    turn('yes');
+    turn('Boat trading company in Dubai, expected selling price AED 600k');
+
+    const submit = service.handleNavigationCommand(chatId, 'submit for review');
+    expect(submit.response).toContain('Could I have your name');
+    const nameDirective = service.getDirective(chatId);
+    service.confirmDirectiveSent(chatId, nameDirective);
+
+    turn('Ansar');
+    expect(service.getCurrentRecord(chatId)?.nextStep).toBe('submit');
+    expect(service.getCurrentRecord(chatId)?.clientName).toBe('Ansar');
   });
 });

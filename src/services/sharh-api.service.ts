@@ -17,6 +17,27 @@ export interface IndicativeValuationResult {
   formattedRange: string;
 }
 
+export interface SharhConversationControl {
+  found: boolean;
+  botEnabled: boolean;
+  owner: 'bot' | 'human' | 'closed';
+  controlMode: string;
+  reviewRequired: boolean;
+  adminGuidance: string[];
+  recentHumanMessages: string[];
+}
+
+
+export interface SharhAdminOutboxMessage {
+  id: string;
+  conversationId: string;
+  externalChatId: string;
+  phone: string | null;
+  content: string;
+  senderName: string | null;
+  queuedAt: string;
+}
+
 interface ApiResult<T> {
   ok: boolean;
   status: number;
@@ -231,6 +252,138 @@ export class SharhApiService {
       high: valuation.high,
       currency,
       formattedRange: `${currency} ${valuation.low.toLocaleString('en-US')}–${valuation.high.toLocaleString('en-US')} (midpoint ${currency} ${valuation.mid.toLocaleString('en-US')})`,
+    };
+  }
+
+
+  async fetchAdminOutbox(limit: number = 10): Promise<SharhAdminOutboxMessage[]> {
+    if (!this.config.enabled) return [];
+    const safeLimit = Math.max(1, Math.min(50, limit));
+    const result = await this.request<unknown>(
+      'GET',
+      `/api/v1/bot/admin-outbox?limit=${safeLimit}`
+    );
+    if (!result.ok || !this.isRecord(result.data)) return [];
+    const rawItems = result.data['items'];
+    if (!Array.isArray(rawItems)) return [];
+    const items: SharhAdminOutboxMessage[] = [];
+    for (const raw of rawItems) {
+      if (!this.isRecord(raw)) continue;
+      const id = typeof raw['id'] === 'string' ? raw['id'] : '';
+      const conversationId =
+        typeof raw['conversation_id'] === 'string' ? raw['conversation_id'] : '';
+      const externalChatId =
+        typeof raw['external_chat_id'] === 'string' ? raw['external_chat_id'] : '';
+      const content = typeof raw['content'] === 'string' ? raw['content'].trim() : '';
+      if (!id || !conversationId || !externalChatId || !content) continue;
+      items.push({
+        id,
+        conversationId,
+        externalChatId,
+        phone: typeof raw['phone'] === 'string' ? raw['phone'] : null,
+        content,
+        senderName:
+          typeof raw['sender_name'] === 'string' ? raw['sender_name'] : null,
+        queuedAt:
+          typeof raw['queued_at'] === 'string'
+            ? raw['queued_at']
+            : new Date().toISOString(),
+      });
+    }
+    return items;
+  }
+
+  async acknowledgeAdminOutboxMessage(
+    messageId: string,
+    status: 'sent' | 'failed',
+    providerMessageId?: string,
+    error?: string
+  ): Promise<boolean> {
+    if (!this.config.enabled || !messageId) return false;
+    const result = await this.request<unknown>(
+      'POST',
+      `/api/v1/bot/admin-outbox/${encodeURIComponent(messageId)}/ack`,
+      {
+        status,
+        provider_message_id: providerMessageId || null,
+        occurred_at: new Date().toISOString(),
+        error: error || null,
+      },
+      `admin-outbox-${messageId}-${status}`
+    );
+    return result.ok;
+  }
+
+  async getConversationControl(
+    externalChatId: string,
+    phone: string
+  ): Promise<SharhConversationControl | null> {
+    if (!this.config.enabled) {
+      return null;
+    }
+
+    const params = new URLSearchParams({ external_chat_id: externalChatId });
+    if (phone) {
+      params.set('phone', phone);
+    }
+    const result = await this.request<unknown>(
+      'GET',
+      `/api/v1/bot/conversations/context?${params.toString()}`
+    );
+    if (!result.ok || !this.isRecord(result.data)) {
+      return null;
+    }
+    if (result.data['found'] !== true) {
+      return {
+        found: false,
+        botEnabled: true,
+        owner: 'bot',
+        controlMode: 'bot',
+        reviewRequired: false,
+        adminGuidance: [],
+        recentHumanMessages: [],
+      };
+    }
+    const conversation = result.data['conversation'];
+    if (!this.isRecord(conversation)) {
+      return null;
+    }
+    const rawOwner = conversation['owner'];
+    const owner =
+      rawOwner === 'human' || rawOwner === 'closed' ? rawOwner : 'bot';
+    const botEnabled =
+      typeof conversation['bot_enabled'] === 'boolean'
+        ? conversation['bot_enabled']
+        : owner === 'bot';
+    const rawGuidance = conversation['admin_guidance'];
+    const adminGuidance = Array.isArray(rawGuidance)
+      ? rawGuidance
+          .filter((item): item is string => typeof item === 'string')
+          .map(item => item.trim())
+          .filter(Boolean)
+          .slice(0, 5)
+      : [];
+    const rawHumanMessages = conversation['recent_human_messages'];
+    const recentHumanMessages = Array.isArray(rawHumanMessages)
+      ? rawHumanMessages
+          .filter((item): item is string => typeof item === 'string')
+          .map(item => item.trim())
+          .filter(Boolean)
+          .slice(-5)
+      : [];
+    return {
+      found: true,
+      botEnabled,
+      owner,
+      controlMode:
+        typeof conversation['control_mode'] === 'string'
+          ? conversation['control_mode']
+          : botEnabled
+            ? 'bot'
+            : 'human',
+      reviewRequired: conversation['review_required'] === true,
+      adminGuidance,
+      recentHumanMessages,
     };
   }
 

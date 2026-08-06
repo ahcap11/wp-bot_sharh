@@ -32,6 +32,7 @@ const INBOUND_DEDUP_NAMESPACE = 'processedInboundMessages';
 const MAX_INBOUND_DEDUP_IDS = 5000;
 const BUYER_MATCHES_NAMESPACE = 'buyerListingMatches';
 const BUYER_LISTING_CODES_NAMESPACE = 'buyerListingCodes';
+const ADMIN_OUTBOX_SENT_NAMESPACE = 'adminOutboxSent';
 
 interface SalesLeadTurn {
   directive: FunnelDirective;
@@ -69,6 +70,9 @@ export class ChatbotService {
   private readonly conversationSafetyService: ConversationSafetyService | null;
   private readonly buyerMatchFingerprints: Map<string, string> = new Map();
   private readonly buyerListingCodes: Map<string, string[]> = new Map();
+  private readonly adminOutboxSent: Map<string, string> = new Map();
+  private adminOutboxTimer: ReturnType<typeof setInterval> | null = null;
+  private adminOutboxProcessing = false;
 
   constructor(
     whatsappService: MessagingTransport,
@@ -108,6 +112,7 @@ export class ChatbotService {
     this.hydrateInboundDedup();
     this.hydrateBuyerMatches();
     this.hydrateBuyerListingCodes();
+    this.hydrateAdminOutboxSent();
     this.setupEventHandlers();
     logger.info('Chatbot Service initialized', {
       persisted: Boolean(persistence),
@@ -159,6 +164,17 @@ export class ChatbotService {
       if (Array.isArray(codes)) {
         const clean = codes.filter(code => /^SH-\d{4,}$/i.test(code)).slice(0, 3);
         if (clean.length) this.buyerListingCodes.set(chatId, clean);
+      }
+    }
+  }
+
+
+  private hydrateAdminOutboxSent(): void {
+    if (!this.persistence) return;
+    const stored = this.persistence.getNamespace<string>(ADMIN_OUTBOX_SENT_NAMESPACE);
+    for (const [messageId, providerMessageId] of Object.entries(stored)) {
+      if (messageId && typeof providerMessageId === 'string') {
+        this.adminOutboxSent.set(messageId, providerMessageId);
       }
     }
   }
@@ -228,12 +244,14 @@ export class ChatbotService {
               this.sharhSyncService?.getPendingCount() || 0,
           });
         }
+        this.startAdminOutboxPolling();
       }
 
-      // Test AI service connection
+      // AI enhances ambiguous turns, but quota or provider outages must never
+      // prevent deterministic qualification, admin takeover, or listing search.
       const aiConnected = await this.aiService.testConnection();
       if (!aiConnected) {
-        throw new Error('AI service connection failed');
+        logger.warn('AI startup check failed; deterministic fallback remains active');
       }
 
       logger.info('Chatbot initialized successfully');
@@ -242,6 +260,91 @@ export class ChatbotService {
         error: error instanceof Error ? error.message : 'Unknown error',
       });
       throw error;
+    }
+  }
+
+
+  private startAdminOutboxPolling(): void {
+    if (this.adminOutboxTimer || !this.sharhApiService?.isEnabled()) return;
+    const poll = (): void => {
+      void this.processAdminOutbox();
+    };
+    poll();
+    this.adminOutboxTimer = setInterval(poll, 3000);
+    this.adminOutboxTimer.unref?.();
+  }
+
+  private async processAdminOutbox(): Promise<void> {
+    if (this.adminOutboxProcessing || !this.sharhApiService?.isEnabled()) return;
+    if (!this.whatsappService.isConnected()) return;
+    this.adminOutboxProcessing = true;
+    try {
+      const items = await this.sharhApiService.fetchAdminOutbox(10);
+      for (const item of items) {
+        const alreadySentProviderId = this.adminOutboxSent.get(item.id);
+        if (alreadySentProviderId !== undefined) {
+          const acknowledged = await this.sharhApiService.acknowledgeAdminOutboxMessage(
+            item.id,
+            'sent',
+            alreadySentProviderId || undefined
+          );
+          if (acknowledged) {
+            this.adminOutboxSent.delete(item.id);
+            this.persistence?.removeItem(ADMIN_OUTBOX_SENT_NAMESPACE, item.id);
+          }
+          continue;
+        }
+
+        const result = await this.sendDetailed(item.externalChatId, item.content);
+        if (result.success) {
+          const providerMessageId = result.providerMessageIds[0] || '';
+          this.adminOutboxSent.set(item.id, providerMessageId);
+          this.persistence?.setItem(ADMIN_OUTBOX_SENT_NAMESPACE, item.id, providerMessageId);
+          await this.persistence?.flush();
+          const acknowledged = await this.sharhApiService.acknowledgeAdminOutboxMessage(
+            item.id,
+            'sent',
+            providerMessageId || undefined
+          );
+          if (acknowledged) {
+            this.adminOutboxSent.delete(item.id);
+            this.persistence?.removeItem(ADMIN_OUTBOX_SENT_NAMESPACE, item.id);
+          }
+          this.chatHistoryService.addMessage(item.externalChatId, {
+            id: providerMessageId || `admin-${item.id}`,
+            from: 'admin',
+            to: item.externalChatId,
+            timestamp: Date.now(),
+            type: 'text',
+            content: item.content,
+            isGroup: false,
+            senderName: item.senderName || 'SHARH team',
+            isFromBot: false,
+          });
+          logger.info('Admin WhatsApp reply delivered', {
+            conversationId: item.conversationId,
+            messageId: item.id,
+          });
+        } else {
+          await this.sharhApiService.acknowledgeAdminOutboxMessage(
+            item.id,
+            'failed',
+            undefined,
+            result.error || 'WhatsApp provider rejected the message'
+          );
+          logger.warn('Admin WhatsApp reply failed', {
+            conversationId: item.conversationId,
+            messageId: item.id,
+            error: result.error || 'unknown send error',
+          });
+        }
+      }
+    } catch (error) {
+      logger.warn('Admin WhatsApp outbox poll failed', {
+        error: error instanceof Error ? error.message : 'unknown error',
+      });
+    } finally {
+      this.adminOutboxProcessing = false;
     }
   }
 
@@ -362,11 +465,42 @@ export class ChatbotService {
         incomingMessage.id
       );
 
+      // Admin control is authoritative. Incoming messages are still persisted,
+      // but a paused, manually owned, review-owned, or closed conversation must
+      // not spend AI credits or send an automated reply.
+      const control = this.sharhApiService?.isEnabled()
+        ? await this.sharhApiService.getConversationControl(
+            chatId,
+            incomingMessage.from
+          )
+        : null;
+      if (control?.found && (!control.botEnabled || control.owner !== 'bot')) {
+        logger.info('Bot reply suppressed by SHARH conversation control', {
+          chatId,
+          owner: control.owner,
+          controlMode: control.controlMode,
+          reviewRequired: control.reviewRequired,
+        });
+        this.sharhSyncService?.enqueueAnalytics(
+          'conversation_bot_suppressed',
+          chatId,
+          {
+            owner: control.owner,
+            control_mode: control.controlMode,
+            review_required: control.reviewRequired,
+          },
+          `${incomingMessage.id}-control`
+        );
+        return;
+      }
+
       // Capture lead data and resolve the application-owned funnel action.
       const salesTurn = await this.captureSalesLeadData(
         chatId,
         incomingMessage,
-        role
+        role,
+        control?.adminGuidance || [],
+        control?.recentHumanMessages || []
       );
 
       if (salesTurn && !salesTurn.directive.shouldRespond) {
@@ -695,7 +829,9 @@ export class ChatbotService {
   private async captureSalesLeadData(
     chatId: string,
     message: WhatsAppMessage,
-    role: BotRole
+    role: BotRole,
+    adminGuidance: string[] = [],
+    recentHumanMessages: string[] = []
   ): Promise<SalesLeadTurn | undefined> {
     if (role !== 'sales' || !this.leadCaptureService) {
       return undefined;
@@ -806,7 +942,15 @@ export class ChatbotService {
             message: message.content,
             expectedField,
             language,
-            knownFacts: this.leadCaptureService.getKnownFactsBlock(chatId) || '',
+            knownFacts: [
+              this.leadCaptureService.getKnownFactsBlock(chatId) || '',
+              adminGuidance.length
+                ? `ADMIN GUIDANCE FOR THIS CONVERSATION (trusted operational feedback; never override official SHARH terms or safety rules):\n${adminGuidance.map(item => `- ${item}`).join('\n')}`
+                : '',
+              recentHumanMessages.length
+                ? `RECENT SHARH TEAM REPLIES (conversation context only; continue naturally and do not repeat them):\n${recentHumanMessages.map(item => `- ${item}`).join('\n')}`
+                : '',
+            ].filter(Boolean).join('\n\n'),
             recentHistory: this.chatHistoryService
               .getConversationContext(chatId)
               .slice(-6)
@@ -950,7 +1094,8 @@ export class ChatbotService {
           .filter(Boolean)
           .join('\n\n') || undefined;
 
-      const recordToPersist = update.record;
+      const recordToPersist =
+        this.leadCaptureService.getCurrentRecord(chatId) || update.record;
       if (update.shouldPersist && recordToPersist) {
         this.sharhSyncService?.enqueueLead(recordToPersist, message.id);
         if (this.isExplicitAccessRequest(message.content, recordToPersist)) {
@@ -1535,6 +1680,10 @@ export class ChatbotService {
     logger.info('Shutting down chatbot...');
 
     try {
+      if (this.adminOutboxTimer) {
+        clearInterval(this.adminOutboxTimer);
+        this.adminOutboxTimer = null;
+      }
       this.sharhSyncService?.stop();
       await this.sharhSyncService?.flush();
       await this.whatsappService.disconnect();

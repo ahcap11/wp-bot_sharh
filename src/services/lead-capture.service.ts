@@ -10,7 +10,7 @@ import type {
 } from './sales-message-intelligence.types';
 
 const PERSISTENCE_NAMESPACE = 'leadStates';
-const STATE_VERSION = 10;
+const STATE_VERSION = 11;
 const MAX_PROCESSED_MESSAGE_IDS = 500;
 
 export type LeadInquiryPurpose = 'buying' | 'selling';
@@ -229,7 +229,6 @@ type SerializedLeadState = Partial<
 const SELLER_REQUIRED_FIELDS: Array<keyof LeadCaptureState> = [
   'businessType',
   'businessLocation',
-  'annualRevenueAed',
   'desiredSellingPriceAed',
 ];
 
@@ -1135,20 +1134,6 @@ export class LeadCaptureService {
       };
     }
 
-    if (
-      state.inquiryPurpose === 'selling' &&
-      state.termsPresented &&
-      state.termsAccepted !== true &&
-      /^(?:3|contact me|ask sharh to contact me|call me|request a call|свяжитесь со мной|позвоните мне|تواصلوا معي|اتصلوا بي)$/iu.test(lower)
-    ) {
-      state.pendingContactRequest = true;
-      state.nextStep = 'contact';
-      state.lastInputIssue = undefined;
-      this.persist(chatId);
-      const directive = this.getDirective(chatId);
-      return { handled: true, response: directive.directResponse, continueFunnel: true, action: 'review' };
-    }
-
     const requestedLanguage = this.detectExplicitLanguageSwitch(lower);
     if (requestedLanguage) {
       state.language = requestedLanguage;
@@ -1170,41 +1155,34 @@ export class LeadCaptureService {
     }
 
     if (state.status === 'qualified' && state.inquiryPurpose === 'selling') {
-      if (/^(?:1|submit|submit for review|send for review|review it|подать|отправить на рассмотрение|إرسال للمراجعة)$/iu.test(lower)) {
+      if (/^(?:1|submit|submit it|submit for review|send for review|review it|подать|отправить на рассмотрение|إرسال للمراجعة)$/iu.test(lower)) {
         state.pendingSubmitRequest = true;
-        state.nextStep = 'submit';
+        state.nextStep = undefined;
         state.qualificationNoticeSent = false;
         this.persist(chatId);
         const directive = this.getDirective(chatId);
         return { handled: true, response: directive.directResponse, continueFunnel: true, action: 'review' };
       }
-      if (/^(?:2|add details|more details|continue with details|добавить детали|добавить подробности|إضافة تفاصيل)$/iu.test(lower)) {
+      if (/^(?:2|add details|add more details|more details|continue with details|добавить детали|добавить подробности|إضافة تفاصيل)$/iu.test(lower)) {
         state.optionalDetailsMode = true;
         state.nextStep = 'details';
         state.qualificationNoticeSent = true;
         this.persist(chatId);
         return { handled: true, response: this.optionalDetailsPrompt(state.language, 'selling'), action: 'review' };
       }
-      if (/^(?:3|contact me|ask sharh to contact me|call me|request a call|свяжитесь со мной|позвоните мне|تواصلوا معي|اتصلوا بي)$/iu.test(lower)) {
-        state.pendingContactRequest = true;
-        state.nextStep = 'contact';
-        state.qualificationNoticeSent = false;
-        this.persist(chatId);
-        const directive = this.getDirective(chatId);
-        return { handled: true, response: directive.directResponse, continueFunnel: true, action: 'review' };
-      }
-      if (/^(?:4|website|continue on website|open website|site|перейти на сайт|продолжить на сайте|الموقع|تابع على الموقع)$/iu.test(lower)) {
+      if (/^(?:3|website|continue on website|open website|send the website link|site|перейти на сайт|продолжить на сайте|الموقع|تابع على الموقع)$/iu.test(lower)) {
         state.websiteLinkSent = true;
         state.nextStep = 'website';
         this.persist(chatId);
         return { handled: true, response: this.websiteContinuationMessage(state.language, 'selling'), action: 'review' };
       }
-      if (/^(?:5|later|continue later|save and continue later|not now|позже|продолжить позже|ليس الآن|لاحقاً)$/iu.test(lower)) {
-        state.continueLater = true;
-        state.paused = true;
-        state.nextStep = 'later';
+      if (/^(?:contact me|ask sharh to contact me|call me|request a call|speak to someone|human|свяжитесь со мной|позвоните мне|живой человек|تواصلوا معي|اتصلوا بي)$/iu.test(lower)) {
+        state.pendingSubmitRequest = true;
+        state.nextStep = undefined;
+        state.qualificationNoticeSent = false;
         this.persist(chatId);
-        return { handled: true, response: this.continueLaterMessage(state.language), action: 'pause' };
+        const directive = this.getDirective(chatId);
+        return { handled: true, response: directive.directResponse, continueFunnel: true, action: 'review' };
       }
     }
 
@@ -1572,7 +1550,7 @@ export class LeadCaptureService {
   private navigationMessage(language: ConversationLanguage, key: 'restart_confirm' | 'restart_cancelled' | 'paused' | 'still_paused' | 'nothing_to_go_back' | 'help'): string {
     const messages: Record<ConversationLanguage, Record<string, string>> = {
       en: {
-        restart_confirm: 'Starting over will clear the active answers in this chat, while the conversation history remains recorded. Reply 1 to confirm or 2 to cancel.',
+        restart_confirm: 'Starting over will clear the active answers in this chat, while the conversation history remains recorded. Should I start over?',
         restart_cancelled: 'Start-over cancelled. Your current answers are unchanged.',
         paused: 'Paused. Your progress is saved. Reply “resume” whenever you want to continue.',
         still_paused: 'This request is paused. Reply “resume”, “review”, or “start over”.',
@@ -1580,7 +1558,7 @@ export class LeadCaptureService {
         help: 'Available controls: back, change [answer], review, start over, switch to buying/selling, pause, and resume.',
       },
       ru: {
-        restart_confirm: 'Начать заново означает очистить активные ответы в этом чате, при этом история переписки сохранится. Ответьте 1 для подтверждения или 2 для отмены.',
+        restart_confirm: 'Начать заново означает очистить активные ответы в этом чате, при этом история переписки сохранится. Начать заново?',
         restart_cancelled: 'Перезапуск отменён. Текущие ответы не изменены.',
         paused: 'Процесс приостановлен, прогресс сохранён. Напишите «продолжить», когда будете готовы.',
         still_paused: 'Запрос приостановлен. Напишите «продолжить», «проверить ответы» или «начать заново».',
@@ -1588,7 +1566,7 @@ export class LeadCaptureService {
         help: 'Команды: назад, изменить [ответ], проверить ответы, начать заново, переключить на покупку/продажу, пауза и продолжить.',
       },
       ar: {
-        restart_confirm: 'البدء من جديد سيمسح الإجابات النشطة في هذه المحادثة مع الاحتفاظ بسجل الرسائل. أجب 1 للتأكيد أو 2 للإلغاء.',
+        restart_confirm: 'البدء من جديد سيمسح الإجابات النشطة في هذه المحادثة مع الاحتفاظ بسجل الرسائل. هل أبدأ من جديد؟',
         restart_cancelled: 'تم إلغاء البدء من جديد، ولم تتغير إجاباتك الحالية.',
         paused: 'تم إيقاف الطلب مؤقتاً وحفظ تقدمك. اكتب «تابع» عندما تريد المتابعة.',
         still_paused: 'الطلب متوقف مؤقتاً. اكتب «تابع» أو «مراجعة» أو «ابدأ من جديد».',
@@ -2361,16 +2339,11 @@ export class LeadCaptureService {
     }
 
     if (state.inquiryPurpose === 'selling') {
-      const hasFinancialAnchor = Boolean(
-        this.hasValue(state.annualRevenueAed) ||
-        this.hasValue(state.monthlyNetProfitAed) ||
-        this.hasValue(state.desiredSellingPriceAed)
-      );
       return Boolean(
         state.termsAccepted === true &&
         this.hasValue(state.businessType) &&
         this.hasValue(state.businessLocation) &&
-        hasFinancialAnchor
+        this.hasValue(state.desiredSellingPriceAed)
       );
     }
 
@@ -2383,12 +2356,8 @@ export class LeadCaptureService {
   private nextMissingSellerField(state: LeadCaptureState): LeadField | null {
     if (!this.hasValue(state.businessType)) return 'business_type';
     if (!this.hasValue(state.businessLocation)) return 'business_location';
-    if (
-      !this.hasValue(state.annualRevenueAed) &&
-      !this.hasValue(state.monthlyNetProfitAed) &&
-      !this.hasValue(state.desiredSellingPriceAed)
-    ) {
-      return 'annual_revenue_aed';
+    if (!this.hasValue(state.desiredSellingPriceAed)) {
+      return 'desired_selling_price_aed';
     }
     return null;
   }
@@ -3107,9 +3076,9 @@ export class LeadCaptureService {
     const webBase = (process.env['SHARH_WEB_BASE_URL'] || 'https://sharh.ae').replace(/\/$/, '');
     if (state.inquiryPurpose === 'buying') {
       const messages: Record<ConversationLanguage, string> = {
-        en: `Choose 1, 2, or 3 to open a result, or:\n4. Ask SHARH to contact me\n5. Refine the search\n6. Save this search\n7. Open the marketplace: ${webBase}/marketplace`,
-        ru: `Выберите 1, 2 или 3, чтобы открыть вариант, либо:\n4. Попросить SHARH связаться со мной\n5. Уточнить поиск\n6. Сохранить поиск\n7. Открыть маркетплейс: ${webBase}/marketplace`,
-        ar: `اختر 1 أو 2 أو 3 لفتح أحد النتائج، أو:\n4. طلب تواصل SHARH معي\n5. تحسين البحث\n6. حفظ البحث\n7. فتح السوق: ${webBase}/marketplace`,
+        en: `You can open a result by replying with its number or SH-XXXX code. You can also refine the search, save your requirements for SHARH review, or open the marketplace: ${webBase}/marketplace`,
+        ru: `Чтобы открыть вариант, отправьте его номер или код SH-XXXX. Также можно уточнить поиск, сохранить требования для рассмотрения SHARH или открыть маркетплейс: ${webBase}/marketplace`,
+        ar: `لفتح أحد الخيارات، أرسل رقمه أو رمز SH-XXXX. ويمكنك أيضاً تعديل البحث أو حفظ متطلباتك لمراجعة SHARH أو فتح السوق: ${webBase}/marketplace`,
       };
       return messages[state.language];
     }
@@ -3117,14 +3086,14 @@ export class LeadCaptureService {
     const summary: string[] = [];
     if (state.businessType) summary.push(`Business: ${state.businessType}`);
     if (state.businessLocation) summary.push(`Location: ${state.businessLocation}`);
+    if (state.desiredSellingPriceAed) summary.push(`Expected price: ${state.desiredSellingPriceAed}`);
     if (state.annualRevenueAed) summary.push(`Annual revenue: ${state.annualRevenueAed}`);
     if (state.monthlyNetProfitAed) summary.push(`Monthly profit: ${state.monthlyNetProfitAed}`);
-    if (state.desiredSellingPriceAed) summary.push(`Expected price: ${state.desiredSellingPriceAed}`);
-    const rendered = summary.map(item => `• ${item}`).join('\n');
+    const rendered = summary.map((item) => `• ${item}`).join('\n');
     const messages: Record<ConversationLanguage, string> = {
-      en: `I have recorded the essential details${rendered ? `:\n${rendered}` : ''}. This is enough for an initial SHARH review.\n\nWhat would you like to do next?\n1. Submit for review\n2. Add more details\n3. Ask SHARH to contact me\n4. Continue on the SHARH website\n5. Save and continue later`,
-      ru: `Я зафиксировал основные данные${rendered ? `:\n${rendered}` : ''}. Этого достаточно для первичного рассмотрения SHARH.\n\nЧто вы хотите сделать дальше?\n1. Отправить на рассмотрение\n2. Добавить подробности\n3. Попросить SHARH связаться со мной\n4. Продолжить на сайте SHARH\n5. Сохранить и продолжить позже`,
-      ar: `تم تسجيل المعلومات الأساسية${rendered ? `:\n${rendered}` : ''}. وهي كافية للمراجعة الأولية من SHARH.\n\nما الخطوة التالية؟\n1. الإرسال للمراجعة\n2. إضافة تفاصيل\n3. طلب تواصل SHARH معي\n4. المتابعة على موقع SHARH\n5. الحفظ والمتابعة لاحقاً`,
+      en: `I have recorded the essential details${rendered ? `:\n${rendered}` : ''}. This is enough for an initial SHARH review. Would you like me to submit it for review, add more details, or send you the website link?`,
+      ru: `Я зафиксировал основные данные${rendered ? `:\n${rendered}` : ''}. Этого достаточно для первичного рассмотрения SHARH. Отправить запрос на рассмотрение, добавить подробности или прислать ссылку на сайт?`,
+      ar: `تم تسجيل المعلومات الأساسية${rendered ? `:\n${rendered}` : ''}. وهي كافية للمراجعة الأولية من SHARH. هل تريد إرسال الطلب للمراجعة أو إضافة تفاصيل أو الحصول على رابط الموقع؟`,
     };
     return messages[state.language];
   }
@@ -3169,9 +3138,9 @@ export class LeadCaptureService {
 
   private submissionConfirmed(language: ConversationLanguage): string {
     const messages: Record<ConversationLanguage, string> = {
-      en: 'Submitted for initial SHARH review. The team can see your WhatsApp conversation and the information already recorded. You may still add or change any detail here.',
-      ru: 'Запрос отправлен на первичное рассмотрение SHARH. Команда видит переписку WhatsApp и сохранённые данные. Здесь по-прежнему можно добавить или изменить любую информацию.',
-      ar: 'تم إرسال الطلب للمراجعة الأولية لدى SHARH. ويمكن للفريق الاطلاع على محادثة واتساب والمعلومات المسجلة. وما زال بإمكانك إضافة أو تعديل أي تفصيل هنا.',
+      en: 'Submitted for initial SHARH review. The SHARH team can now see the conversation and the information recorded. Automated replies are paused while the team reviews it.',
+      ru: 'Запрос отправлен на первичное рассмотрение SHARH. Команда видит переписку WhatsApp и сохранённые данные. Автоматические ответы приостановлены на время рассмотрения.',
+      ar: 'تم إرسال الطلب للمراجعة الأولية لدى SHARH. ويمكن للفريق الاطلاع على محادثة واتساب والمعلومات المسجلة. تم إيقاف الردود الآلية أثناء المراجعة.',
     };
     return messages[language];
   }
@@ -3190,14 +3159,6 @@ export class LeadCaptureService {
     return messages[language];
   }
 
-  private continueLaterMessage(language: ConversationLanguage): string {
-    const messages: Record<ConversationLanguage, string> = {
-      en: 'Saved. You can return to this chat at any time and write “resume”, “review”, or change any answer.',
-      ru: 'Сохранено. Вы можете вернуться в этот чат в любое время и написать «продолжить», «проверить ответы» или изменить любой ответ.',
-      ar: 'تم الحفظ. يمكنك العودة إلى هذه المحادثة في أي وقت وكتابة «تابع» أو «مراجعة» أو تغيير أي إجابة.',
-    };
-    return messages[language];
-  }
 
   private buyerSearchSavedMessage(language: ConversationLanguage): string {
     const messages: Record<ConversationLanguage, string> = {
@@ -3214,13 +3175,29 @@ export class LeadCaptureService {
     purpose?: LeadInquiryPurpose,
     isRetry: boolean = false
   ): string {
+    if (field === 'business_type' && purpose === 'selling') {
+      const prompts: Record<ConversationLanguage, string> = {
+        en: 'Please tell me briefly what the business does, where it is located, and the expected selling price. You can write everything naturally in one message, and approximate figures are fine.',
+        ru: 'Кратко расскажите, чем занимается бизнес, где он находится и какую цену продажи вы ожидаете. Можно написать всё одним сообщением, приблизительные цифры подходят.',
+        ar: 'أخبرني باختصار عن نشاط المشروع وموقعه وسعر البيع المتوقع. يمكنك كتابة كل المعلومات بشكل طبيعي في رسالة واحدة، والأرقام التقريبية مقبولة.',
+      };
+      return prompts[language];
+    }
+    if (field === 'business_type' && purpose === 'buying') {
+      const prompts: Record<ConversationLanguage, string> = {
+        en: 'What kind of business are you looking for? You can include the preferred location and maximum budget in the same message.',
+        ru: 'Какой бизнес вы ищете? В том же сообщении можно указать желаемую локацию и максимальный бюджет.',
+        ar: 'ما نوع المشروع الذي تبحث عنه؟ يمكنك إضافة الموقع المفضل والحد الأقصى للميزانية في الرسالة نفسها.',
+      };
+      return prompts[language];
+    }
     const questions: Record<ConversationLanguage, Partial<Record<LeadField, string>>> = {
       en: {
         business_type: 'What does the business do, or which sector interests you?',
-        business_location: 'In which emirate and area is the business located? Reply with a number or type the emirate and area.\n\n1. Dubai\n2. Abu Dhabi\n3. Sharjah\n4. Ajman\n5. Ras Al Khaimah\n6. Fujairah\n7. Umm Al Quwain\n8. Other',
-        annual_revenue_aed: 'What is the approximate annual revenue, monthly profit, or expected selling price? One useful figure is enough for the initial review.',
+        business_location: 'In which emirate and area is the business located?',
+        annual_revenue_aed: 'What was the approximate annual revenue over the last 12 months? You can say “unknown” if it is not available.',
         lease_details: 'Is the premises leased, and what are the monthly rent and remaining lease term?',
-        desired_selling_price_aed: 'What selling price or range do you expect? Reply with a number or type your own amount.\n\n1. Under AED 250,000\n2. AED 250,000–500,000\n3. AED 500,000–1,000,000\n4. AED 1,000,000–3,000,000\n5. AED 3,000,000+\n6. Suggest a SHARH range',
+        desired_selling_price_aed: 'What selling price or price range do you expect? An approximate amount is fine.',
         year_established: 'In which year was the business established?',
         employee_count: 'How many employees does the business have?',
         monthly_operating_expenses_aed: 'What are the approximate monthly operating expenses?',
@@ -3229,20 +3206,20 @@ export class LeadCaptureService {
         contracts_licenses: 'Which active licences, supplier agreements, or important contracts are in place?',
         sale_reason_urgency: 'Why are you selling, and what timing do you have in mind?',
         included_assets: 'What is included in the sale, such as equipment, inventory, brand, or licences?',
-        buyer_budget_aed: 'What budget range have you allocated? Reply with a number or type your own amount.\n\n1. Under AED 250,000\n2. AED 250,000–500,000\n3. AED 500,000–1,000,000\n4. AED 1,000,000–3,000,000\n5. AED 3,000,000+\n6. Other',
-        buyer_location: 'Which emirate or area would you consider, or what is your maximum budget? Either one is enough to start the search.\n\n1. Dubai\n2. Abu Dhabi\n3. Sharjah\n4. Ajman\n5. Ras Al Khaimah\n6. Fujairah\n7. Umm Al Quwain\n8. Other',
-        buyer_timeline: 'When would you like to complete an acquisition?\n\n1. Within 3 months\n2. Within 3–6 months\n3. Within 6–12 months\n4. Flexible / exploring',
-        buyer_involvement: 'How would you like to be involved?\n\n1. Operate the business personally\n2. Passive investment\n3. Open to either',
-        buyer_funding_status: 'How will the acquisition be funded?\n\n1. Funds available now\n2. Financing required\n3. Combination of own funds and financing',
+        buyer_budget_aed: 'What is your approximate maximum budget? You can also say that the budget is flexible.',
+        buyer_location: 'Which emirate or area would you consider? You can include your maximum budget in the same message.',
+        buyer_timeline: 'When would you ideally like to complete an acquisition?',
+        buyer_involvement: 'Would you prefer to operate the business personally, invest passively, or are you open to either?',
+        buyer_funding_status: 'How do you expect to fund the acquisition: available funds, financing, or a combination?',
         buyer_additional_comments: 'Are there any other requirements I should record?',
         contact_preference: 'Please send the name we should use and a convenient time for SHARH to contact you.',
       },
       ru: {
         business_type: 'Чем занимается бизнес или какая сфера вас интересует?',
-        business_location: 'В каком эмирате и районе находится бизнес? Ответьте номером или напишите эмират и район.\n\n1. Дубай\n2. Абу-Даби\n3. Шарджа\n4. Аджман\n5. Рас-эль-Хайма\n6. Фуджейра\n7. Умм-эль-Кайвайн\n8. Другой',
-        annual_revenue_aed: 'Какова примерная годовая выручка, ежемесячная прибыль или ожидаемая цена продажи? Для первичного рассмотрения достаточно одной полезной цифры.',
+        business_location: 'В каком эмирате и районе находится бизнес?',
+        annual_revenue_aed: 'Какова примерная годовая выручка за последние 12 месяцев? Если данных нет, можно написать «не знаю».',
         lease_details: 'Помещение арендуется, и если да, какова месячная аренда и оставшийся срок договора?',
-        desired_selling_price_aed: 'Какую цену продажи или диапазон вы ожидаете? Ответьте номером или укажите свою сумму.\n\n1. До 250 000 AED\n2. 250 000–500 000 AED\n3. 500 000–1 000 000 AED\n4. 1 000 000–3 000 000 AED\n5. Более 3 000 000 AED\n6. Предложить диапазон SHARH',
+        desired_selling_price_aed: 'Какую цену продажи или диапазон вы ожидаете? Приблизительной суммы достаточно.',
         year_established: 'В каком году был основан бизнес?',
         employee_count: 'Сколько сотрудников работает в бизнесе?',
         monthly_operating_expenses_aed: 'Каковы примерные ежемесячные операционные расходы?',
@@ -3251,20 +3228,20 @@ export class LeadCaptureService {
         contracts_licenses: 'Какие действующие лицензии, договоры с поставщиками или важные контракты есть у бизнеса?',
         sale_reason_urgency: 'Почему вы продаёте бизнес и в какие сроки хотите завершить сделку?',
         included_assets: 'Что входит в продажу: оборудование, запасы, бренд, лицензии или другие активы?',
-        buyer_budget_aed: 'Какой диапазон бюджета вы предусмотрели? Ответьте номером или укажите свою сумму.\n\n1. До 250 000 AED\n2. 250 000–500 000 AED\n3. 500 000–1 000 000 AED\n4. 1 000 000–3 000 000 AED\n5. Более 3 000 000 AED\n6. Другой',
-        buyer_location: 'Какой эмират или район вы рассматриваете либо каков максимальный бюджет? Для начала поиска достаточно одного из этих критериев.\n\n1. Дубай\n2. Абу-Даби\n3. Шарджа\n4. Аджман\n5. Рас-эль-Хайма\n6. Фуджейра\n7. Умм-эль-Кайвайн\n8. Другой',
-        buyer_timeline: 'Когда вы хотели бы завершить покупку?\n\n1. В течение 3 месяцев\n2. Через 3–6 месяцев\n3. Через 6–12 месяцев\n4. Гибко / пока изучаю варианты',
-        buyer_involvement: 'Как вы хотите участвовать в бизнесе?\n\n1. Управлять лично\n2. Пассивная инвестиция\n3. Рассматриваю оба варианта',
-        buyer_funding_status: 'Как будет финансироваться покупка?\n\n1. Средства уже доступны\n2. Требуется финансирование\n3. Собственные средства и финансирование',
+        buyer_budget_aed: 'Каков ваш примерный максимальный бюджет? Можно также указать, что бюджет гибкий.',
+        buyer_location: 'Какой эмират или район вы рассматриваете? В том же сообщении можно указать максимальный бюджет.',
+        buyer_timeline: 'Когда вы хотели бы завершить покупку? Можно ответить своими словами, например: в течение 3 месяцев или пока просто изучаю варианты.',
+        buyer_involvement: 'Как вы хотите участвовать в бизнесе: управлять лично, инвестировать пассивно или рассматриваете оба варианта?',
+        buyer_funding_status: 'Как вы планируете финансировать покупку: собственными средствами, финансированием или их комбинацией?',
         buyer_additional_comments: 'Есть ли другие требования, которые нужно зафиксировать?',
         contact_preference: 'Напишите, пожалуйста, как к вам обращаться и в какое время удобно связаться.',
       },
       ar: {
         business_type: 'ما نشاط المشروع أو القطاع الذي تهتم به؟',
-        business_location: 'في أي إمارة ومنطقة يقع المشروع؟ أجب برقم أو اكتب الإمارة والمنطقة.\n\n1. دبي\n2. أبوظبي\n3. الشارقة\n4. عجمان\n5. رأس الخيمة\n6. الفجيرة\n7. أم القيوين\n8. أخرى',
-        annual_revenue_aed: 'ما الإيرادات السنوية التقريبية أو الربح الشهري أو سعر البيع المتوقع؟ يكفي رقم واحد مفيد للمراجعة الأولية.',
+        business_location: 'في أي إمارة ومنطقة يقع المشروع؟',
+        annual_revenue_aed: 'ما الإيرادات السنوية التقريبية خلال آخر 12 شهراً؟ يمكنك قول «غير معروف» إذا لم تتوفر البيانات.',
         lease_details: 'هل الموقع مستأجر، وما قيمة الإيجار الشهري والمدة المتبقية في العقد؟',
-        desired_selling_price_aed: 'ما سعر البيع أو النطاق السعري المتوقع؟ أجب برقم أو اكتب المبلغ.\n\n1. أقل من 250,000 درهم\n2. 250,000–500,000 درهم\n3. 500,000–1,000,000 درهم\n4. 1,000,000–3,000,000 درهم\n5. أكثر من 3,000,000 درهم\n6. اقتراح نطاق من SHARH',
+        desired_selling_price_aed: 'ما سعر البيع أو النطاق السعري المتوقع؟ يكفي مبلغ تقريبي.',
         year_established: 'في أي سنة تأسس المشروع؟',
         employee_count: 'كم عدد الموظفين في المشروع؟',
         monthly_operating_expenses_aed: 'ما المصاريف التشغيلية الشهرية التقريبية؟',
@@ -3273,37 +3250,15 @@ export class LeadCaptureService {
         contracts_licenses: 'ما التراخيص والعقود المهمة أو اتفاقيات الموردين السارية؟',
         sale_reason_urgency: 'ما سبب البيع وما الإطار الزمني المطلوب لإتمام الصفقة؟',
         included_assets: 'ما الذي يشمله البيع، مثل المعدات أو المخزون أو العلامة التجارية أو التراخيص؟',
-        buyer_budget_aed: 'ما نطاق الميزانية المخصص؟ أجب برقم أو اكتب المبلغ.\n\n1. أقل من 250,000 درهم\n2. 250,000–500,000 درهم\n3. 500,000–1,000,000 درهم\n4. 1,000,000–3,000,000 درهم\n5. أكثر من 3,000,000 درهم\n6. أخرى',
-        buyer_location: 'ما الإمارة أو المنطقة التي تفضلها، أو ما الحد الأقصى لميزانيتك؟ يكفي أحدهما لبدء البحث.\n\n1. دبي\n2. أبوظبي\n3. الشارقة\n4. عجمان\n5. رأس الخيمة\n6. الفجيرة\n7. أم القيوين\n8. أخرى',
-        buyer_timeline: 'متى ترغب في إتمام عملية الاستحواذ؟\n\n1. خلال 3 أشهر\n2. خلال 3–6 أشهر\n3. خلال 6–12 شهراً\n4. مرن / ما زلت أستكشف',
-        buyer_involvement: 'كيف تريد المشاركة في المشروع؟\n\n1. إدارته شخصياً\n2. استثمار سلبي\n3. منفتح على الخيارين',
-        buyer_funding_status: 'كيف سيتم تمويل الاستحواذ؟\n\n1. الأموال متاحة الآن\n2. التمويل مطلوب\n3. مزيج من الأموال الذاتية والتمويل',
+        buyer_budget_aed: 'ما الحد الأقصى التقريبي لميزانيتك؟ ويمكنك أيضاً القول إن الميزانية مرنة.',
+        buyer_location: 'ما الإمارة أو المنطقة التي تفضلها؟ يمكنك أيضاً ذكر الحد الأقصى للميزانية في الرسالة نفسها.',
+        buyer_timeline: 'متى ترغب في إتمام عملية الاستحواذ؟ يمكنك الإجابة بطريقتك، مثل خلال ثلاثة أشهر أو أن الوقت مرن.',
+        buyer_involvement: 'كيف تريد المشاركة في المشروع: إدارته شخصياً أم استثماراً سلبياً أم أنك منفتح على الخيارين؟',
+        buyer_funding_status: 'كيف تخطط لتمويل الاستحواذ: أموال متاحة أم تمويل أم مزيج منهما؟',
         buyer_additional_comments: 'هل توجد متطلبات أخرى تريد تسجيلها؟',
         contact_preference: 'أرسل الاسم الذي نستخدمه والوقت المناسب لتواصل SHARH معك.',
       },
     };
-    if (field === 'business_type') {
-      const purposeQuestions: Record<ConversationLanguage, Record<LeadInquiryPurpose, string>> = {
-        en: {
-          selling: 'Please tell me briefly about the business you want to sell. You can include what it does, emirate and area, approximate annual revenue or profit, and expected selling price in one message. Approximate figures are fine.',
-          buying: 'What type of business are you looking for? You can include the preferred emirate or area and maximum budget in the same message—for example, “a salon in Dubai under AED 500,000”.',
-        },
-        ru: {
-          selling: 'Кратко расскажите о бизнесе, который хотите продать. Одним сообщением можно указать деятельность, эмират и район, примерную годовую выручку или прибыль и ожидаемую цену. Приблизительных данных достаточно.',
-          buying: 'Какой бизнес вы хотите купить? Одним сообщением можно указать сферу, эмират или район и максимальный бюджет, например: «салон в Дубае до 500 000 AED».',
-        },
-        ar: {
-          selling: 'أخبرني باختصار عن المشروع الذي تريد بيعه. يمكنك ذكر النشاط والإمارة والمنطقة والإيرادات أو الربح التقريبي وسعر البيع المتوقع في رسالة واحدة. الأرقام التقريبية كافية.',
-          buying: 'ما نوع المشروع الذي تبحث عنه؟ يمكنك ذكر الإمارة أو المنطقة والحد الأقصى للميزانية في الرسالة نفسها، مثل: «صالون في دبي بأقل من 500,000 درهم».',
-        },
-      };
-      if (purpose) {
-        const base = purposeQuestions[language][purpose];
-        return isRetry
-          ? `${this.retryPrefix(language)} ${base}`
-          : base;
-      }
-    }
     const base = questions[language][field] || questions.en[field] || 'Please provide the requested information.';
     return isRetry ? `${this.retryPrefix(language)} ${base}` : base;
   }
@@ -3430,10 +3385,7 @@ export class LeadCaptureService {
 • We connect sellers with serious buyers from our network.
 • ${SHARH_FEE_TERMS.en}
 
-Do you agree and wish to proceed?
-1. Yes, continue
-2. I have a question
-3. Ask SHARH to contact me`,
+Do you agree and wish to proceed?`,
         ask_terms_acceptance: 'Do you agree to the SHARH confidentiality, process, and commission terms?',
         terms_declined:
           'Understood. Which part of the terms would you like clarified?',
@@ -3454,10 +3406,7 @@ Do you agree and wish to proceed?
 • Мы связываем продавцов с серьёзными покупателями из нашей сети.
 • ${SHARH_FEE_TERMS.ru}
 
-Вы согласны и хотите продолжить?
-1. Да, продолжить
-2. У меня есть вопрос
-3. Попросить SHARH связаться со мной`,
+Вы согласны и хотите продолжить?`,
         ask_terms_acceptance:
           'Вы согласны с условиями SHARH по конфиденциальности, процессу и комиссии?',
         terms_declined: 'Понял. Какую часть условий нужно уточнить?',
@@ -3478,10 +3427,7 @@ Do you agree and wish to proceed?
 • نربط البائعين بمشترين جادين من شبكتنا.
 • ${SHARH_FEE_TERMS.ar}
 
-هل توافق وترغب في المتابعة؟
-1. نعم، تابع
-2. لدي سؤال
-3. اطلب من SHARH التواصل معي`,
+هل توافق وترغب في المتابعة؟`,
         ask_terms_acceptance:
           'هل توافق على شروط SHARH المتعلقة بالسرية والإجراءات والعمولة؟',
         terms_declined: 'مفهوم. أي جزء من الشروط تريد توضيحه؟',
