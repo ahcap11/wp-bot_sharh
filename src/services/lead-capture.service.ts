@@ -10,7 +10,8 @@ import type {
 } from './sales-message-intelligence.types';
 
 const PERSISTENCE_NAMESPACE = 'leadStates';
-const STATE_VERSION = 11;
+const STATE_VERSION = 13;
+const REENTRY_REPEAT_WINDOW_MS = 30 * 60 * 1000;
 const MAX_PROCESSED_MESSAGE_IDS = 500;
 
 export type LeadInquiryPurpose = 'buying' | 'selling';
@@ -129,6 +130,7 @@ export interface NavigationResult {
   handled: boolean;
   response?: string | undefined;
   resetAiUsage?: boolean | undefined;
+  restartConfirmed?: boolean | undefined;
   continueFunnel?: boolean | undefined;
   action?: 'back' | 'change' | 'review' | 'restart' | 'switch' | 'pause' | 'resume' | 'help' | undefined;
 }
@@ -194,6 +196,11 @@ interface LeadCaptureState {
   priceGuidanceCount: number;
   paused: boolean;
   pendingRestartConfirmation: boolean;
+  lastUserMessageAt?: number | undefined;
+  lastReentryPromptAt?: number | undefined;
+  awaitingReentryChoice: boolean;
+  reentryPromptCount: number;
+  activeCaseStartedAt?: number | undefined;
   messageCount: number;
   processedMessageIds: Set<string>;
 }
@@ -329,6 +336,7 @@ export class LeadCaptureService {
 
       const initial = this.createInitialState();
       const restoredStatus = this.normalizeLegacyStatus(serialized);
+      const migratedFromOlderFlow = (serialized.version || 0) < STATE_VERSION;
       const restored: LeadCaptureState = {
         ...initial,
         ...serialized,
@@ -349,10 +357,14 @@ export class LeadCaptureService {
           serialized.pendingNoticeSent ||
           false,
         qualificationNoticeSent:
+          (migratedFromOlderFlow && restoredStatus === 'qualified') ||
           serialized.qualificationNoticeSent ||
           serialized.closingMessageSent ||
           Boolean(serialized.reviewNoticeSent && restoredStatus === 'qualified') ||
           false,
+        awaitingReentryChoice: false,
+        reentryPromptCount: 0,
+        lastReentryPromptAt: undefined,
         objectionsDetected: serialized.objectionsDetected || [],
         promptRepeatCount: serialized.promptRepeatCount || 0,
         invalidAttempts: serialized.invalidAttempts || {},
@@ -428,11 +440,15 @@ export class LeadCaptureService {
     state.processedMessageIds.add(message.id);
     this.trimProcessedMessageIds(state);
     state.messageCount += 1;
+    state.lastUserMessageAt = Date.now();
     if (state.status === 'new') {
       state.status = 'contacted';
     }
     const fieldsUpdated: string[] = [];
     const normalizedContent = this.normalizeWhitespace(message.content);
+    if (!this.isGreeting(normalizedContent)) {
+      state.awaitingReentryChoice = false;
+    }
 
     const interpretedLanguage =
       interpretation && interpretation.confidence >= 0.65
@@ -1060,6 +1076,14 @@ export class LeadCaptureService {
     return this.buildRecord(chatId, synthetic, state, []);
   }
 
+  isRestartRecoveryCommand(chatId: string, rawContent: string): boolean {
+    const content = this.normalizeWhitespace(rawContent).toLowerCase();
+    const state = this.leadStates.get(chatId);
+    if (this.isStartOverCommand(content)) return true;
+    if (!state?.pendingRestartConfirmation) return false;
+    return /^(?:yes|yes start over|confirm|1|no|cancel|2|да|подтверждаю|нет|отмена|نعم|تأكيد|لا|إلغاء)$/iu.test(content);
+  }
+
   handleNavigationCommand(chatId: string, rawContent: string): NavigationResult {
     const content = this.normalizeWhitespace(rawContent);
     const lower = content.toLowerCase();
@@ -1080,6 +1104,7 @@ export class LeadCaptureService {
           handled: true,
           response: this.navigationPrefix(language, 'restart_done', directive.directResponse),
           resetAiUsage: true,
+          restartConfirmed: true,
           continueFunnel: true,
           action: 'restart',
         };
@@ -1095,7 +1120,7 @@ export class LeadCaptureService {
       }
     }
 
-    if (/^(?:start over|start all over again|start again|begin again|restart|reset|clear everything|начать заново|начать сначала|перезапустить|ابدأ من جديد|إعادة البدء)$/iu.test(lower)) {
+    if (this.isStartOverCommand(lower)) {
       state.pendingRestartConfirmation = true;
       this.persist(chatId);
       return {
@@ -1152,6 +1177,80 @@ export class LeadCaptureService {
         continueFunnel: true,
         action: 'help',
       };
+    }
+
+    const previousUserMessageAt = state.lastUserMessageAt;
+    const now = Date.now();
+    state.lastUserMessageAt = now;
+
+    if (state.status === 'qualified') {
+      const newCasePurpose = this.detectNewCasePurpose(lower, state.awaitingReentryChoice);
+      if (newCasePurpose) {
+        const language = state.language;
+        this.beginSeparateCase(state, newCasePurpose);
+        this.persist(chatId);
+        const directive = this.getDirective(chatId);
+        return {
+          handled: true,
+          response: this.newCasePrefix(language, newCasePurpose, directive.directResponse),
+          resetAiUsage: true,
+          restartConfirmed: true,
+          continueFunnel: true,
+          action: 'switch',
+        };
+      }
+
+      if (this.isNewRequestCommand(lower)) {
+        state.awaitingReentryChoice = true;
+        state.lastReentryPromptAt = now;
+        state.reentryPromptCount += 1;
+        this.persist(chatId);
+        return {
+          handled: true,
+          response: this.newRequestDisambiguation(state.language),
+          action: 'help',
+        };
+      }
+
+      if (this.isGreeting(content)) {
+        const recentlyPrompted = Boolean(
+          state.lastReentryPromptAt && now - state.lastReentryPromptAt < REENTRY_REPEAT_WINDOW_MS
+        );
+        state.awaitingReentryChoice = true;
+        state.lastReentryPromptAt = now;
+        state.reentryPromptCount += 1;
+        this.persist(chatId);
+        return {
+          handled: true,
+          response: recentlyPrompted
+            ? this.shortReentryPrompt(state)
+            : this.contextualReentryPrompt(state),
+          action: 'help',
+        };
+      }
+
+      if (state.awaitingReentryChoice && this.isCurrentCaseReference(lower)) {
+        state.awaitingReentryChoice = false;
+        this.persist(chatId);
+        return {
+          handled: true,
+          response: this.currentCaseStatus(state),
+          action: 'review',
+        };
+      }
+
+      if (
+        this.isCurrentCaseStatusQuestion(lower) ||
+        (previousUserMessageAt && now - previousUserMessageAt > REENTRY_REPEAT_WINDOW_MS && this.isVagueHelpRequest(lower))
+      ) {
+        state.awaitingReentryChoice = false;
+        this.persist(chatId);
+        return {
+          handled: true,
+          response: this.currentCaseStatus(state),
+          action: 'review',
+        };
+      }
     }
 
     if (state.status === 'qualified' && state.inquiryPurpose === 'selling') {
@@ -1501,7 +1600,7 @@ export class LeadCaptureService {
     add('Price / budget', state.desiredSellingPriceAed || state.buyerBudgetAed);
     add('Profit', state.monthlyNetProfitAed);
     add('Timeline', state.buyerTimeline || state.saleReasonUrgency);
-    return `Your current answers:\n${rows.length ? rows.join('\n') : 'Nothing has been saved yet.'}\n\nYou can say “change revenue”, “back”, or “start over”.`;
+    return `Your current answers:\n${rows.length ? rows.join('\n') : 'Nothing has been saved yet.'}\n\nYou can say “change revenue”, “back”, or “new request”.`;
   }
 
   private buildChangeHelp(state: LeadCaptureState): string {
@@ -1553,9 +1652,9 @@ export class LeadCaptureService {
         restart_confirm: 'Starting over will clear the active answers in this chat, while the conversation history remains recorded. Should I start over?',
         restart_cancelled: 'Start-over cancelled. Your current answers are unchanged.',
         paused: 'Paused. Your progress is saved. Reply “resume” whenever you want to continue.',
-        still_paused: 'This request is paused. Reply “resume”, “review”, or “start over”.',
+        still_paused: 'This request is paused. Reply “resume” or “review”.',
         nothing_to_go_back: 'There is no earlier completed answer to return to. You can review your answers or continue.',
-        help: 'Available controls: back, change [answer], review, start over, switch to buying/selling, pause, and resume.',
+        help: 'Available controls: back, change [answer], review, new request, switch to buying/selling, pause, and resume.',
       },
       ru: {
         restart_confirm: 'Начать заново означает очистить активные ответы в этом чате, при этом история переписки сохранится. Начать заново?',
@@ -1571,7 +1670,7 @@ export class LeadCaptureService {
         paused: 'تم إيقاف الطلب مؤقتاً وحفظ تقدمك. اكتب «تابع» عندما تريد المتابعة.',
         still_paused: 'الطلب متوقف مؤقتاً. اكتب «تابع» أو «مراجعة» أو «ابدأ من جديد».',
         nothing_to_go_back: 'لا توجد إجابة مكتملة سابقة للرجوع إليها. يمكنك مراجعة الإجابات أو المتابعة.',
-        help: 'الأوامر المتاحة: الرجوع، تغيير [إجابة]، مراجعة، ابدأ من جديد، التحويل إلى شراء/بيع، توقف، وتابع.',
+        help: 'الأوامر المتاحة: الرجوع، تغيير [إجابة]، مراجعة، طلب جديد، التحويل إلى شراء/بيع، توقف، وتابع.',
       },
     };
     return messages[language][key] || messages.en[key] || '';
@@ -1606,6 +1705,9 @@ export class LeadCaptureService {
       continueLater: false,
       paused: false,
       pendingRestartConfirmation: false,
+      awaitingReentryChoice: false,
+      reentryPromptCount: 0,
+      activeCaseStartedAt: Date.now(),
       messageCount: 0,
       processedMessageIds: new Set<string>(),
     };
@@ -2895,7 +2997,14 @@ export class LeadCaptureService {
   }
 
   private extractPhoneFromJid(jid: string): string | null {
-    return this.normalizePhoneNumber(jid.split('@')[0] || '');
+    const trimmed = jid.trim();
+    const separator = trimmed.indexOf('@');
+    if (separator >= 0) {
+      const domain = trimmed.slice(separator + 1).toLowerCase();
+      if (domain !== 's.whatsapp.net') return null;
+      return this.normalizePhoneNumber(trimmed.slice(0, separator));
+    }
+    return this.normalizePhoneNumber(trimmed);
   }
 
   private normalizePhoneNumber(value: string): string | null {
@@ -3059,6 +3168,171 @@ export class LeadCaptureService {
     return typeof value === 'string' ? value.trim().length > 0 : value != null;
   }
 
+  private isStartOverCommand(value: string): boolean {
+    const normalized = this.normalizeWhitespace(value.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' '));
+    if (/^(?:start over|start all over again|start again|begin again|restart|reset|clear everything|начать заново|начать сначала|перезапустить|ابدأ من جديد|إعادة البدء)$/iu.test(normalized)) {
+      return true;
+    }
+    // Tolerate short command typos such as “start pver” without applying fuzzy
+    // matching to normal conversational sentences.
+    if (normalized.length >= 7 && normalized.length <= 12 && normalized.startsWith('start ')) {
+      return this.editDistance(normalized, 'start over') <= 2;
+    }
+    return false;
+  }
+
+  private editDistance(left: string, right: string): number {
+    const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+    for (let i = 1; i <= left.length; i += 1) {
+      let diagonal = previous[0] ?? 0;
+      previous[0] = i;
+      for (let j = 1; j <= right.length; j += 1) {
+        const above = previous[j] ?? j;
+        const candidate = Math.min(
+          (previous[j - 1] ?? i) + 1,
+          above + 1,
+          diagonal + (left[i - 1] === right[j - 1] ? 0 : 1)
+        );
+        diagonal = above;
+        previous[j] = candidate;
+      }
+    }
+    return previous[right.length] ?? Math.max(left.length, right.length);
+  }
+
+  private isGreeting(value: string): boolean {
+    const normalized = this.normalizeWhitespace(value.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' '));
+    return /^(?:hi|hello|hey|salam|assalamu alaikum|good morning|good afternoon|good evening|привет|здравствуйте|добрый день|добрый вечер|салам|مرحبا|السلام عليكم|أهلا)$/iu.test(normalized);
+  }
+
+  private isNewRequestCommand(value: string): boolean {
+    return /^(?:new request|another request|new case|another case|i have another one|новый запрос|другой запрос|ещё один запрос|طلب جديد|طلب آخر)$/iu.test(value);
+  }
+
+  private detectNewCasePurpose(value: string, awaitingChoice: boolean): LeadInquiryPurpose | null {
+    const buying =
+      /\b(?:i\s+(?:want|would like|need|plan)\s+to|looking\s+to|interested\s+to)\s+(?:buy|purchase|acquire)\b/iu.test(value) ||
+      /\b(?:another|new)\s+(?:buyer|buying|acquisition)\s+(?:request|case)?\b/iu.test(value) ||
+      /(?:хочу|нужно|планирую)\s+(?:купить|приобрести)|новый запрос на покупку/iu.test(value) ||
+      /(?:أريد|أرغب)\s+(?:شراء|الاستحواذ)|طلب شراء جديد/u.test(value) ||
+      (awaitingChoice && /^(?:buy|buying|buyer|purchase|покупка|купить|شراء)$/iu.test(value));
+    if (buying) return 'buying';
+
+    const selling =
+      /\b(?:i\s+(?:also\s+)?(?:have|want|would like|need|plan)\s+to|looking\s+to)\s+(?:sell|list)\b/iu.test(value) ||
+      /\bi\s+(?:also\s+)?have\s+.{1,80}\bto\s+(?:sell|list)\b/iu.test(value) ||
+      /\b(?:another|new|different)\s+(?:business|company|seller|selling)\b.*\b(?:sell|request|case)?\b/iu.test(value) ||
+      /\b(?:sell|selling|list)\b.*\b(?:another|new|different)\s+(?:business|company|one)\b/iu.test(value) ||
+      /(?:хочу|нужно|планирую)\s+продать|ещ[ёе] один бизнес|новый запрос на продажу/iu.test(value) ||
+      /(?:أريد|أرغب)\s+بيع|مشروع آخر للبيع|طلب بيع جديد/u.test(value) ||
+      (awaitingChoice && /^(?:sell|selling|seller|продажа|продать|بيع)$/iu.test(value));
+    return selling ? 'selling' : null;
+  }
+
+  private isCurrentCaseReference(value: string): boolean {
+    return /^(?:this|that|current|existing|same|my request|the request|about it|first one|этот|текущий|мой запрос|о н[её]м|тот же|هذا|الطلب الحالي|طلبي)$/iu.test(value);
+  }
+
+  private isCurrentCaseStatusQuestion(value: string): boolean {
+    return /(?:what(?:'s| is) happening|what now|status|progress|any update|what happened|my request|submitted request|что с моим запросом|какой статус|есть новости|что дальше|حالة طلبي|ماذا حدث|ما التالي)/iu.test(value);
+  }
+
+  private isVagueHelpRequest(value: string): boolean {
+    return /^(?:help|i need help|can you help|what can i do|помоги|нужна помощь|что делать|ساعدني|أحتاج مساعدة)$/iu.test(value);
+  }
+
+  private beginSeparateCase(state: LeadCaptureState, purpose: LeadInquiryPurpose): void {
+    const language = state.language;
+    const phone = state.clientPhone;
+    const name = state.clientName;
+    const fresh = this.createInitialState();
+    fresh.language = language;
+    fresh.clientPhone = phone;
+    fresh.clientName = name;
+    fresh.inquiryPurpose = purpose;
+    fresh.entryType = purpose === 'selling' ? 'seller_inbound' : 'buyer_inbound';
+    fresh.status = 'contacted';
+    fresh.stage = name ? 'identity_collected' : 'intent_identified';
+    fresh.activeCaseStartedAt = Date.now();
+    for (const key of Object.keys(state) as Array<keyof LeadCaptureState>) {
+      Reflect.deleteProperty(state, key);
+    }
+    Object.assign(state, fresh);
+  }
+
+  private currentCaseLabel(state: LeadCaptureState): string {
+    if (state.businessType) return state.businessType;
+    return state.inquiryPurpose === 'buying' ? 'buyer search' : 'seller request';
+  }
+
+  private contextualReentryPrompt(state: LeadCaptureState): string {
+    const name = state.clientName ? `, ${state.clientName}` : '';
+    const label = this.currentCaseLabel(state);
+    const messages: Record<ConversationLanguage, string> = {
+      en: `Hello${name}. Your ${label} request is saved with SHARH. Are you asking about that request, selling another business, or looking to buy?`,
+      ru: `Здравствуйте${name}. Ваш запрос «${label}» сохранён в SHARH. Вы хотите уточнить этот запрос, продать другой бизнес или подобрать бизнес для покупки?`,
+      ar: `مرحباً${name}. طلب ${label} محفوظ لدى SHARH. هل تسأل عن هذا الطلب، أم تريد بيع مشروع آخر، أم تبحث عن مشروع للشراء؟`,
+    };
+    return messages[state.language];
+  }
+
+  private shortReentryPrompt(state: LeadCaptureState): string {
+    const messages: Record<ConversationLanguage, string> = {
+      en: 'How can I help with your SHARH request?',
+      ru: 'Чем помочь по вашему запросу в SHARH?',
+      ar: 'كيف يمكنني مساعدتك بخصوص طلبك لدى SHARH؟',
+    };
+    return messages[state.language];
+  }
+
+  private currentCaseStatus(state: LeadCaptureState): string {
+    const label = this.currentCaseLabel(state);
+    const submitted = state.submittedForReview;
+    const messages: Record<ConversationLanguage, string> = {
+      en: submitted
+        ? `Your ${label} request has been submitted for initial SHARH review. You can update any detail here, add more information, or start a separate buyer or seller request.`
+        : `Your ${label} request is saved. You can update it, add more information, submit it for review, or start a separate request.`,
+      ru: submitted
+        ? `Запрос «${label}» отправлен на первичное рассмотрение SHARH. Здесь можно изменить данные, добавить информацию или создать отдельный запрос на покупку или продажу.`
+        : `Запрос «${label}» сохранён. Можно изменить или дополнить его, отправить на рассмотрение либо создать отдельный запрос.`,
+      ar: submitted
+        ? `تم إرسال طلب ${label} للمراجعة الأولية لدى SHARH. يمكنك تحديث أي معلومة أو إضافة تفاصيل أو بدء طلب شراء أو بيع منفصل.`
+        : `تم حفظ طلب ${label}. يمكنك تحديثه أو إضافة معلومات أو إرساله للمراجعة أو بدء طلب منفصل.`,
+    };
+    return messages[state.language];
+  }
+
+  private newRequestDisambiguation(language: ConversationLanguage): string {
+    const messages: Record<ConversationLanguage, string> = {
+      en: 'Is the new request for selling another business or buying a business?',
+      ru: 'Новый запрос — на продажу другого бизнеса или на покупку бизнеса?',
+      ar: 'هل الطلب الجديد لبيع مشروع آخر أم لشراء مشروع؟',
+    };
+    return messages[language];
+  }
+
+  private newCasePrefix(
+    language: ConversationLanguage,
+    purpose: LeadInquiryPurpose,
+    next?: string
+  ): string {
+    const prefixes: Record<ConversationLanguage, Record<LeadInquiryPurpose, string>> = {
+      en: {
+        selling: 'Understood. I will keep the previous request and create a separate seller request.',
+        buying: 'Understood. I will keep the previous request and create a separate buyer search.',
+      },
+      ru: {
+        selling: 'Понял. Предыдущий запрос сохранится, а для другого бизнеса будет создан отдельный запрос на продажу.',
+        buying: 'Понял. Предыдущий запрос сохранится, а для покупки будет создан отдельный запрос.',
+      },
+      ar: {
+        selling: 'مفهوم. سأحتفظ بالطلب السابق وأنشئ طلب بيع منفصلاً.',
+        buying: 'مفهوم. سأحتفظ بالطلب السابق وأنشئ طلب شراء منفصلاً.',
+      },
+    };
+    return [prefixes[language][purpose], next].filter(Boolean).join('\n\n');
+  }
+
   private detectExplicitLanguageSwitch(value: string): ConversationLanguage | null {
     if (/^(?:speak|continue|reply|answer in|use)?\s*english(?:\s+please)?$/iu.test(value) || /(?:speak|continue|reply|answer).{0,20}english/iu.test(value)) {
       return 'en';
@@ -3138,9 +3412,9 @@ export class LeadCaptureService {
 
   private submissionConfirmed(language: ConversationLanguage): string {
     const messages: Record<ConversationLanguage, string> = {
-      en: 'Submitted for initial SHARH review. The SHARH team can now see the conversation and the information recorded. Automated replies are paused while the team reviews it.',
-      ru: 'Запрос отправлен на первичное рассмотрение SHARH. Команда видит переписку WhatsApp и сохранённые данные. Автоматические ответы приостановлены на время рассмотрения.',
-      ar: 'تم إرسال الطلب للمراجعة الأولية لدى SHARH. ويمكن للفريق الاطلاع على محادثة واتساب والمعلومات المسجلة. تم إيقاف الردود الآلية أثناء المراجعة.',
+      en: 'Submitted for initial SHARH review. The SHARH team can now see the conversation and the information recorded. I can still help you update this request or start a separate one.',
+      ru: 'Запрос отправлен на первичное рассмотрение SHARH. Команда видит переписку WhatsApp и сохранённые данные. Я по-прежнему могу помочь обновить этот запрос или создать отдельный.',
+      ar: 'تم إرسال الطلب للمراجعة الأولية لدى SHARH. ويمكن للفريق الاطلاع على محادثة واتساب والمعلومات المسجلة. ما زلت أستطيع مساعدتك في تحديث الطلب أو بدء طلب منفصل.',
     };
     return messages[language];
   }

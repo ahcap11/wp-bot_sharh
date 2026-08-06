@@ -71,6 +71,7 @@ export class ChatbotService {
   private readonly buyerMatchFingerprints: Map<string, string> = new Map();
   private readonly buyerListingCodes: Map<string, string[]> = new Map();
   private readonly adminOutboxSent: Map<string, string> = new Map();
+  private readonly pendingConversationResets: Set<string> = new Set();
   private adminOutboxTimer: ReturnType<typeof setInterval> | null = null;
   private adminOutboxProcessing = false;
 
@@ -466,15 +467,41 @@ export class ChatbotService {
       );
 
       // Admin control is authoritative. Incoming messages are still persisted,
-      // but a paused, manually owned, review-owned, or closed conversation must
-      // not spend AI credits or send an automated reply.
-      const control = this.sharhApiService?.isEnabled()
+      // but only an explicit admin pause, takeover, or close may suppress the bot.
+      // Review-queue membership never changes conversation ownership.
+      let control = this.sharhApiService?.isEnabled()
         ? await this.sharhApiService.getConversationControl(
             chatId,
             incomingMessage.from
           )
         : null;
-      if (control?.found && (!control.botEnabled || control.owner !== 'bot')) {
+
+      if (
+        this.pendingConversationResets.has(chatId) &&
+        control?.found &&
+        !['paused', 'human', 'closed'].includes(control.controlMode)
+      ) {
+        const released =
+          (await this.sharhApiService?.restartConversationForUser(
+            chatId,
+            incomingMessage.from
+          )) ?? false;
+        if (released) {
+          this.pendingConversationResets.delete(chatId);
+          control = {
+            ...control,
+            botEnabled: true,
+            owner: 'bot',
+            controlMode: 'bot',
+            reviewRequired: false,
+          };
+        }
+      }
+
+      if (
+        control?.found &&
+        (!control.botEnabled || control.owner !== 'bot')
+      ) {
         logger.info('Bot reply suppressed by SHARH conversation control', {
           chatId,
           owner: control.owner,
@@ -858,6 +885,20 @@ export class ChatbotService {
           this.persistence?.removeItem(BUYER_MATCHES_NAMESPACE, chatId);
           this.buyerListingCodes.delete(chatId);
           this.persistence?.removeItem(BUYER_LISTING_CODES_NAMESPACE, chatId);
+        }
+        if (navigation.restartConfirmed && this.sharhApiService?.isEnabled()) {
+          const released = await this.sharhApiService.restartConversationForUser(
+            chatId,
+            message.from
+          );
+          if (released) {
+            this.pendingConversationResets.delete(chatId);
+          } else {
+            this.pendingConversationResets.add(chatId);
+            logger.warn('Conversation restart saved locally but SHARH review control release is pending', {
+              chatId,
+            });
+          }
         }
         const record = this.leadCaptureService.getCurrentRecord(chatId) || undefined;
         if (record?.inquiryPurpose) {
@@ -1528,11 +1569,18 @@ export class ChatbotService {
     }
 
     if (record?.status === 'qualified') {
+      if (record.inquiryPurpose === 'selling') {
+        return record.language === 'ru'
+          ? 'Ваш запрос на продажу сохранён в SHARH. Можно изменить данные, добавить подробности, отправить его на рассмотрение или создать отдельный запрос.'
+          : record.language === 'ar'
+            ? 'تم حفظ طلب البيع لدى SHARH. يمكنك تحديث المعلومات أو إضافة تفاصيل أو إرساله للمراجعة أو بدء طلب منفصل.'
+            : 'Your seller request is saved with SHARH. You can update it, add details, submit it for review, or start a separate request.';
+      }
       return record.language === 'ru'
-        ? 'Ваш запрос сохранён в SHARH. Вы можете добавить требование, исправить любую цифру или отправить код SH-XXXX.'
+        ? 'Ваш запрос покупателя сохранён в SHARH. Можно уточнить критерии, посмотреть варианты или отправить код SH-XXXX.'
         : record.language === 'ar'
-          ? 'تم حفظ طلبك في SHARH. يمكنك إضافة شرط أو تصحيح أي رقم أو إرسال رمز SH-XXXX.'
-          : 'Your request is saved in SHARH. You can add a requirement, correct any figure, or send an SH-XXXX code.';
+          ? 'تم حفظ طلب الشراء لدى SHARH. يمكنك تعديل المعايير أو عرض الخيارات أو إرسال رمز SH-XXXX.'
+          : 'Your buyer request is saved with SHARH. You can refine the criteria, view options, or send an SH-XXXX code.';
     }
 
     return this.safeSalesFallback(record?.language || 'en');

@@ -83,6 +83,21 @@ describe('conversation navigation and seller terms', () => {
     expect(service.getDirective(chatId).expectedField).toBe('inquiry_purpose');
   });
 
+  it('recognizes a common start-over typo and marks confirmed restart for backend release', () => {
+    turn('sell');
+    turn('yes');
+    turn('Restaurant in Dubai, expected price AED 600k');
+
+    const request = service.handleNavigationCommand(chatId, 'Start pver');
+    expect(request.response).toContain('Should I start over');
+    expect(service.isRestartRecoveryCommand(chatId, 'Yes')).toBe(true);
+
+    const confirmed = service.handleNavigationCommand(chatId, 'Yes');
+    expect(confirmed.restartConfirmed).toBe(true);
+    expect(confirmed.response).toContain('Started over');
+    expect(confirmed.response).toContain('buy or sell');
+  });
+
   it('switches between buyer and seller routes without a new chat', () => {
     turn('buy');
     turn('Healthcare in Dubai');
@@ -139,4 +154,46 @@ describe('conversation navigation and seller terms', () => {
     expect(service.getCurrentRecord(chatId)?.nextStep).toBe('submit');
     expect(service.getCurrentRecord(chatId)?.clientName).toBe('Ansar');
   });
+
+  it('uses a one-time contextual re-entry prompt after a completed case', () => {
+    turn('sell');
+    turn('yes');
+    turn('Boat trading company in Dubai, expected selling price AED 600k');
+
+    const firstGreeting = service.handleNavigationCommand(chatId, 'Salam');
+    expect(firstGreeting.response).toContain('request is saved with SHARH');
+    expect(firstGreeting.response).toContain('selling another business');
+
+    const secondGreeting = service.handleNavigationCommand(chatId, 'Hello');
+    expect(secondGreeting.response).toBe('How can I help with your SHARH request?');
+  });
+
+  it('creates separate buyer and seller cases without leaking previous answers', () => {
+    turn('sell');
+    turn('yes');
+    turn('Boat trading company in Dubai, expected selling price AED 600k');
+
+    const buyer = service.handleNavigationCommand(chatId, 'I want to buy a restaurant now');
+    expect(buyer.restartConfirmed).toBe(true);
+    expect(service.getCurrentRecord(chatId)?.inquiryPurpose).toBe('buying');
+    expect(service.getCurrentRecord(chatId)?.businessType).toBe('');
+    expect(buyer.response).toContain('separate buyer search');
+
+    turn('Restaurant in Dubai under AED 1m');
+    const seller = service.handleNavigationCommand(chatId, 'I also have a salon to sell');
+    expect(seller.restartConfirmed).toBe(true);
+    expect(service.getCurrentRecord(chatId)?.inquiryPurpose).toBe('selling');
+    expect(service.getCurrentRecord(chatId)?.businessType).toBe('');
+    expect(seller.response).toContain('separate seller request');
+  });
+
+  it('does not expose a WhatsApp LID as a phone number', () => {
+    service.updateFromMessage(chatId, {
+      ...message(`m-${++sequence}`, 'sell'),
+      from: '208911705595993@lid',
+    });
+
+    expect(service.getCurrentRecord(chatId)?.clientPhone).toBe('');
+  });
+
 });

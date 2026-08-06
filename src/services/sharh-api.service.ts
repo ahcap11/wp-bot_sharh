@@ -314,6 +314,27 @@ export class SharhApiService {
     return result.ok;
   }
 
+  async restartConversationForUser(
+    externalChatId: string,
+    phone: string
+  ): Promise<boolean> {
+    if (!this.config.enabled) {
+      return true;
+    }
+    const result = await this.request<unknown>(
+      'POST',
+      '/api/v1/bot/conversations/restart',
+      {
+        external_chat_id: externalChatId,
+        phone: phone || null,
+        requested_at: new Date().toISOString(),
+        reason: 'user_requested_start_over',
+      },
+      `conversation-restart-${externalChatId}-${Date.now()}`
+    );
+    return result.ok;
+  }
+
   async getConversationControl(
     externalChatId: string,
     phone: string
