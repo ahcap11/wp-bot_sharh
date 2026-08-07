@@ -59,7 +59,14 @@ class WhatsAppAIChatbot {
       const messagingConfig = getMessagingConfig();
       const salesPlaybookVersion = getSalesPlaybookVersion();
       const conversationSafetyConfig = getConversationSafetyConfig();
-      this.webSocketPort = appConfig.healthPort;
+      // Railway health checks always target PORT. Keep the optional internal
+      // monitoring WebSocket on a different port if an environment happens to
+      // configure HEALTH_PORT equal to PORT.
+      const requestedWebSocketPort = appConfig.healthPort;
+      this.webSocketPort =
+        requestedWebSocketPort === appConfig.port
+          ? appConfig.port + 1
+          : requestedWebSocketPort;
 
       // Apply configured log level to the shared logger.
       logger.level = appConfig.logLevel;
@@ -67,6 +74,8 @@ class WhatsAppAIChatbot {
       logger.info('Configuration loaded', {
         port: appConfig.port,
         healthPort: appConfig.healthPort,
+        webSocketPort: this.webSocketPort,
+        railwayPort: process.env['PORT'] || null,
         openaiModel: appConfig.openaiModel,
         maxHistoryLength: appConfig.maxHistoryLength,
         logLevel: appConfig.logLevel,
@@ -118,7 +127,7 @@ class WhatsAppAIChatbot {
         this.persistenceService
       );
       const webSocketService = new WebSocketService(
-        appConfig.healthPort,
+        this.webSocketPort,
         appConfig.wsAuthToken
       );
       const googleSheetsService = new GoogleSheetsService(googleSheetsConfig);

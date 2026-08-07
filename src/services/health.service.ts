@@ -57,8 +57,11 @@ export class HealthService {
       logger.error('Health server error', { error: error.message });
     });
 
-    this.server.listen(this.port, () => {
-      logger.info('Health server started', { port: this.port });
+    this.server.listen(this.port, '0.0.0.0', () => {
+      logger.info('Health server started', {
+        host: '0.0.0.0',
+        port: this.port,
+      });
     });
   }
 

@@ -222,8 +222,16 @@ export class ChatbotService {
     try {
       logger.info('Initializing chatbot...');
 
-      // Initialize WebSocket service
-      this.webSocketService.initialize();
+      // The monitoring WebSocket is non-critical. A local port conflict must
+      // never prevent WhatsApp, buyer matching, or the HTTP health endpoint
+      // from starting.
+      try {
+        this.webSocketService.initialize();
+      } catch (error) {
+        logger.error('Monitoring WebSocket failed to initialize; continuing', {
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
+      }
 
       // Initialize WhatsApp service
       await this.whatsappService.initialize();
