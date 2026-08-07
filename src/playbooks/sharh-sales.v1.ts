@@ -64,7 +64,7 @@ export const SHARH_SALES_V1: SalesPlaybook = {
   objections: {
     commission: {
       patterns: [
-        /commission|fee|2%|5%|10,?000|200,?000|500,?000/i,
+        /\b(?:commission|broker(?:age)? fee|success fee|service fee|your fee|sharh fee|fees?|charges?)\b/i,
         /комисси|вознагражден/iu,
         /عمولة|رسوم/u,
       ],

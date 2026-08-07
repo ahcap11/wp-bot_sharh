@@ -152,6 +152,74 @@ describe('LeadCaptureService', () => {
     });
   });
 
+  it('accepts an unlabelled budget after any sector', () => {
+    const chatId = 'buyer-compact-budget';
+    turn(chatId, 'b1', 'buy');
+    const result = turn(chatId, 'b2', 'any sector 10000000', false);
+
+    expect(result.status).toBe('qualified');
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      businessType: 'Any profitable business',
+      buyerBudgetAed: 'AED 10,000,000',
+      objectionsDetected: '',
+    });
+    expect(result.directive.directResponse).not.toContain('success-based only');
+  });
+
+  it('accepts the compact buyer reply shown in WhatsApp without misreading money as commission', () => {
+    const chatId = 'buyer-compact-numbers';
+    turn(chatId, 'b1', 'buy');
+
+    const result = turn(
+      chatId,
+      'b2',
+      'any sector 10000000 100000 passive',
+      false
+    );
+
+    expect(result.status).toBe('qualified');
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      inquiryPurpose: 'buying',
+      businessType: 'Any profitable business',
+      buyerBudgetAed: 'AED 10,000,000',
+      buyerMinimumAnnualProfitAed: 'AED 100,000',
+      buyerReturnPeriod: 'annual',
+      buyerInvolvement: 'Passive required',
+      buyerProfitableOnly: true,
+      objectionsDetected: '',
+    });
+    expect(result.directive.directResponse).not.toContain('success-based only');
+  });
+
+  it('accepts compact sector, budget, location, profit and passive criteria', () => {
+    const chatId = 'buyer-compact-specific';
+    turn(chatId, 'b1', 'buy');
+    turn(chatId, 'b2', 'restaurant 1000000 Dubai 200000 passive', false);
+
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      businessType: 'Restaurant',
+      buyerBudgetAed: 'AED 1,000,000',
+      buyerLocation: 'Dubai',
+      buyerMinimumAnnualProfitAed: 'AED 200,000',
+      buyerReturnPeriod: 'annual',
+      buyerInvolvement: 'Passive required',
+    });
+  });
+
+  it('accepts a compact ROI slot without treating 5 percent as a fee question', () => {
+    const chatId = 'buyer-compact-roi';
+    turn(chatId, 'b1', 'buy');
+    turn(chatId, 'b2', 'any sector 10m 5% passive', false);
+
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      businessType: 'Any profitable business',
+      buyerBudgetAed: 'AED 10,000,000',
+      buyerMinimumRoiPct: '5%',
+      buyerInvolvement: 'Passive required',
+      objectionsDetected: '',
+    });
+  });
+
   it('resolves annual return clarification and supports later criteria changes', () => {
     const chatId = 'buyer-criteria-correction';
     turn(chatId, 'b1', 'buy');

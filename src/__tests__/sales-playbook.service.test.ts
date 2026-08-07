@@ -19,4 +19,13 @@ describe('SalesPlaybookService', () => {
   ])('detects %s as %s', (message, topic) => {
     expect(new SalesPlaybookService().detectObjection(message)).toBe(topic);
   });
+  it.each([
+    'any sector 10000000',
+    'any sector 10000000 100000 passive',
+    'ROI 5%',
+    '5%',
+    'AED 10,000 budget',
+  ])('does not interpret buyer financial criteria as a commission objection: %s', message => {
+    expect(new SalesPlaybookService().detectObjection(message)).toBeUndefined();
+  });
 });

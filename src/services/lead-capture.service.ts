@@ -2916,6 +2916,19 @@ export class LeadCaptureService {
       }
     }
 
+    // The buyer prompt explicitly invites one compact message. Accept natural
+    // shorthand such as "any sector 10000000 100000 passive" instead of
+    // forcing labels onto every number. In this compact form, the first money
+    // value is the maximum budget and the second is minimum ANNUAL profit,
+    // matching the order of the question shown to the user. Explicitly labelled
+    // values above always remain authoritative.
+    this.applyCompactBuyerCriteriaFallback(
+      state,
+      normalized,
+      fieldsUpdated,
+      budget !== null || flexibleBudget
+    );
+
     const buyerLocation = this.extractLocation(normalized, false);
     const locationIntent = /\b(?:prefer|preferred|only|location|emirate|area|located|in)\b/i.test(normalized)
       || /(?:предпоч|только|локац|эмират|район|\bв\b)/iu.test(normalized)
@@ -3087,6 +3100,137 @@ export class LeadCaptureService {
     }
   }
 
+  private applyCompactBuyerCriteriaFallback(
+    state: LeadCaptureState,
+    value: string,
+    fieldsUpdated: string[],
+    budgetAlreadyExplicit: boolean
+  ): void {
+    if (!value || this.looksLikeQuestion(value) || /\bSH-\d{4,}\b/i.test(value)) {
+      return;
+    }
+
+    const genericSector =
+      /\b(?:any|all)\s+(?:sector(?:s)?|industr(?:y|ies)|business(?:es)?(?:\s+type)?s?)\b/i.test(value) ||
+      /\b(?:any business|whatever sector|whatever industry|no sector preference|no industry preference)\b/i.test(value) ||
+      /(?:любая\s+(?:сфера|отрасль)|любой\s+(?:сектор|бизнес)|без предпочтений по (?:сфере|отрасли))/iu.test(value) ||
+      /(?:أي\s+(?:قطاع|مجال|مشروع)|لا تفضيل للقطاع)/u.test(value);
+
+    if (genericSector && state.businessType !== 'Any profitable business') {
+      state.businessType = 'Any profitable business';
+      fieldsUpdated.push('business_type');
+    }
+
+    const compactSector = genericSector ? null : this.extractCompactBuyerSector(value);
+    if (compactSector && state.businessType !== compactSector) {
+      state.businessType = compactSector;
+      fieldsUpdated.push('business_type');
+    }
+
+    const values = this.extractCompactBuyerMoneyValues(value);
+    const hasBudgetWords =
+      /\b(?:budget|maximum budget|max budget|purchase price|can spend|invest(?:ment)? amount|up to|under|below|not more than)\b/i.test(value) ||
+      /(?:бюджет|максимум|до|не более|готов вложить)/iu.test(value) ||
+      /(?:الميزانية|الحد الأقصى|حتى|أستطيع دفع)/u.test(value);
+    const hasProfitWords =
+      /\b(?:net\s+profit|profit|income|cash\s*flow|cashflow|earnings?|earns?|makes?|brings?|return)\b/i.test(value) ||
+      /(?:прибыл|доход|денежн(?:ый|ого)? поток|зарабатывает|приносит)/iu.test(value) ||
+      /(?:ربح|دخل|تدفق نقدي|يدر|عائد)/u.test(value);
+
+    const compactTuple = genericSector || values.length >= 2;
+    const canTreatFirstAsBudget =
+      !budgetAlreadyExplicit &&
+      !hasBudgetWords &&
+      values.length >= 1 &&
+      (compactTuple ||
+        !this.hasValue(state.buyerBudgetAed) ||
+        state.expectedField === 'buyer_budget_aed');
+
+    if (canTreatFirstAsBudget && values[0] !== undefined) {
+      const formatted = this.formatAedAmount(values[0]);
+      if (state.buyerBudgetAed !== formatted) {
+        state.buyerBudgetAed = formatted;
+        fieldsUpdated.push('buyer_budget_aed');
+      }
+    }
+
+    // If the user supplies two unlabelled amounts in the one-message buyer
+    // schema, the second slot is annual profit because the prompt itself asks
+    // for minimum annual profit (or ROI) in that position.
+    if (
+      compactTuple &&
+      !hasProfitWords &&
+      values.length >= 2 &&
+      values[1] !== undefined
+    ) {
+      const annualProfit = this.formatAedAmount(values[1]);
+      const changed =
+        state.buyerMinimumAnnualProfitAed !== annualProfit ||
+        state.buyerReturnPeriod !== 'annual';
+      state.buyerReturnAmountAed = annualProfit;
+      state.buyerReturnPeriod = 'annual';
+      state.buyerMinimumAnnualProfitAed = annualProfit;
+      state.buyerProfitableOnly = true;
+      if (changed) {
+        fieldsUpdated.push(
+          'buyer_return_period',
+          'buyer_minimum_annual_profit_aed',
+          'buyer_profitable_only'
+        );
+      }
+    }
+
+    // A standalone percentage in the same compact schema is interpreted as
+    // minimum ROI. This makes \"any sector 10m 15% passive\" work naturally.
+    if (compactTuple) {
+      const percent = value.match(/(?<![\p{L}\p{N}])(\d+(?:[.,]\d+)?)\s*%(?![\p{L}\p{N}])/u)?.[1];
+      if (percent) {
+        const roi = Number.parseFloat(percent.replace(',', '.'));
+        if (Number.isFinite(roi) && roi >= 0 && roi <= 1000) {
+          const formatted = `${roi}%`;
+          if (state.buyerMinimumRoiPct !== formatted) {
+            state.buyerMinimumRoiPct = formatted;
+            fieldsUpdated.push('buyer_minimum_roi_pct');
+          }
+          if (roi > 0) state.buyerProfitableOnly = true;
+        }
+      }
+    }
+  }
+
+  private extractCompactBuyerSector(value: string): string | null {
+    const firstMoney = value.search(/(?:aed|dhs?|dirhams?)?\s*\d{1,3}(?:[, ]\d{3})+|(?:aed|dhs?|dirhams?)?\s*\d+(?:[.,]\d+)?\s*(?:bn|billion|b|mn|mln|million|m|thousand|k)?/i);
+    if (firstMoney <= 0) return null;
+
+    let candidate = value.slice(0, firstMoney).trim();
+    candidate = candidate
+      .replace(/^(?:sector|industry|business type)\s*[:=-]?\s*/i, '')
+      .replace(/^(?:looking for|want(?: to buy)?|buy|seeking|interested in)\s+(?:a|an|the)?\s*/i, '')
+      .replace(/(?:\s+in)?\s+(?:Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\s*$/i, '')
+      .trim();
+    if (!candidate || this.isBuyerCriteriaOnlyText(candidate)) return null;
+
+    const normalized = this.normalizeBusinessText(candidate);
+    if (!normalized || this.isGenericBuyerSector(normalized)) return null;
+    return normalized;
+  }
+
+  private extractCompactBuyerMoneyValues(value: string): number[] {
+    const values: number[] = [];
+    const pattern = /(?:^|[^\p{L}\p{N}])(?:aed|dhs?|dirhams?)?\s*(\d{1,3}(?:[, ]\d{3})+|\d+(?:[.,]\d+)?)\s*(bn|billion|b|mn|mln|million|m|thousand|k)?(?=$|[^\p{L}\p{N}%])/giu;
+    for (const match of value.matchAll(pattern)) {
+      const raw = match[1];
+      if (!raw) continue;
+      const amount = this.scaleMoneyNumber(raw, match[2] || '');
+      if (amount === null || amount < 1_000 || amount > 100_000_000_000) continue;
+      // Avoid interpreting obvious calendar years as financial criteria.
+      if (!match[2] && amount >= 1900 && amount <= 2100) continue;
+      values.push(amount);
+      if (values.length >= 3) break;
+    }
+    return values;
+  }
+
   private extractBuyerSectorPreference(value: string): string | null {
     const patterns = [
       /(?:looking for|want to (?:buy|acquire)|interested in|seeking)\s+(?:(?:a|an|the)\s+)?(.+?)(?=\s+(?:in|under|below|up to|with (?:a\s+)?budget|within (?:a\s+)?budget|that|which|if)\b|[,.;]|$)/i,
@@ -3120,7 +3264,7 @@ export class LeadCaptureService {
       .replace(/\b(?:cash[- ]?generating|profitable|passive|investment|opportunity|established|good|any)\b/g, ' ')
       .replace(/(?:прибыльн|пассивн|инвестиц|возможност|любой|хорош)/gu, ' ')
       .replace(/(?:مربح|سلبي|استثمار|فرصة|أي)/gu, ' ')
-      .replace(/\b(?:business(?:es)?|company|companies)\b/g, ' ')
+      .replace(/\b(?:business(?:es)?|company|companies|sector(?:s)?|industry|industries)\b/g, ' ')
       .replace(/(?:бизнес|компан(?:ия|ии)|проект)/gu, ' ')
       .replace(/(?:مشروع|شركة|أعمال)/gu, ' ')
       .replace(/(?:aed|dhs?|dirhams?)?\s*\d+(?:[.,]\d+)?\s*(?:m|mn|million|k|thousand)?/g, ' ')
