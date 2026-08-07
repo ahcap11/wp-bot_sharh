@@ -134,7 +134,7 @@ class WhatsAppAIChatbot {
         this.persistenceService
       );
 
-      // Create and initialize chatbot service
+      // Create chatbot service before starting dependency initialization.
       this.chatbotService = new ChatbotService(
         whatsappService,
         aiService,
@@ -152,10 +152,13 @@ class WhatsAppAIChatbot {
         conversationSafetyService
       );
 
-      await this.chatbotService.initialize();
-
-      // Start HTTP health/readiness probes on the platform-exposed port so
-      // Railway health checks reach them.
+      // IMPORTANT: expose liveness before any external dependency checks.
+      // Railway starts probing /health as soon as the container is deployed.
+      // WhatsApp protocol discovery, Google Sheets, SHARH API or OpenAI can
+      // legitimately take several seconds (or temporarily be unavailable), but
+      // that must not make a healthy Node process fail its deployment healthcheck.
+      // /ready remains dependency-aware and can stay 503 until initialization
+      // completes, while /health is an immediate process-liveness probe.
       this.healthService = new HealthService(
         appConfig.port,
         () => (this.chatbotService ? this.chatbotService.getStatus() : null),
@@ -164,6 +167,8 @@ class WhatsAppAIChatbot {
         rawBody => sharhSyncService.enqueueProviderWebhook(rawBody)
       );
       this.healthService.start();
+
+      await this.chatbotService.initialize();
 
       logger.info('WhatsApp AI Chatbot initialized successfully! 🚀');
       this.logStartupInfo();
