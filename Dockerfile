@@ -27,6 +27,9 @@ FROM node:20-bookworm-slim AS runtime
 
 ENV NODE_ENV=production
 ENV PUPPETEER_SKIP_DOWNLOAD=true
+# Known-good fallback used by the currently active Railway deployment.
+# Railway runtime PORT still overrides this when injected.
+ENV PORT=8080
 ENV HEALTH_PORT=3001
 
 WORKDIR /app
@@ -41,9 +44,9 @@ COPY --from=builder /app/dist ./dist
 
 RUN mkdir -p /app/data /app/logs
 
-EXPOSE 3000 3001
+EXPOSE 8080 3000 3001
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 3000) + '/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 8080) + '/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
 CMD ["node", "dist/index.js"]

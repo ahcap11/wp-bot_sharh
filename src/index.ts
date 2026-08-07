@@ -37,7 +37,8 @@ class WhatsAppAIChatbot {
   private chatbotService: ChatbotService | null = null;
   private healthService: HealthService | null = null;
   private persistenceService: PersistenceService | null = null;
-  private webSocketPort: number = 8080;
+  private webSocketPort: number = 3001;
+  private initRetryTimer: NodeJS.Timeout | null = null;
 
   constructor() {
     logger.info('WhatsApp AI Chatbot starting...');
@@ -59,14 +60,19 @@ class WhatsAppAIChatbot {
       const messagingConfig = getMessagingConfig();
       const salesPlaybookVersion = getSalesPlaybookVersion();
       const conversationSafetyConfig = getConversationSafetyConfig();
-      // Railway health checks always target PORT. Keep the optional internal
-      // monitoring WebSocket on a different port if an environment happens to
-      // configure HEALTH_PORT equal to PORT.
-      const requestedWebSocketPort = appConfig.healthPort;
-      this.webSocketPort =
-        requestedWebSocketPort === appConfig.port
-          ? appConfig.port + 1
-          : requestedWebSocketPort;
+      // Railway health checks use the injected PORT. The currently active
+      // production deployment is known to work on 8080, so expose liveness on
+      // both values when they differ. This removes ambiguity from an existing
+      // Railway target-port/service-variable configuration during rollout.
+      const healthPorts = Array.from(new Set([appConfig.port, 8080]));
+
+      // Keep the optional monitoring WebSocket away from every HTTP health port.
+      const healthPortSet = new Set(healthPorts);
+      let requestedWebSocketPort = appConfig.healthPort;
+      while (healthPortSet.has(requestedWebSocketPort)) {
+        requestedWebSocketPort += 1;
+      }
+      this.webSocketPort = requestedWebSocketPort;
 
       // Apply configured log level to the shared logger.
       logger.level = appConfig.logLevel;
@@ -76,6 +82,7 @@ class WhatsAppAIChatbot {
         healthPort: appConfig.healthPort,
         webSocketPort: this.webSocketPort,
         railwayPort: process.env['PORT'] || null,
+        healthPorts,
         openaiModel: appConfig.openaiModel,
         maxHistoryLength: appConfig.maxHistoryLength,
         logLevel: appConfig.logLevel,
@@ -169,7 +176,7 @@ class WhatsAppAIChatbot {
       // /ready remains dependency-aware and can stay 503 until initialization
       // completes, while /health is an immediate process-liveness probe.
       this.healthService = new HealthService(
-        appConfig.port,
+        healthPorts,
         () => (this.chatbotService ? this.chatbotService.getStatus() : null),
         () => whatsappService.getCurrentQr?.() ?? null,
         whatsappService,
@@ -177,9 +184,20 @@ class WhatsAppAIChatbot {
       );
       this.healthService.start();
 
-      await this.chatbotService.initialize();
+      try {
+        await this.chatbotService.initialize();
+        logger.info('WhatsApp AI Chatbot initialized successfully! 🚀');
+      } catch (error) {
+        // Liveness must not disappear because an external dependency had a
+        // transient startup failure. Keep the process healthy and retry the
+        // chatbot initialization in the background. /ready remains false until
+        // the dependencies actually recover.
+        logger.error('Chatbot dependency initialization failed; retry scheduled', {
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
+        this.scheduleChatbotInitializationRetry();
+      }
 
-      logger.info('WhatsApp AI Chatbot initialized successfully! 🚀');
       this.logStartupInfo();
     } catch (error) {
       logger.error('Failed to initialize application', {
@@ -187,6 +205,27 @@ class WhatsAppAIChatbot {
       });
       process.exit(1);
     }
+  }
+
+
+  private scheduleChatbotInitializationRetry(): void {
+    if (this.initRetryTimer || !this.chatbotService) return;
+
+    this.initRetryTimer = setTimeout(async () => {
+      this.initRetryTimer = null;
+      if (!this.chatbotService) return;
+
+      try {
+        await this.chatbotService.initialize();
+        logger.info('Chatbot dependency initialization recovered');
+      } catch (error) {
+        logger.error('Chatbot dependency initialization retry failed', {
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
+        this.scheduleChatbotInitializationRetry();
+      }
+    }, 15000);
+    this.initRetryTimer.unref?.();
   }
 
   /**
@@ -262,6 +301,10 @@ class WhatsAppAIChatbot {
    * Shutdown the application
    */
   async shutdown(): Promise<void> {
+    if (this.initRetryTimer) {
+      clearTimeout(this.initRetryTimer);
+      this.initRetryTimer = null;
+    }
     if (this.healthService) {
       this.healthService.stop();
     }

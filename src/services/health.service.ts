@@ -30,11 +30,11 @@ export type VerifiedWebhookForwarder = (rawBody: Buffer) => void;
  * - GET /ready  (alias /readyz):  readiness, 200 only when dependencies are up.
  */
 export class HealthService {
-  private server: http.Server | null = null;
+  private servers: http.Server[] = [];
   private readonly startedAt: number = Date.now();
 
   constructor(
-    private readonly port: number,
+    private readonly portOrPorts: number | number[],
     private readonly provider: HealthProvider,
     private readonly qrProvider: QrProvider | null = null,
     private readonly webhookTransport: MessagingTransport | null = null,
@@ -45,35 +45,52 @@ export class HealthService {
    * Start listening for probe requests.
    */
   start(): void {
-    if (this.server) {
+    if (this.servers.length > 0) {
       return;
     }
 
-    this.server = http.createServer((req, res) => {
-      void this.handleRequest(req, res);
-    });
+    const ports = Array.from(
+      new Set(
+        (Array.isArray(this.portOrPorts)
+          ? this.portOrPorts
+          : [this.portOrPorts]
+        ).filter(port => Number.isInteger(port) && port > 0)
+      )
+    );
 
-    this.server.on('error', (error: Error) => {
-      logger.error('Health server error', { error: error.message });
-    });
-
-    this.server.listen(this.port, '0.0.0.0', () => {
-      logger.info('Health server started', {
-        host: '0.0.0.0',
-        port: this.port,
+    for (const port of ports) {
+      const server = http.createServer((req, res) => {
+        void this.handleRequest(req, res);
       });
-    });
+
+      server.on('error', (error: Error) => {
+        logger.error('Health server error', { port, error: error.message });
+      });
+
+      server.listen(port, '0.0.0.0', () => {
+        logger.info('Health server started', {
+          host: '0.0.0.0',
+          port,
+        });
+      });
+
+      this.servers.push(server);
+    }
   }
 
   /**
    * Stop the probe server.
    */
   stop(): void {
-    if (this.server) {
-      this.server.close();
-      this.server = null;
-      logger.info('Health server closed');
+    if (this.servers.length === 0) {
+      return;
     }
+
+    for (const server of this.servers) {
+      server.close();
+    }
+    this.servers = [];
+    logger.info('Health server closed');
   }
 
   /**
