@@ -1239,16 +1239,17 @@ export class LeadCaptureService {
       }
 
       if (this.isGreeting(content)) {
-        const recentlyPrompted = Boolean(
-          state.lastReentryPromptAt && now - state.lastReentryPromptAt < REENTRY_REPEAT_WINDOW_MS
-        );
+        // The detailed saved-request re-entry message is shown once per active
+        // case. Later greetings use a short continuation even if a long time
+        // has passed, so the bot does not keep reintroducing the same context.
+        const alreadyPrompted = state.reentryPromptCount > 0;
         state.awaitingReentryChoice = true;
         state.lastReentryPromptAt = now;
         state.reentryPromptCount += 1;
         this.persist(chatId);
         return {
           handled: true,
-          response: recentlyPrompted
+          response: alreadyPrompted
             ? this.shortReentryPrompt(state)
             : this.contextualReentryPrompt(state),
           action: 'help',
@@ -1765,10 +1766,20 @@ export class LeadCaptureService {
     }
 
     if (state.pendingObjection) {
-      response = `${this.playbook.objectionResponse(
+      const objectionResponse = this.playbook.objectionResponse(
         state.language,
         state.pendingObjection
-      )}\n\n${response}`;
+      );
+      const promptAlreadyPresented = Boolean(
+        directive.expectedField &&
+          state.lastPromptField === directive.expectedField &&
+          state.promptRepeatCount > 0
+      );
+      // Answer side questions/objections without re-sending the same funnel
+      // prompt underneath. The expected field remains active in state.
+      response = promptAlreadyPresented
+        ? objectionResponse
+        : `${objectionResponse}\n\n${response}`;
     }
 
     const includeReviewNotice =
@@ -3990,12 +4001,17 @@ export class LeadCaptureService {
       return prompts[language];
     }
     if (field === 'business_type' && purpose === 'buying') {
-      const prompts: Record<ConversationLanguage, string> = {
+      const firstPrompts: Record<ConversationLanguage, string> = {
         en: 'Describe the business you want in one message: preferred sector (or any sector), maximum budget, location if important, minimum annual profit or ROI, and whether it must be passive/manager-run.',
         ru: 'Опишите желаемый бизнес одним сообщением: сфера (или любая), максимальный бюджет, важная локация, минимальная годовая прибыль или ROI и нужен ли пассивный/управляемый формат.',
         ar: 'صف المشروع المطلوب في رسالة واحدة: القطاع أو أي قطاع، الحد الأقصى للميزانية، الموقع إن كان مهماً، الحد الأدنى للربح السنوي أو العائد، وهل يجب أن يكون مُداراً دون تدخل مباشر.',
       };
-      return prompts[language];
+      const retryPrompts: Record<ConversationLanguage, string> = {
+        en: 'I only still need the sector. Reply with a sector name or “any sector”.',
+        ru: 'Мне не хватает только сферы. Напишите название сферы или «любая сфера».',
+        ar: 'ينقصني فقط القطاع. اكتب اسم القطاع أو «أي قطاع».',
+      };
+      return isRetry ? retryPrompts[language] : firstPrompts[language];
     }
     const questions: Record<ConversationLanguage, Partial<Record<LeadField, string>>> = {
       en: {
@@ -4111,6 +4127,7 @@ export class LeadCaptureService {
     const question = this.questionForField(language, field, undefined, false);
     const examples: Record<ConversationLanguage, Partial<Record<LeadField, string>>> = {
       en: {
+        business_type: 'Reply with a sector name or “any sector”.',
         annual_revenue_aed: 'Please send an approximate amount such as AED 150,000, 1.2m, or “unknown”.',
         monthly_net_profit_aed: 'Please send an approximate monthly amount such as AED 20,000 or “unknown”.',
         monthly_operating_expenses_aed: 'Please send an approximate monthly amount such as AED 50,000 or “unknown”.',
@@ -4120,6 +4137,7 @@ export class LeadCaptureService {
         employee_count: 'Please send the number of employees, such as 12, or reply “unknown”.',
       },
       ru: {
+        business_type: 'Напишите название сферы или «любая сфера».',
         annual_revenue_aed: 'Укажите примерную сумму, например 150 000 AED, 1,2 млн или «не знаю».',
         monthly_net_profit_aed: 'Укажите примерную месячную сумму, например 20 000 AED, или «не знаю».',
         monthly_operating_expenses_aed: 'Укажите примерную месячную сумму, например 50 000 AED, или «не знаю».',
@@ -4129,6 +4147,7 @@ export class LeadCaptureService {
         employee_count: 'Укажите количество сотрудников, например 12, или ответьте «не знаю».',
       },
       ar: {
+        business_type: 'اكتب اسم القطاع أو «أي قطاع».',
         annual_revenue_aed: 'أرسل مبلغاً تقريبياً مثل 150,000 درهم أو 1.2 مليون أو «غير معروف».',
         monthly_net_profit_aed: 'أرسل مبلغاً شهرياً تقريبياً مثل 20,000 درهم أو «غير معروف».',
         monthly_operating_expenses_aed: 'أرسل مبلغاً شهرياً تقريبياً مثل 50,000 درهم أو «غير معروف».',

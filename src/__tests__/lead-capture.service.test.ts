@@ -152,6 +152,26 @@ describe('LeadCaptureService', () => {
     });
   });
 
+  it('answers a buyer side question without repeating the full buyer prompt', () => {
+    const chatId = 'buyer-no-repeat-side-question';
+    const first = turn(chatId, 'b1', 'buy');
+    expect(first.directive.directResponse).toContain('Describe the business you want');
+
+    const fee = turn(chatId, 'b2', 'what is your commission?', false);
+    expect(fee.directive.directResponse).toContain('success-based only');
+    expect(fee.directive.directResponse).not.toContain('Describe the business you want');
+  });
+
+  it('uses a focused retry instead of repeating the full buyer questionnaire', () => {
+    const chatId = 'buyer-focused-retry';
+    turn(chatId, 'b1', 'buy');
+    const retry = turn(chatId, 'b2', 'nonsense', false);
+
+    expect(retry.directive.directResponse).toContain('sector');
+    expect(retry.directive.directResponse).not.toContain('maximum budget');
+    expect(retry.directive.directResponse).not.toContain('minimum annual profit');
+  });
+
   it('accepts an unlabelled budget after any sector', () => {
     const chatId = 'buyer-compact-budget';
     turn(chatId, 'b1', 'buy');

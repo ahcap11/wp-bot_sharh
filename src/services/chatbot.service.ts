@@ -617,6 +617,15 @@ export class ChatbotService {
           }
         }
 
+        if (role === 'sales') {
+          outboundResponse = this.preventUnwantedRepeat(
+            chatId,
+            incomingMessage.content,
+            outboundResponse,
+            salesTurn
+          );
+        }
+
         // Add delay to simulate human-like response
         await this.delay(this.responseDelay);
 
@@ -1082,12 +1091,17 @@ export class ChatbotService {
         if (contextualReply) {
           directive = {
             ...directive,
-            directResponse: interpretation?.holdFunnel
-              ? contextualReply
-              : this.composeContextualReply(
-                  contextualReply,
-                  directive.directResponse
-                ),
+            directResponse:
+              interpretation?.holdFunnel ||
+              this.shouldAvoidRepeatingFunnelPrompt(
+                message.content,
+                interpretation
+              )
+                ? contextualReply
+                : this.composeContextualReply(
+                    contextualReply,
+                    directive.directResponse
+                  ),
           };
         } else if (aiLimitNotice) {
           directive = {
@@ -1258,13 +1272,269 @@ export class ChatbotService {
       return messages[language];
     }
 
-    const variants: Record<'en' | 'ru' | 'ar', string[]> = {
-      en: ['Understood.', 'Noted.', 'Thank you, that helps.'],
-      ru: ['Понял.', 'Зафиксировал.', 'Спасибо, это полезно.'],
-      ar: ['مفهوم.', 'تم تسجيل ذلك.', 'شكراً، هذه معلومة مفيدة.'],
+    // Do not add a generic acknowledgement on every qualification turn.
+    // The next question/search result already shows that the input was understood,
+    // and repeated “Understood/Noted/Thank you” makes the conversation feel robotic.
+    return '';
+  }
+
+  private shouldAvoidRepeatingFunnelPrompt(
+    content: string,
+    interpretation?: SalesMessageInterpretation | null
+  ): boolean {
+    if (interpretation?.classification === 'question') return true;
+    if (interpretation?.holdFunnel) return true;
+    // Side questions should be answered on their own. Re-attaching the same
+    // qualification prompt makes the bot sound scripted and repetitive.
+    return (
+      /\?/u.test(content) ||
+      /\b(?:commission|fee|success fee|how much do you charge|confidential|confidentiality|privacy|marketing|how does (?:it|this) work|what happens next|process|steps)\b/iu.test(content) ||
+      /(?:комисси|сколько.*(?:берете|стоит)|конфиденц|публич|маркетинг|как.*(?:работает|проходит)|что дальше|процесс)/iu.test(content) ||
+      /(?:عمولة|رسوم|سرية|خصوصية|تسويق|كيف.*(?:يعمل|تتم)|ما الخطوة التالية|العملية)/u.test(content)
+    );
+  }
+
+  private preventUnwantedRepeat(
+    chatId: string,
+    incomingContent: string,
+    candidate: string,
+    salesTurn?: SalesLeadTurn
+  ): string {
+    if (!candidate.trim() || this.isExplicitRepeatRequest(incomingContent)) {
+      return candidate;
+    }
+
+    const recentBotReplies = this.chatHistoryService
+      .getRecentMessages(chatId, 10)
+      .filter(message => message.isFromBot)
+      .slice(-3)
+      .map(message => message.content)
+      .filter(Boolean);
+    if (!recentBotReplies.length) return candidate;
+
+    const repeated = recentBotReplies.some(previous =>
+      this.responsesAreNearDuplicate(previous, candidate)
+    );
+    if (!repeated) return candidate;
+
+    const record =
+      salesTurn?.record || this.leadCaptureService?.getCurrentRecord(chatId) || undefined;
+    const language = record?.language || 'en';
+    const expectedField = salesTurn?.directive.expectedField;
+    const lower = incomingContent.toLowerCase();
+
+    if (/\b(?:commission|fee|success fee|how much do you charge)\b|комисси|сколько.*(?:берете|стоит)|عمولة|رسوم/iu.test(lower)) {
+      const messages = {
+        en: 'The fee terms are unchanged. Which part would you like clarified?',
+        ru: 'Условия комиссии не изменились. Какой именно пункт нужно уточнить?',
+        ar: 'شروط الرسوم لم تتغير. ما الجزء الذي تريد توضيحه؟',
+      } as const;
+      return messages[language];
+    }
+
+    const focused = this.compactContinuationForField(expectedField, record);
+    if (
+      focused &&
+      !recentBotReplies.some(previous =>
+        this.responsesAreNearDuplicate(previous, focused)
+      )
+    ) {
+      return focused;
+    }
+
+    if (record?.inquiryPurpose === 'buying') {
+      const messages = {
+        en: record.status === 'qualified'
+          ? 'Your buyer criteria are already saved. Send only what you want to change, or send an SH-XXXX code.'
+          : 'I have the details you already sent. Send only the missing or changed buyer criterion.',
+        ru: record.status === 'qualified'
+          ? 'Критерии покупателя уже сохранены. Напишите только то, что хотите изменить, или отправьте код SH-XXXX.'
+          : 'Уже полученные данные сохранены. Напишите только недостающий или изменённый критерий.',
+        ar: record.status === 'qualified'
+          ? 'تم حفظ معايير المشتري. أرسل فقط ما تريد تغييره أو أرسل رمز SH-XXXX.'
+          : 'تم حفظ المعلومات التي أرسلتها. أرسل فقط المعيار الناقص أو الذي تريد تغييره.',
+      } as const;
+      return messages[language];
+    }
+
+    const fallback = {
+      en: 'I already have the previous information. Send only the new detail or change.',
+      ru: 'Предыдущая информация уже сохранена. Напишите только новую деталь или изменение.',
+      ar: 'المعلومات السابقة محفوظة. أرسل فقط المعلومة الجديدة أو التغيير.',
+    } as const;
+    return fallback[language];
+  }
+
+  private compactContinuationForField(
+    field: FunnelDirective['expectedField'],
+    record?: LeadCaptureRecord
+  ): string {
+    if (!field) return '';
+    const language = record?.language || 'en';
+    const prompts: Record<
+      NonNullable<FunnelDirective['expectedField']>,
+      Record<'en' | 'ru' | 'ar', string>
+    > = {
+      inquiry_purpose: {
+        en: 'Reply only with “buy” or “sell”.',
+        ru: 'Ответьте только «купить» или «продать».',
+        ar: 'أجب فقط «شراء» أو «بيع».',
+      },
+      client_name: {
+        en: 'I only need the name you want me to use.',
+        ru: 'Мне нужно только имя, которым к вам обращаться.',
+        ar: 'أحتاج فقط الاسم الذي تفضّل أن أخاطبك به.',
+      },
+      seller_terms: {
+        en: 'Reply “yes” to proceed, or tell me which term you want clarified.',
+        ru: 'Ответьте «да», чтобы продолжить, или укажите, какой пункт нужно уточнить.',
+        ar: 'أجب «نعم» للمتابعة أو اذكر البند الذي تريد توضيحه.',
+      },
+      business_type: {
+        en: record?.inquiryPurpose === 'buying'
+          ? 'I only still need the sector. A sector name or “any sector” is enough.'
+          : 'I only still need what the business does.',
+        ru: record?.inquiryPurpose === 'buying'
+          ? 'Мне не хватает только сферы. Достаточно названия сферы или «любая сфера».'
+          : 'Мне не хватает только информации о том, чем занимается бизнес.',
+        ar: record?.inquiryPurpose === 'buying'
+          ? 'ينقصني فقط القطاع. يكفي اسم القطاع أو «أي قطاع».'
+          : 'ينقصني فقط نشاط المشروع.',
+      },
+      business_location: {
+        en: 'I only still need the emirate or area.',
+        ru: 'Мне не хватает только эмирата или района.',
+        ar: 'ينقصني فقط اسم الإمارة أو المنطقة.',
+      },
+      annual_revenue_aed: {
+        en: 'Send only the approximate annual revenue, or “unknown”.',
+        ru: 'Укажите только примерную годовую выручку или «не знаю».',
+        ar: 'أرسل فقط الإيراد السنوي التقريبي أو «غير معروف».',
+      },
+      lease_details: {
+        en: 'Send only the lease/rent detail, or “unknown”.',
+        ru: 'Укажите только данные по аренде или «не знаю».',
+        ar: 'أرسل فقط تفاصيل الإيجار أو «غير معروف».',
+      },
+      desired_selling_price_aed: {
+        en: 'Send only the expected selling price or range.',
+        ru: 'Укажите только ожидаемую цену продажи или диапазон.',
+        ar: 'أرسل فقط سعر البيع المتوقع أو النطاق.',
+      },
+      year_established: {
+        en: 'Send only the year established, or “unknown”.',
+        ru: 'Укажите только год основания или «не знаю».',
+        ar: 'أرسل فقط سنة التأسيس أو «غير معروف».',
+      },
+      employee_count: {
+        en: 'Send only the employee count, or “unknown”.',
+        ru: 'Укажите только количество сотрудников или «не знаю».',
+        ar: 'أرسل فقط عدد الموظفين أو «غير معروف».',
+      },
+      monthly_operating_expenses_aed: {
+        en: 'Send only the approximate monthly operating expenses, or “unknown”.',
+        ru: 'Укажите только примерные ежемесячные расходы или «не знаю».',
+        ar: 'أرسل فقط المصاريف التشغيلية الشهرية التقريبية أو «غير معروف».',
+      },
+      monthly_net_profit_aed: {
+        en: 'Send only the approximate monthly net profit, or “unknown”.',
+        ru: 'Укажите только примерную ежемесячную чистую прибыль или «не знаю».',
+        ar: 'أرسل فقط صافي الربح الشهري التقريبي أو «غير معروف».',
+      },
+      liabilities: {
+        en: 'Send only the liabilities detail, or “none/unknown”.',
+        ru: 'Укажите только обязательства или «нет/не знаю».',
+        ar: 'أرسل فقط تفاصيل الالتزامات أو «لا يوجد/غير معروف».',
+      },
+      contracts_licenses: {
+        en: 'Send only the key licences/contracts, or “unknown”.',
+        ru: 'Укажите только ключевые лицензии/контракты или «не знаю».',
+        ar: 'أرسل فقط التراخيص/العقود الرئيسية أو «غير معروف».',
+      },
+      sale_reason_urgency: {
+        en: 'Send only the sale reason or timing.',
+        ru: 'Укажите только причину продажи или сроки.',
+        ar: 'أرسل فقط سبب البيع أو الإطار الزمني.',
+      },
+      included_assets: {
+        en: 'Send only what is included in the sale.',
+        ru: 'Укажите только то, что входит в продажу.',
+        ar: 'أرسل فقط ما يشمله البيع.',
+      },
+      buyer_budget_aed: {
+        en: 'I only still need your maximum budget, e.g. “1M AED”.',
+        ru: 'Мне не хватает только максимального бюджета, например «1M AED».',
+        ar: 'ينقصني فقط الحد الأقصى للميزانية، مثلاً «1M AED».',
+      },
+      buyer_location: {
+        en: 'Send only the preferred emirate/area, or say location is flexible.',
+        ru: 'Укажите только желаемый эмират/район или напишите, что локация не важна.',
+        ar: 'أرسل فقط الإمارة/المنطقة المفضلة أو اذكر أن الموقع مرن.',
+      },
+      buyer_timeline: {
+        en: 'Send only your preferred acquisition timing.',
+        ru: 'Укажите только желаемые сроки покупки.',
+        ar: 'أرسل فقط التوقيت المفضل للاستحواذ.',
+      },
+      buyer_involvement: {
+        en: 'Reply only with passive, active, or either.',
+        ru: 'Ответьте только: пассивно, активно или оба варианта.',
+        ar: 'أجب فقط: سلبي، نشط، أو كلاهما.',
+      },
+      buyer_funding_status: {
+        en: 'Send only the funding method: own funds, financing, or both.',
+        ru: 'Укажите только способ финансирования: свои средства, финансирование или оба варианта.',
+        ar: 'أرسل فقط طريقة التمويل: أموال خاصة، تمويل، أو كلاهما.',
+      },
+      buyer_additional_comments: {
+        en: 'Send only any additional buyer requirement, or “none”.',
+        ru: 'Укажите только дополнительное требование или «нет».',
+        ar: 'أرسل فقط أي متطلب إضافي أو «لا يوجد».',
+      },
+      contact_preference: {
+        en: 'Send only the preferred contact name/time.',
+        ru: 'Укажите только имя и удобное время для связи.',
+        ar: 'أرسل فقط الاسم والوقت المناسب للتواصل.',
+      },
     };
-    const stableIndex = Math.abs(expectedField.length + record.fieldsUpdated.length) % variants[language].length;
-    return variants[language][stableIndex] || variants[language][0] || '';
+    return prompts[field][language];
+  }
+
+  private responsesAreNearDuplicate(left: string, right: string): boolean {
+    const a = this.normalizeResponseForRepeat(left);
+    const b = this.normalizeResponseForRepeat(right);
+    if (!a || !b) return false;
+    if (a === b) return true;
+
+    const minLength = Math.min(a.length, b.length);
+    const maxLength = Math.max(a.length, b.length);
+    if (minLength >= 60 && (a.includes(b) || b.includes(a)) && minLength / maxLength >= 0.82) {
+      return true;
+    }
+
+    if (minLength < 80) return false;
+    const aTokens = new Set(a.split(' ').filter(token => token.length > 2));
+    const bTokens = new Set(b.split(' ').filter(token => token.length > 2));
+    if (!aTokens.size || !bTokens.size) return false;
+    let intersection = 0;
+    for (const token of aTokens) {
+      if (bTokens.has(token)) intersection += 1;
+    }
+    const union = new Set([...aTokens, ...bTokens]).size;
+    return union > 0 && intersection / union >= 0.86;
+  }
+
+  private normalizeResponseForRepeat(value: string): string {
+    return value
+      .toLowerCase()
+      .replace(/https?:\/\/\S+/g, '<url>')
+      .replace(/[^\p{L}\p{N}%]+/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private isExplicitRepeatRequest(content: string): boolean {
+    return /\b(?:show|send|list|repeat)\s+(?:them|it|that|results?|options?)?\s*again\b|\bagain please\b|(?:повтори|покажи|отправь).*(?:ещ[её] раз|снова)|(?:أعد|اعرض|أرسل).*(?:مرة أخرى|مجدداً)/iu.test(content);
   }
 
   private composeContextualReply(reply: string, next?: string): string {
