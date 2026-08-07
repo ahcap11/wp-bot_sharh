@@ -125,6 +125,41 @@ describe('SharhApiService', () => {
 
 
 
+
+  it('syncs legacy persisted lead snapshots with missing newer buyer fields', async () => {
+    const fetchMock = jest.fn().mockResolvedValue(response(200, { ok: true }));
+    global.fetch = fetchMock as typeof fetch;
+    const service = new SharhApiService(config());
+
+    // Old durable outbox entries predate buyerMinimumRoiPct and several other
+    // qualification fields. Runtime deserialization can therefore produce
+    // undefined values even though the current TypeScript interface is stricter.
+    const legacyRecord = {
+      chatId: 'legacy-chat',
+      sourceJid: '971501234567@s.whatsapp.net',
+      timestamp: new Date().toISOString(),
+      inquiryPurpose: 'selling',
+      status: 'new',
+      funnelStage: 'qualifying',
+      owner: 'bot',
+      language: 'en',
+      businessType: 'Legacy business',
+    } as unknown as import('../services/lead-capture.service').LeadCaptureRecord;
+
+    await expect(
+      service.syncLeadSnapshot(legacyRecord, 'legacy-idem')
+    ).resolves.toBe(true);
+
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    const body = JSON.parse(String(init.body)) as {
+      qualification: Record<string, unknown>;
+    };
+    expect(body.qualification['buyer_min_roi_pct']).toBeNull();
+    expect(body.qualification['buyer_min_annual_profit_aed']).toBeNull();
+    expect(body.qualification['year_established']).toBeNull();
+    expect(body.qualification['employee_count']).toBeNull();
+  });
+
   it('creates an access request without granting access', async () => {
     const fetchMock = jest.fn().mockResolvedValue(response(201, { id: 'ar-1' }));
     global.fetch = fetchMock as typeof fetch;

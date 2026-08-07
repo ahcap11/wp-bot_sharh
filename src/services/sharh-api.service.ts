@@ -685,7 +685,11 @@ export class SharhApiService {
     }
   }
 
-  private parseAed(value: string): number | null {
+  private parseAed(value: unknown): number | null {
+    if (typeof value === 'number') {
+      return Number.isFinite(value) ? value : null;
+    }
+    if (typeof value !== 'string' || !value.trim()) return null;
     const match = value.match(/([\d,.]+)/);
     if (!match?.[1]) return null;
     const parsed = Number.parseFloat(match[1].replace(/,/g, ''));
@@ -884,9 +888,7 @@ export class SharhApiService {
         ),
         buyer_min_roi_pct: this.parsePercent(record.buyerMinimumRoiPct),
         buyer_return_period: record.buyerReturnPeriod || null,
-        buyer_excluded_sectors: record.buyerExcludedSectors
-          ? record.buyerExcludedSectors.split(',').map(value => value.trim()).filter(Boolean)
-          : [],
+        buyer_excluded_sectors: this.splitText(record.buyerExcludedSectors, ','),
         buyer_profitable_only: record.buyerProfitableOnly,
         contact_preference: record.contactPreference || null,
       },
@@ -896,46 +898,61 @@ export class SharhApiService {
         score: record.leadScore,
         grade: record.leadGrade,
         temperature: record.leadTemperature,
-        score_reasons: record.scoreReasons
-          ? record.scoreReasons.split('|').map(value => value.trim()).filter(Boolean)
-          : [],
-        risk_flags: record.riskFlags
-          ? record.riskFlags.split('|').map(value => value.trim()).filter(Boolean)
-          : [],
+        score_reasons: this.splitText(record.scoreReasons, '|'),
+        risk_flags: this.splitText(record.riskFlags, '|'),
         next_best_action: record.nextBestAction,
         next_best_action_code: record.nextBestActionCode,
-        objections_detected: record.objectionsDetected
-          ? record.objectionsDetected.split(',').map(value => value.trim()).filter(Boolean)
-          : [],
+        objections_detected: this.splitText(record.objectionsDetected, ','),
         conversation_summary: record.conversationSummary,
         review_brief: record.reviewBrief,
       },
       next_field: record.nextField || null,
       next_step: record.nextStep || null,
-      fields_updated: record.fieldsUpdated
-        ? record.fieldsUpdated.split(',').map(value => value.trim()).filter(Boolean)
-        : [],
+      fields_updated: this.splitText(record.fieldsUpdated, ','),
       latest_message: record.latestMessage || null,
       notes: record.notes || null,
     };
   }
 
-  private parsePercent(value: string): number | null {
+  private splitText(value: unknown, delimiter: string): string[] {
+    if (typeof value !== 'string' || !value.trim()) return [];
+    return value
+      .split(delimiter)
+      .map(item => item.trim())
+      .filter(Boolean);
+  }
+
+  private parsePercent(value: unknown): number | null {
+    if (typeof value === 'number') {
+      return Number.isFinite(value) ? value : null;
+    }
+    if (typeof value !== 'string' || !value.trim()) return null;
     const match = value.match(/(\d+(?:\.\d+)?)\s*%?/);
     if (!match?.[1]) return null;
     const parsed = Number.parseFloat(match[1]);
     return Number.isFinite(parsed) ? parsed : null;
   }
 
-  private parseInteger(value: string): number | null {
+  private parseInteger(value: unknown): number | null {
+    if (typeof value === 'number') {
+      return Number.isSafeInteger(value) ? value : null;
+    }
+    if (typeof value !== 'string' || !value.trim()) return null;
     const match = value.match(/\d[\d,]*/);
     if (!match) return null;
     const parsed = Number.parseInt(match[0].replace(/,/g, ''), 10);
     return Number.isSafeInteger(parsed) ? parsed : null;
   }
 
-  private parseAedValues(value: string): number[] {
-    if (!value || /unknown|to confirm/i.test(value)) return [];
+  private parseAedValues(value: unknown): number[] {
+    if (typeof value === 'number') {
+      return Number.isFinite(value) && Number.isSafeInteger(Math.round(value))
+        ? [Math.round(value)]
+        : [];
+    }
+    if (typeof value !== 'string' || !value.trim() || /unknown|to confirm/i.test(value)) {
+      return [];
+    }
     const matches = value.matchAll(/(?<!\d)(-?\d[\d,.]*)(?:\s*)(k|m|b|thousand|million|billion)?/gi);
     const values: number[] = [];
     for (const match of matches) {
@@ -955,19 +972,19 @@ export class SharhApiService {
     return values;
   }
 
-  private parseAedRepresentative(value: string): number | null {
+  private parseAedRepresentative(value: unknown): number | null {
     const values = this.parseAedValues(value);
     if (values.length === 0) return null;
     if (values.length === 1) return values[0] ?? null;
     return Math.round((Math.min(...values) + Math.max(...values)) / 2);
   }
 
-  private parseAedUpperBound(value: string): number | null {
+  private parseAedUpperBound(value: unknown): number | null {
     const values = this.parseAedValues(value);
     return values.length > 0 ? Math.max(...values) : null;
   }
 
-  private parseAedLowerBound(value: string): number | null {
+  private parseAedLowerBound(value: unknown): number | null {
     const values = this.parseAedValues(value);
     return values.length > 0 ? Math.min(...values) : null;
   }

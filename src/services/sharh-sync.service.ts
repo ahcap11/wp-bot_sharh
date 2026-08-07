@@ -45,10 +45,10 @@ export class SharhSyncService {
 
     const config = this.api.getConfig();
     this.interval = setInterval(() => {
-      void this.flush();
+      this.triggerFlush();
     }, config.syncIntervalMs);
     this.interval.unref();
-    void this.flush();
+    this.triggerFlush();
   }
 
   stop(): void {
@@ -206,7 +206,15 @@ export class SharhSyncService {
     };
     this.operations.set(operation.id, operation);
     this.persistence?.setItem(OUTBOX_NAMESPACE, operation.id, operation);
-    void this.flush();
+    this.triggerFlush();
+  }
+
+  private triggerFlush(): void {
+    void this.flush().catch(error => {
+      logger.error('Unexpected SHARH outbox flush failure; process will continue', {
+        error: error instanceof Error ? error.message : 'unknown error',
+      });
+    });
   }
 
   private async flushInternal(): Promise<void> {
@@ -218,7 +226,21 @@ export class SharhSyncService {
       .slice(0, config.syncBatchSize);
 
     for (const operation of due) {
-      const succeeded = await this.dispatch(operation);
+      let succeeded = false;
+      let failureReason = 'SHARH API request failed';
+
+      try {
+        succeeded = await this.dispatch(operation);
+      } catch (error) {
+        failureReason =
+          error instanceof Error ? error.message : 'unexpected dispatch error';
+        logger.error('SHARH sync operation threw; keeping bot process alive', {
+          operationId: operation.id,
+          kind: operation.kind,
+          error: failureReason,
+        });
+      }
+
       if (succeeded) {
         this.operations.delete(operation.id);
         this.persistence?.removeItem(OUTBOX_NAMESPACE, operation.id);
@@ -226,13 +248,14 @@ export class SharhSyncService {
       }
 
       operation.attempts += 1;
-      operation.lastError = 'SHARH API request failed';
+      operation.lastError = failureReason;
       if (operation.attempts >= config.syncMaxAttempts) {
         operation.nextAttemptAt = Date.now() + 60 * 60 * 1000;
         logger.error('SHARH sync operation reached retry limit', {
           operationId: operation.id,
           kind: operation.kind,
           attempts: operation.attempts,
+          error: operation.lastError,
         });
       } else {
         operation.nextAttemptAt = Date.now() + this.backoffMs(operation.attempts);
