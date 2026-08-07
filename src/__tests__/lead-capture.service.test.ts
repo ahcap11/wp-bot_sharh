@@ -117,15 +117,81 @@ describe('LeadCaptureService', () => {
     });
   });
 
-  it('can start a buyer search with category plus either location or budget', () => {
+  it('requires a budget before running a generic buyer search', () => {
     const chatId = 'buyer-location-only';
     turn(chatId, 'b1', 'buy');
     const result = turn(chatId, 'b2', 'Healthcare business in Abu Dhabi', false);
 
-    expect(result.status).toBe('qualified');
+    expect(result.status).toBe('contacted');
+    expect(result.directive.expectedField).toBe('buyer_budget_aed');
     expect(service.getCurrentRecord(chatId)).toMatchObject({
       businessType: 'Healthcare business',
       buyerLocation: 'Abu Dhabi',
+    });
+  });
+
+  it('captures strict buyer economics from the screenshot request on the first turn', () => {
+    const chatId = 'buyer-strict-return';
+    turn(
+      chatId,
+      'b1',
+      'I am looking for cash generating business, my budget is 1M aed, if it brings more than 300K passively it is good for me',
+      false
+    );
+
+    const record = service.getCurrentRecord(chatId);
+    expect(record).toMatchObject({
+      inquiryPurpose: 'buying',
+      businessType: 'Any profitable business',
+      buyerBudgetAed: 'AED 1,000,000',
+      buyerInvolvement: 'Passive required',
+      buyerReturnPeriod: 'ambiguous',
+      buyerMinimumAnnualProfitAed: '',
+      buyerProfitableOnly: true,
+      desiredSellingPriceAed: '',
+    });
+  });
+
+  it('resolves annual return clarification and supports later criteria changes', () => {
+    const chatId = 'buyer-criteria-correction';
+    turn(chatId, 'b1', 'buy');
+    turn(
+      chatId,
+      'b2',
+      'Any profitable business, budget AED 1,000,000, profit above AED 300,000, passive',
+      false
+    );
+    turn(chatId, 'b3', 'Annual. Exclude restaurants and gyms.', false);
+
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      buyerMinimumAnnualProfitAed: 'AED 300,000',
+      buyerReturnPeriod: 'annual',
+      buyerInvolvement: 'Passive required',
+      buyerExcludedSectors: 'restaurants, gyms',
+    });
+
+    turn(chatId, 'b4', 'Budget 1.5M and active management is acceptable', false);
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      buyerBudgetAed: 'AED 1,500,000',
+      buyerInvolvement: 'Open to either',
+    });
+  });
+
+  it('keeps an any-sector flexible-budget request generic across sentences', () => {
+    const chatId = 'buyer-flexible-generic';
+    turn(
+      chatId,
+      'b1',
+      'I want to buy any profitable business. My budget is flexible, active management is acceptable.',
+      false
+    );
+
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      inquiryPurpose: 'buying',
+      businessType: 'Any profitable business',
+      buyerBudgetAed: 'Flexible / no fixed maximum',
+      buyerInvolvement: 'Open to either',
+      buyerProfitableOnly: true,
     });
   });
 

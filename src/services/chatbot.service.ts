@@ -26,6 +26,7 @@ import {
 } from '../types';
 import { logger } from '../utils/logger';
 import { SHARH_FEE_TERMS } from '../playbooks/sharh-sales.v1';
+import { BuyerCriteriaService, BuyerSearchCriteria } from './buyer-criteria.service';
 
 const ROLES_PERSISTENCE_NAMESPACE = 'chatRoles';
 const INBOUND_DEDUP_NAMESPACE = 'processedInboundMessages';
@@ -72,6 +73,7 @@ export class ChatbotService {
   private readonly buyerListingCodes: Map<string, string[]> = new Map();
   private readonly adminOutboxSent: Map<string, string> = new Map();
   private readonly pendingConversationResets: Set<string> = new Set();
+  private readonly buyerCriteriaService = new BuyerCriteriaService();
   private adminOutboxTimer: ReturnType<typeof setInterval> | null = null;
   private adminOutboxProcessing = false;
 
@@ -1433,13 +1435,29 @@ export class ChatbotService {
       'business_type',
       'buyer_location',
       'buyer_budget_aed',
+      'buyer_involvement',
+      'buyer_additional_comments',
+      'buyer_minimum_annual_profit_aed',
+      'buyer_minimum_roi_pct',
+      'buyer_return_period',
+      'buyer_excluded_sectors',
+      'buyer_profitable_only',
     ].some(field => changed.has(field));
 
-    if (!force && !explicitRequest && !criteriaChanged && record.status !== 'qualified') {
+    if (!force && !explicitRequest && !criteriaChanged) {
       return null;
     }
     if (!hasSearchCriteria && !explicitRequest) {
       return null;
+    }
+
+    const criteria = this.buyerCriteriaService.fromRecord(record);
+    const clarification = this.buyerCriteriaService.clarificationMessage(
+      criteria,
+      record.language
+    );
+    if (!record.specificListingCode && clarification) {
+      return clarification;
     }
 
     const fingerprint = [
@@ -1447,6 +1465,13 @@ export class ChatbotService {
       record.businessType.toLowerCase(),
       record.buyerLocation.toLowerCase(),
       record.buyerBudgetAed.toLowerCase(),
+      record.buyerInvolvement.toLowerCase(),
+      record.buyerAdditionalComments.toLowerCase(),
+      record.buyerMinimumAnnualProfitAed.toLowerCase(),
+      record.buyerMinimumRoiPct.toLowerCase(),
+      record.buyerReturnPeriod.toLowerCase(),
+      record.buyerExcludedSectors.toLowerCase(),
+      String(record.buyerProfitableOnly),
     ].join('|');
     if (!force && !explicitRequest && this.buyerMatchFingerprints.get(chatId) === fingerprint) {
       return null;
@@ -1460,29 +1485,51 @@ export class ChatbotService {
     this.persistence?.setItem(BUYER_MATCHES_NAMESPACE, chatId, fingerprint);
 
     const nextPrompt = directive.directResponse?.trim() || '';
-    const response = this.formatBuyerListingResults(chatId, record, rows);
-    return [response, nextPrompt].filter(Boolean).join('\n\n');
+    const response = this.formatBuyerListingResults(chatId, record, criteria, rows);
+    const appendNextPrompt = Boolean(
+      nextPrompt &&
+      !/open a result|replying with its number|refine the search|открыть вариант|أرسل رقمه/i.test(nextPrompt)
+    );
+    return [response, appendNextPrompt ? nextPrompt : ''].filter(Boolean).join('\n\n');
   }
 
   private formatBuyerListingResults(
     chatId: string,
     record: LeadCaptureRecord,
+    criteria: BuyerSearchCriteria,
     rows: Array<Record<string, unknown>>
   ): string {
     const language = record.language;
     if (rows.length === 0) {
       if (record.specificListingCode) {
         return language === 'ru'
-          ? `Листинг ${record.specificListingCode} сейчас недоступен в опубликованном маркетплейсе. Я сохранил ваш запрос.`
+          ? `Листинг ${record.specificListingCode} сейчас недоступен среди опубликованных предложений. Запрос сохранён.`
           : language === 'ar'
-            ? `الإعلان ${record.specificListingCode} غير متاح حالياً في السوق المنشور. تم حفظ طلبك.`
-            : `Listing ${record.specificListingCode} is not currently available in the published marketplace. I saved your request.`;
+            ? `الإعلان ${record.specificListingCode} غير متاح حالياً ضمن الفرص المنشورة. تم حفظ الطلب.`
+            : `Listing ${record.specificListingCode} is not currently available among published opportunities. The request is saved.`;
       }
-      return language === 'ru'
-        ? 'Сейчас я не нашёл точного опубликованного совпадения по этим критериям. Ваш запрос сохранён, и вы можете уточнить сектор, эмират или бюджет.'
-        : language === 'ar'
-          ? 'لم أجد حالياً تطابقاً منشوراً دقيقاً مع هذه المعايير. تم حفظ طلبك، ويمكنك تعديل القطاع أو الإمارة أو الميزانية.'
-          : 'I do not currently see an exact published match for those criteria. Your request is saved, and you can adjust the sector, emirate, or budget.';
+
+      const summary = this.buyerCriteriaService.compactSummary(criteria, language);
+      const rendered = summary.map(item => `• ${item}`).join('\n');
+      if (language === 'ru') {
+        return [
+          'Сейчас нет опубликованного листинга, который одновременно соответствует всем обязательным критериям:',
+          rendered,
+          'Случайные или финансово неподтверждённые варианты показываться не будут. Критерии сохранены. Для нового поиска можно написать, например: «прибыль от 250K в год», «можно активное управление» или «бюджет 1.5M».',
+        ].filter(Boolean).join('\n');
+      }
+      if (language === 'ar') {
+        return [
+          'لا يوجد حالياً إعلان منشور يطابق جميع الشروط الإلزامية معاً:',
+          rendered,
+          'لن أعرض خيارات عشوائية أو بيانات مالية غير معلنة. تم حفظ المعايير. يمكنك تعديل البحث بعبارات مثل: «ربح سنوي 250K»، أو «الإدارة النشطة مقبولة»، أو «الميزانية 1.5M».',
+        ].filter(Boolean).join('\n');
+      }
+      return [
+        'There is currently no published listing that meets all hard criteria at the same time:',
+        rendered,
+        'I will not substitute random listings or listings with missing required financial data. Your criteria are saved. To revise the search, send a change such as “annual profit 250K”, “active management is acceptable”, or “budget 1.5M”.',
+      ].filter(Boolean).join('\n');
     }
 
     const codes = rows
@@ -1494,31 +1541,176 @@ export class ChatbotService {
       this.persistence?.setItem(BUYER_LISTING_CODES_NAMESPACE, chatId, codes);
     }
 
-    const header = language === 'ru'
-      ? 'Ближайшие опубликованные варианты:'
-      : language === 'ar'
-        ? 'أقرب الخيارات المنشورة:'
-        : 'Closest published options:';
+    const exactCode = Boolean(record.specificListingCode);
+    const header = exactCode
+      ? language === 'ru'
+        ? 'Опубликованный листинг:'
+        : language === 'ar'
+          ? 'الإعلان المنشور:'
+          : 'Published listing:'
+      : language === 'ru'
+        ? 'Опубликованные варианты, соответствующие обязательным критериям:'
+        : language === 'ar'
+          ? 'الخيارات المنشورة المطابقة للشروط الإلزامية:'
+          : 'Published options meeting all hard criteria:';
+
+    const criteriaItems = exactCode
+      ? []
+      : this.buyerCriteriaService.compactSummary(criteria, language);
+    const criteriaBlock = criteriaItems.length > 0
+      ? [
+          language === 'ru'
+            ? 'Применённые критерии:'
+            : language === 'ar'
+              ? 'المعايير المطبقة:'
+              : 'Applied criteria:',
+          ...criteriaItems.map(item => `• ${item}`),
+        ].join('\n')
+      : '';
+
     const lines = rows.map((row, index) => {
       const code = String(row['public_code'] || '').trim();
       const title = String(row['title'] || 'Business opportunity').trim();
       const location = String(row['emirate'] || row['region'] || '').trim();
       const sector = String(row['sector'] || '').trim();
-      const price = String(row['asking'] || row['price'] || '').trim();
-      const details = [location, sector, price].filter(Boolean).join(' · ');
+      const priceNumber = this.readPositiveNumber(
+        row['parsed_price_aed'] ?? row['price_int']
+      );
+      const priceText = priceNumber !== null
+        ? `AED ${priceNumber.toLocaleString('en-US')}`
+        : String(row['asking'] || row['price'] || '').trim();
+      const annualProfit = this.readPositiveNumber(
+        row['annual_profit_aed'] ?? row['ebitda']
+      );
+      const roi = this.readPositiveNumber(row['roi_pct']);
+      const passive = row['passive_evidence'] === true;
+      const reasons = Array.isArray(row['match_reasons'])
+        ? row['match_reasons']
+            .map(value => this.localizeBuyerMatchLabel(String(value), language))
+            .filter(Boolean)
+        : [];
+      const gaps = Array.isArray(row['match_gaps'])
+        ? row['match_gaps']
+            .map(value => this.localizeBuyerMatchLabel(String(value), language))
+            .filter(Boolean)
+        : [];
+      const details = [location, sector, priceText].filter(Boolean).join(' · ');
+      const metrics: string[] = [];
+      if (annualProfit !== null) {
+        metrics.push(
+          language === 'ru'
+            ? `Годовая прибыль: AED ${annualProfit.toLocaleString('en-US')}`
+            : language === 'ar'
+              ? `الربح السنوي: ${annualProfit.toLocaleString('en-US')} درهم`
+              : `Annual profit: AED ${annualProfit.toLocaleString('en-US')}`
+        );
+      }
+      if (roi !== null) {
+        metrics.push(`ROI: ${roi.toLocaleString('en-US')}%`);
+      }
+      if (passive) {
+        metrics.push(
+          language === 'ru'
+            ? 'Пассивное/управляемое ведение указано в листинге'
+            : language === 'ar'
+              ? 'الإدارة التشغيلية المناسبة لدور سلبي مذكورة في الإعلان'
+              : 'Passive/manager-run operation indicated in listing'
+        );
+      }
+      const matchLine = reasons.length > 0
+        ? language === 'ru'
+          ? `Почему подходит: ${reasons.join(', ')}`
+          : language === 'ar'
+            ? `سبب المطابقة: ${reasons.join(', ')}`
+            : `Why it fits: ${reasons.join(', ')}`
+        : '';
+      const gapLine = gaps.length > 0
+        ? language === 'ru'
+          ? `Ограничение: ${gaps.join(', ')}`
+          : language === 'ar'
+            ? `ملاحظة: ${gaps.join(', ')}`
+            : `Caveat: ${gaps.join(', ')}`
+        : '';
       const webBase = (process.env['SHARH_WEB_BASE_URL'] || 'https://sharh.ae').replace(/\/$/, '');
       const listingId = String(row['id'] || '').trim();
       const url = listingId ? `${webBase}/listings/${encodeURIComponent(listingId)}` : '';
-      return `${index + 1}. ${code ? `${code} — ` : ''}${title}${details ? `
-   ${details}` : ''}${url ? `
-   ${url}` : ''}`;
+      return [
+        `${index + 1}. ${code ? `${code} — ` : ''}${title}`,
+        details ? `   ${details}` : '',
+        metrics.length ? `   ${metrics.join(' · ')}` : '',
+        matchLine ? `   ${matchLine}` : '',
+        gapLine ? `   ${gapLine}` : '',
+        url ? `   ${url}` : '',
+      ].filter(Boolean).join('\n');
     });
-    const footer = language === 'ru'
-      ? 'Ответьте 1, 2 или 3 либо отправьте код SH-XXXX, чтобы открыть конкретный вариант.'
-      : language === 'ar'
-        ? 'أجب 1 أو 2 أو 3، أو أرسل رمز SH-XXXX لعرض خيار محدد.'
-        : 'Reply 1, 2, or 3, or send the SH-XXXX code to open a specific option.';
-    return [header, ...lines, footer].join('\n');
+
+    const footer = exactCode
+      ? language === 'ru'
+        ? 'Финансовые и операционные данные основаны на опубликованном листинге и подлежат проверке в due diligence.'
+        : language === 'ar'
+          ? 'البيانات المالية والتشغيلية مأخوذة من الإعلان المنشور وتخضع للتحقق أثناء الفحص النافي للجهالة.'
+          : 'Financial and operating data come from the published listing and remain subject to due diligence.'
+      : language === 'ru'
+        ? 'Ответьте номером или кодом SH-XXXX. Финансовые показатели и пассивность необходимо подтвердить в due diligence.'
+        : language === 'ar'
+          ? 'أرسل الرقم أو رمز SH-XXXX. يجب التحقق من الأرقام المالية وطبيعة الإدارة أثناء الفحص النافي للجهالة.'
+          : 'Reply with the number or SH-XXXX code. Financial figures and passive-operation claims must be confirmed in due diligence.';
+    return [header, criteriaBlock, ...lines, footer].filter(Boolean).join('\n');
+  }
+
+  private localizeBuyerMatchLabel(
+    value: string,
+    language: LeadCaptureRecord['language']
+  ): string {
+    const key = value.trim().toLowerCase();
+    const labels: Record<string, Record<LeadCaptureRecord['language'], string>> = {
+      'sector fit': { en: 'sector fit', ru: 'подходящая сфера', ar: 'تطابق القطاع' },
+      'location fit': { en: 'location fit', ru: 'подходящая локация', ar: 'تطابق الموقع' },
+      'within budget': { en: 'within budget', ru: 'в пределах бюджета', ar: 'ضمن الميزانية' },
+      'minimum annual earnings met': {
+        en: 'minimum annual profit met',
+        ru: 'минимальная годовая прибыль достигнута',
+        ar: 'تحقق الحد الأدنى للربح السنوي',
+      },
+      'positive earnings disclosed': {
+        en: 'positive profit disclosed',
+        ru: 'раскрыта положительная прибыль',
+        ar: 'تم الإفصاح عن ربح إيجابي',
+      },
+      'minimum roi met': { en: 'minimum ROI met', ru: 'минимальный ROI достигнут', ar: 'تحقق الحد الأدنى للعائد' },
+      'managed/passive operation indicated': {
+        en: 'manager-run/passive operation indicated',
+        ru: 'указано управление без постоянного участия владельца',
+        ar: 'تشغيل مُدار يسمح بدور سلبي',
+      },
+      'passive operation not evidenced': {
+        en: 'passive operation is not evidenced',
+        ru: 'пассивное управление не подтверждено описанием',
+        ar: 'التشغيل السلبي غير مثبت في الوصف',
+      },
+      'asking price not disclosed': {
+        en: 'asking price is not disclosed',
+        ru: 'цена не раскрыта',
+        ar: 'سعر البيع غير معلن',
+      },
+      'earnings not disclosed': {
+        en: 'profit is not disclosed',
+        ru: 'прибыль не раскрыта',
+        ar: 'الربح غير معلن',
+      },
+    };
+    return labels[key]?.[language] || value;
+  }
+
+  private readPositiveNumber(value: unknown): number | null {
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+      return Math.round(value * 10) / 10;
+    }
+    if (typeof value !== 'string') return null;
+    const match = value.replace(/,/g, '').match(/-?\d+(?:\.\d+)?/);
+    if (!match?.[0]) return null;
+    const parsed = Number.parseFloat(match[0]);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
   }
 
   private resolveBuyerListingSelection(chatId: string, content: string): string | null {

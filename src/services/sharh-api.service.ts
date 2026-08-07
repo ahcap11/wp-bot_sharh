@@ -6,6 +6,7 @@ import type {
 } from '../types';
 import type { LeadCaptureRecord } from './lead-capture.service';
 import { logger } from '../utils/logger';
+import { BuyerCriteriaService } from './buyer-criteria.service';
 
 export type PublicListingRow = Record<string, unknown>;
 
@@ -59,6 +60,7 @@ interface CachedContext {
  */
 export class SharhApiService {
   private readonly config: SharhApiConfig;
+  private readonly buyerCriteria = new BuyerCriteriaService();
   private readonly contextCache: Map<string, CachedContext> = new Map();
   private reachable: boolean | null = null;
   private lastSuccessAt?: string | undefined;
@@ -148,22 +150,50 @@ export class SharhApiService {
       return [];
     }
 
+    const criteria = this.buyerCriteria.fromRecord(record);
     const params = new URLSearchParams();
-    const cleanSector = record.businessType.trim();
-    const cleanLocation = record.buyerLocation.trim();
-    const maxBudget = this.parseAedUpperBound(record.buyerBudgetAed);
-
-    if (cleanSector) {
-      params.set('q', cleanSector);
-      params.set('sector', cleanSector);
+    if (criteria.sector) {
+      params.set('q', criteria.sector);
+      params.set('sector', criteria.sector);
     }
-    if (cleanLocation && !/unknown|to confirm/i.test(cleanLocation)) {
-      params.set('emirate', cleanLocation);
+    if (criteria.emirate) {
+      params.set('emirate', criteria.emirate);
     }
-    if (maxBudget !== null) {
-      params.set('max_price_aed', String(maxBudget));
+    if (criteria.maxBudgetAed !== null) {
+      params.set('max_price_aed', String(criteria.maxBudgetAed));
+    }
+    if (criteria.minAnnualProfitAed !== null) {
+      params.set('min_profit_aed', String(criteria.minAnnualProfitAed));
+    }
+    if (criteria.minRoiPct !== null) {
+      params.set('min_roi_pct', String(criteria.minRoiPct));
+    }
+    if (criteria.profitableOnly) {
+      params.set('profitable_only', 'true');
+    }
+    if (criteria.passivePreference !== 'any') {
+      params.set('passive_preference', criteria.passivePreference);
+    }
+    for (const excluded of criteria.excludedSectors) {
+      params.append('excluded_sector', excluded);
     }
     params.set('limit', String(Math.max(1, Math.min(3, limit))));
+
+    // A generic buyer search must still have a real hard criterion. This also
+    // prevents a malformed state from requesting arbitrary published listings.
+    const hasCriterion = Boolean(
+      criteria.sector ||
+      criteria.emirate ||
+      criteria.maxBudgetAed !== null ||
+      criteria.minAnnualProfitAed !== null ||
+      criteria.minRoiPct !== null ||
+      criteria.profitableOnly ||
+      criteria.passivePreference !== 'any' ||
+      criteria.excludedSectors.length > 0
+    );
+    if (!hasCriterion) {
+      return [];
+    }
 
     const result = await this.request<unknown>(
       'GET',
@@ -849,6 +879,15 @@ export class SharhApiService {
         buyer_involvement: record.buyerInvolvement || null,
         buyer_funding_status: record.buyerFundingStatus || null,
         buyer_additional_comments: record.buyerAdditionalComments || null,
+        buyer_min_annual_profit_aed: this.parseAedLowerBound(
+          record.buyerMinimumAnnualProfitAed
+        ),
+        buyer_min_roi_pct: this.parsePercent(record.buyerMinimumRoiPct),
+        buyer_return_period: record.buyerReturnPeriod || null,
+        buyer_excluded_sectors: record.buyerExcludedSectors
+          ? record.buyerExcludedSectors.split(',').map(value => value.trim()).filter(Boolean)
+          : [],
+        buyer_profitable_only: record.buyerProfitableOnly,
         contact_preference: record.contactPreference || null,
       },
       completion_percent: record.completionPercent,
@@ -879,6 +918,13 @@ export class SharhApiService {
       latest_message: record.latestMessage || null,
       notes: record.notes || null,
     };
+  }
+
+  private parsePercent(value: string): number | null {
+    const match = value.match(/(\d+(?:\.\d+)?)\s*%?/);
+    if (!match?.[1]) return null;
+    const parsed = Number.parseFloat(match[1]);
+    return Number.isFinite(parsed) ? parsed : null;
   }
 
   private parseInteger(value: string): number | null {
@@ -919,6 +965,11 @@ export class SharhApiService {
   private parseAedUpperBound(value: string): number | null {
     const values = this.parseAedValues(value);
     return values.length > 0 ? Math.max(...values) : null;
+  }
+
+  private parseAedLowerBound(value: string): number | null {
+    const values = this.parseAedValues(value);
+    return values.length > 0 ? Math.min(...values) : null;
   }
 
   private compactError(status: number, responseText: string): string {

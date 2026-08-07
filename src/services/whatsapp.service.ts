@@ -389,6 +389,8 @@ export class WhatsAppService implements MessagingTransport {
     const phoneJid = this.firstPhoneJid(
       this.getKeyString(msg, 'remoteJidAlt'),
       this.getKeyString(msg, 'senderPn'),
+      this.getKeyString(msg, 'participantPn'),
+      this.getKeyString(msg, 'participantAlt'),
       remoteJid
     );
 
@@ -404,8 +406,12 @@ export class WhatsAppService implements MessagingTransport {
     field: string
   ): string {
     const key = msg.key as unknown as Record<string, unknown>;
-    const value = key[field];
-    return typeof value === 'string' ? value : '';
+    const message = msg as unknown as Record<string, unknown>;
+    const candidates = [key[field], message[field]];
+    for (const value of candidates) {
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return '';
   }
 
   private firstPhoneJid(...values: string[]): string | null {

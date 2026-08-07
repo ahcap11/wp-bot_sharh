@@ -58,6 +58,35 @@ describe('SharhApiService', () => {
     ]);
   });
 
+  it('sends strict buyer criteria to the server-side matcher', async () => {
+    const fetchMock = jest.fn().mockResolvedValue(response(200, { items: [] }));
+    global.fetch = fetchMock as typeof fetch;
+    const service = new SharhApiService(config());
+    const lead = {
+      inquiryPurpose: 'buying',
+      businessType: 'Any profitable business',
+      buyerLocation: '',
+      buyerBudgetAed: 'AED 1,000,000',
+      buyerMinimumAnnualProfitAed: 'AED 300,000',
+      buyerMinimumRoiPct: '',
+      buyerInvolvement: 'Passive required',
+      buyerAdditionalComments: '',
+      buyerReturnPeriod: 'annual',
+      buyerExcludedSectors: 'restaurant',
+      buyerProfitableOnly: true,
+    } as import('../services/lead-capture.service').LeadCaptureRecord;
+
+    await service.searchBuyerMatches(lead, 3);
+
+    const calledUrl = new URL(String(fetchMock.mock.calls[0]?.[0]));
+    expect(calledUrl.pathname).toBe('/api/v1/bot/listings/search');
+    expect(calledUrl.searchParams.get('max_price_aed')).toBe('1000000');
+    expect(calledUrl.searchParams.get('min_profit_aed')).toBe('300000');
+    expect(calledUrl.searchParams.get('profitable_only')).toBe('true');
+    expect(calledUrl.searchParams.get('passive_preference')).toBe('required');
+    expect(calledUrl.searchParams.getAll('excluded_sector')).toEqual(['restaurant']);
+  });
+
   it('sends service identity and idempotency headers for message ingestion', async () => {
     const fetchMock = jest.fn().mockResolvedValue(response(201, { id: 'm-1' }));
     global.fetch = fetchMock as typeof fetch;

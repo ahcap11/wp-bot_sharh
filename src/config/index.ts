@@ -151,7 +151,7 @@ const envSchema = Joi.object({
   SHARH_API_BOT_ID: Joi.string().default('whatsapp-funnel'),
   SHARH_API_ALLOW_NEON_FALLBACK: booleanFlag().default(false),
   SHARH_API_PUBLIC_LISTING_FIELDS: Joi.string().default(
-    'public_code,title,subtitle,sector,region,emirate,description,price,revenue,tags,ribbon,sale_type'
+    'id,public_code,title,subtitle,sector,region,emirate,description,price,asking,price_int,revenue,ebitda,monthly_net_profit,tags,ribbon,sale_type,match_score,match_reasons,match_gaps,annual_profit_aed,profit_basis,roi_pct,passive_evidence,passive_evidence_label,parsed_price_aed'
   ),
   SHARH_API_SYNC_INTERVAL_MS: Joi.number()
     .integer()
@@ -444,7 +444,7 @@ export const getSharhApiConfig = (): SharhApiConfig => {
 
   const publicListingFields = (
     process.env['SHARH_API_PUBLIC_LISTING_FIELDS'] ||
-    'public_code,title,subtitle,sector,region,emirate,description,price,revenue,tags,ribbon,sale_type'
+    'id,public_code,title,subtitle,sector,region,emirate,description,price,asking,price_int,revenue,ebitda,monthly_net_profit,tags,ribbon,sale_type,match_score,match_reasons,match_gaps,annual_profit_aed,profit_basis,roi_pct,passive_evidence,passive_evidence_label,parsed_price_aed'
   )
     .split(',')
     .map(value => value.trim())

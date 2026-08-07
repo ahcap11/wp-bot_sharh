@@ -266,6 +266,91 @@ describe('ChatbotService', () => {
     });
   });
 
+  describe('buyer matching presentation', () => {
+    const buyerRecord = {
+      language: 'en',
+      specificListingCode: '',
+      businessType: 'Any profitable business',
+      buyerLocation: '',
+      buyerBudgetAed: 'AED 1,000,000',
+      buyerMinimumAnnualProfitAed: 'AED 300,000',
+      buyerMinimumRoiPct: '',
+      buyerInvolvement: 'Passive required',
+      buyerAdditionalComments: '',
+      buyerReturnPeriod: 'annual',
+      buyerExcludedSectors: '',
+      buyerProfitableOnly: true,
+    } as import('../services/lead-capture.service').LeadCaptureRecord;
+
+    it('does not substitute random listings when no hard match exists', () => {
+      const internal = chatbotService as unknown as {
+        buyerCriteriaService: {
+          fromRecord: (record: typeof buyerRecord) => unknown;
+        };
+        formatBuyerListingResults: (
+          chatId: string,
+          record: typeof buyerRecord,
+          criteria: unknown,
+          rows: Array<Record<string, unknown>>
+        ) => string;
+      };
+      const criteria = internal.buyerCriteriaService.fromRecord(buyerRecord);
+      const result = internal.formatBuyerListingResults(
+        'buyer-chat',
+        buyerRecord,
+        criteria,
+        []
+      );
+
+      expect(result).toContain('price up to AED 1,000,000');
+      expect(result).toContain('annual profit of at least AED 300,000');
+      expect(result).toContain('I will not substitute random listings');
+    });
+
+    it('shows verified match economics and reasons without the duplicated menu', () => {
+      const internal = chatbotService as unknown as {
+        buyerCriteriaService: {
+          fromRecord: (record: typeof buyerRecord) => unknown;
+        };
+        formatBuyerListingResults: (
+          chatId: string,
+          record: typeof buyerRecord,
+          criteria: unknown,
+          rows: Array<Record<string, unknown>>
+        ) => string;
+      };
+      const criteria = internal.buyerCriteriaService.fromRecord(buyerRecord);
+      const result = internal.formatBuyerListingResults(
+        'buyer-chat',
+        buyerRecord,
+        criteria,
+        [
+          {
+            id: 'listing-1',
+            public_code: 'SH-0090',
+            title: 'Managed services company',
+            emirate: 'Dubai',
+            sector: 'Services',
+            parsed_price_aed: 900000,
+            annual_profit_aed: 330000,
+            roi_pct: 36.7,
+            passive_evidence: true,
+            match_reasons: [
+              'within budget',
+              'minimum annual earnings met',
+              'managed/passive operation indicated',
+            ],
+          },
+        ]
+      );
+
+      expect(result).toContain('Annual profit: AED 330,000');
+      expect(result).toContain('ROI: 36.7%');
+      expect(result).toContain('Why it fits: within budget');
+      expect(result).not.toContain('You can also refine the search');
+    });
+  });
+
   describe('cleanup', () => {
     it('should cleanup old histories', () => {
       mockChatHistoryService.cleanupOldHistories = jest.fn().mockReturnValue(5);

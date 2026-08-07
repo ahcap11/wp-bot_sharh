@@ -44,6 +44,11 @@ const SHEET_HEADERS = [
   'buyer_involvement',
   'buyer_funding_status',
   'buyer_additional_comments',
+  'buyer_minimum_annual_profit_aed',
+  'buyer_minimum_roi_pct',
+  'buyer_return_period',
+  'buyer_excluded_sectors',
+  'buyer_profitable_only',
   'completion_percent',
   'next_field',
   'fields_updated',
@@ -371,6 +376,18 @@ export class GoogleSheetsService {
         return this.normalizeCell(record.buyerFundingStatus);
       case 'buyer_additional_comments':
         return this.normalizeCell(record.buyerAdditionalComments);
+      case 'buyer_minimum_annual_profit_aed':
+      case 'buyer_min_annual_profit_aed':
+        return this.normalizeCell(record.buyerMinimumAnnualProfitAed);
+      case 'buyer_minimum_roi_pct':
+      case 'buyer_min_roi_pct':
+        return this.normalizeCell(record.buyerMinimumRoiPct);
+      case 'buyer_return_period':
+        return this.normalizeCell(record.buyerReturnPeriod);
+      case 'buyer_excluded_sectors':
+        return this.normalizeCell(record.buyerExcludedSectors);
+      case 'buyer_profitable_only':
+        return this.normalizeCell(record.buyerProfitableOnly ? 'yes' : 'no');
       case 'completion_percent':
         return this.normalizeCell(String(record.completionPercent));
       case 'next_field':
