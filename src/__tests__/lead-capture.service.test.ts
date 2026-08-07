@@ -186,6 +186,27 @@ describe('LeadCaptureService', () => {
     expect(result.directive.directResponse).not.toContain('success-based only');
   });
 
+  it('updates saved buyer profit and budget criteria after qualification', () => {
+    const chatId = 'buyer-refinement-after-qualified';
+    turn(chatId, 'b1', 'buy');
+    turn(chatId, 'b2', 'any sector 10000000 100000 passive', false);
+
+    turn(chatId, 'b3', 'annual profit 250K', false);
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      buyerBudgetAed: 'AED 10,000,000',
+      buyerMinimumAnnualProfitAed: 'AED 250,000',
+      buyerReturnPeriod: 'annual',
+      buyerInvolvement: 'Passive required',
+    });
+
+    turn(chatId, 'b4', 'budget 1.5M', false);
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      buyerBudgetAed: 'AED 1,500,000',
+      buyerMinimumAnnualProfitAed: 'AED 250,000',
+      buyerInvolvement: 'Passive required',
+    });
+  });
+
   it('accepts the compact buyer reply shown in WhatsApp without misreading money as commission', () => {
     const chatId = 'buyer-compact-numbers';
     turn(chatId, 'b1', 'buy');
@@ -367,4 +388,287 @@ describe('LeadCaptureService', () => {
     expect(duplicate.shouldPersist).toBe(false);
     expect(service.getCurrentRecord('duplicate')?.clientName).toBe('Sam');
   });
+
+  it('parses natural buyer ranges, monthly income and hands-off intent without inventing a sector', () => {
+    const chatId = 'buyer-natural-range-monthly';
+    turn(chatId, 'b1', 'buy');
+    turn(
+      chatId,
+      'b2',
+      "I can spend between 1 and 2 million, want 25k per month, don't want to run it",
+      false
+    );
+
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      businessType: 'Any profitable business',
+      buyerSectorPreference: 'any',
+      buyerBudgetAed: 'AED 2,000,000',
+      buyerMinimumAnnualProfitAed: 'AED 300,000',
+      buyerReturnPeriod: 'monthly',
+      buyerInvolvement: 'Passive required',
+    });
+  });
+
+  it('handles dot-grouped money and p.m. correctly', () => {
+    const chatId = 'buyer-dot-grouped-monthly';
+    turn(chatId, 'b1', 'buy');
+    turn(chatId, 'b2', 'budget 1.000.000, profit 20k p.m.', false);
+
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      businessType: 'Any profitable business',
+      buyerBudgetAed: 'AED 1,000,000',
+      buyerMinimumAnnualProfitAed: 'AED 240,000',
+      buyerReturnPeriod: 'monthly',
+    });
+  });
+
+  it('understands word money, grand and manager-run intent', () => {
+    const chatId = 'buyer-word-money';
+    turn(chatId, 'b1', 'buy');
+    turn(
+      chatId,
+      'b2',
+      'two million budget, nets me 300 grand a year, someone else runs it',
+      false
+    );
+
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      businessType: 'Any profitable business',
+      buyerBudgetAed: 'AED 2,000,000',
+      buyerMinimumAnnualProfitAed: 'AED 300,000',
+      buyerReturnPeriod: 'annual',
+      buyerInvolvement: 'Passive required',
+    });
+  });
+
+  it('distinguishes required sector/location from preferences', () => {
+    const chatId = 'buyer-hard-soft';
+    turn(chatId, 'b1', 'buy');
+    turn(
+      chatId,
+      'b2',
+      'restaurants only, max 1.5 mil, Dubai only, ROI 20 percent, passive preferred',
+      false
+    );
+
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      businessType: 'Restaurants',
+      buyerSectorPreference: 'required',
+      buyerBudgetAed: 'AED 1,500,000',
+      buyerLocation: 'Dubai',
+      buyerLocationPreference: 'required',
+      buyerMinimumRoiPct: '20%',
+      buyerInvolvement: 'Passive preferred',
+    });
+  });
+
+  it('asks what a bare refinement amount means instead of overwriting saved economics', () => {
+    const chatId = 'buyer-bare-refinement';
+    turn(chatId, 'b1', 'buy');
+    turn(chatId, 'b2', 'any sector 10m 100k passive', false);
+    const ambiguous = turn(chatId, 'b3', '250k', false);
+
+    expect(ambiguous.directive.directResponse).toContain('budget or minimum annual profit');
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      buyerBudgetAed: 'AED 10,000,000',
+      buyerMinimumAnnualProfitAed: 'AED 100,000',
+    });
+
+    turn(chatId, 'b4', 'budget', false);
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      buyerBudgetAed: 'AED 250,000',
+      buyerMinimumAnnualProfitAed: 'AED 100,000',
+    });
+  });
+
+  it('never silently relabels a non-AED buyer budget as AED', () => {
+    const chatId = 'buyer-foreign-currency';
+    turn(chatId, 'b1', 'buy');
+    const result = turn(chatId, 'b2', '$1m budget', false);
+
+    expect(service.getCurrentRecord(chatId)?.buyerBudgetAed).toBe('');
+    expect(result.directive.directResponse).toContain('amount in USD');
+    expect(result.directive.directResponse).toContain('AED');
+  });
+
+  it('supports exclusions and later removes an exclusion naturally', () => {
+    const chatId = 'buyer-exclusion-correction';
+    turn(chatId, 'b1', 'buy');
+    turn(chatId, 'b2', 'anything except restaurants and gyms under 2m', false);
+    expect(service.getCurrentRecord(chatId)?.buyerExcludedSectors).toBe('restaurants, gyms');
+
+    turn(chatId, 'b3', 'restaurants are fine now', false);
+    expect(service.getCurrentRecord(chatId)?.buyerExcludedSectors).toBe('gyms');
+  });
+
+  it('does not mistake operational negatives or no-sector preference for excluded sectors', () => {
+    const chatId = 'buyer-negative-language';
+    turn(chatId, 'b1', 'buy');
+    turn(
+      chatId,
+      'b2',
+      'no sector preference, budget 1.5m, income 300k p.a., manager in place',
+      false
+    );
+
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      businessType: 'Any profitable business',
+      buyerSectorPreference: 'any',
+      buyerExcludedSectors: '',
+      buyerBudgetAed: 'AED 1,500,000',
+      buyerMinimumAnnualProfitAed: 'AED 300,000',
+      buyerInvolvement: 'Passive required',
+    });
+  });
+
+  it('keeps word-money values in source order for compact buyer tuples', () => {
+    const chatId = 'buyer-word-money-order';
+    turn(chatId, 'b1', 'buy');
+    turn(chatId, 'b2', 'any sector one and a half million 250k passive', false);
+
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      businessType: 'Any profitable business',
+      buyerSectorPreference: 'any',
+      buyerBudgetAed: 'AED 1,500,000',
+      buyerMinimumAnnualProfitAed: 'AED 250,000',
+      buyerReturnPeriod: 'annual',
+      buyerInvolvement: 'Passive required',
+    });
+  });
+
+  it.each(['make it 250k', 'lower it to 250k', 'set it at 250k'])(
+    'clarifies ambiguous post-profile refinement: %s',
+    phrase => {
+      const chatId = `buyer-ambiguous-refinement-${phrase.replace(/\W+/g, '-')}`;
+      turn(chatId, 'b1', 'buy');
+      turn(chatId, 'b2', 'any sector 10m 100k passive', false);
+      const result = turn(chatId, 'b3', phrase, false);
+
+      expect(result.directive.directResponse).toContain('budget or minimum annual profit');
+      expect(service.getCurrentRecord(chatId)).toMatchObject({
+        buyerBudgetAed: 'AED 10,000,000',
+        buyerMinimumAnnualProfitAed: 'AED 100,000',
+      });
+    }
+  );
+
+  it('treats an unlabeled money range as one budget range, not budget plus profit', () => {
+    const chatId = 'buyer-budget-range';
+    turn(chatId, 'b1', 'buy');
+    turn(chatId, 'b2', 'any sector 500k-1m passive', false);
+
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      businessType: 'Any profitable business',
+      buyerBudgetAed: 'AED 1,000,000',
+      buyerMinimumAnnualProfitAed: '',
+      buyerInvolvement: 'Passive required',
+    });
+  });
+
+  it('uses the corrected values when the buyer changes figures inside the same message', () => {
+    const chatId = 'buyer-same-message-correction';
+    turn(chatId, 'b1', 'buy');
+    turn(
+      chatId,
+      'b2',
+      'budget 2m actually 1.5m, profit 200k actually 300k a year',
+      false
+    );
+
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      buyerBudgetAed: 'AED 1,500,000',
+      buyerMinimumAnnualProfitAed: 'AED 300,000',
+      buyerReturnPeriod: 'annual',
+    });
+  });
+
+  it('understands common buyer typos without weakening financial validation', () => {
+    const chatId = 'buyer-common-typos';
+    turn(chatId, 'b1', 'buy');
+    turn(chatId, 'b2', 'budjet 2 milion, proffit 20k montly, pasive', false);
+
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      buyerBudgetAed: 'AED 2,000,000',
+      buyerMinimumAnnualProfitAed: 'AED 240,000',
+      buyerInvolvement: 'Passive required',
+    });
+  });
+
+  it('normalizes Russian compact money units and Arabic-Indic digits', () => {
+    const russianChat = 'buyer-russian-money';
+    turn(russianChat, 'r1', 'buy');
+    turn(russianChat, 'r2', 'бюджет 2 млн, прибыль 300 тыс в год', false);
+    expect(service.getCurrentRecord(russianChat)).toMatchObject({
+      buyerBudgetAed: 'AED 2,000,000',
+      buyerMinimumAnnualProfitAed: 'AED 300,000',
+    });
+
+    const arabicChat = 'buyer-arabic-digits';
+    turn(arabicChat, 'a1', 'buy');
+    turn(arabicChat, 'a2', 'الميزانية ٢ مليون، الربح ٣٠٠ ألف سنوي', false);
+    expect(service.getCurrentRecord(arabicChat)).toMatchObject({
+      buyerBudgetAed: 'AED 2,000,000',
+      buyerMinimumAnnualProfitAed: 'AED 300,000',
+    });
+  });
+
+  it('normalizes weekly and quarterly earnings into an annual minimum', () => {
+    const weeklyChat = 'buyer-weekly-profit';
+    turn(weeklyChat, 'w1', 'buy');
+    turn(weeklyChat, 'w2', 'budget 2m, profit 10k per week', false);
+    expect(service.getCurrentRecord(weeklyChat)).toMatchObject({
+      buyerBudgetAed: 'AED 2,000,000',
+      buyerMinimumAnnualProfitAed: 'AED 520,000',
+      buyerReturnPeriod: 'annual',
+    });
+
+    const quarterlyChat = 'buyer-quarterly-profit';
+    turn(quarterlyChat, 'q1', 'buy');
+    turn(quarterlyChat, 'q2', 'budget 2m, 100k per quarter', false);
+    expect(service.getCurrentRecord(quarterlyChat)).toMatchObject({
+      buyerBudgetAed: 'AED 2,000,000',
+      buyerMinimumAnnualProfitAed: 'AED 400,000',
+      buyerReturnPeriod: 'annual',
+    });
+  });
+
+  it('keeps passive as a preference when the buyer says if possible', () => {
+    const chatId = 'buyer-passive-soft';
+    turn(chatId, 'b1', 'buy');
+    turn(chatId, 'b2', 'unlimited budget, any sector, passive if possible', false);
+
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      businessType: 'Any profitable business',
+      buyerBudgetAed: 'Flexible / no fixed maximum',
+      buyerInvolvement: 'Passive preferred',
+    });
+  });
+
+  it('recognizes hard sector/location phrased as a must', () => {
+    const chatId = 'buyer-hard-must';
+    turn(chatId, 'b1', 'buy');
+    turn(chatId, 'b2', 'restaurant is a must, Dubai is a must, budget 2m, ROI 15', false);
+
+    expect(service.getCurrentRecord(chatId)).toMatchObject({
+      businessType: 'Restaurant',
+      buyerSectorPreference: 'required',
+      buyerLocation: 'Dubai',
+      buyerLocationPreference: 'required',
+      buyerBudgetAed: 'AED 2,000,000',
+      buyerMinimumRoiPct: '15%',
+    });
+  });
+
+  it('honors same-message sector and location corrections', () => {
+    const sectorChat = 'buyer-sector-correction';
+    turn(sectorChat, 's1', 'buy');
+    turn(sectorChat, 's2', 'restaurant, actually salon, budget 1m', false);
+    expect(service.getCurrentRecord(sectorChat)?.businessType).toBe('Salon');
+
+    const locationChat = 'buyer-location-correction';
+    turn(locationChat, 'l1', 'buy');
+    turn(locationChat, 'l2', 'Dubai, actually Abu Dhabi, budget 1m any sector', false);
+    expect(service.getCurrentRecord(locationChat)?.buyerLocation).toBe('Abu Dhabi');
+  });
+
 });

@@ -4,10 +4,13 @@ import type {
 } from './lead-capture.service';
 
 export type PassivePreference = 'any' | 'preferred' | 'required';
+export type BuyerPreferenceMode = 'any' | 'preferred' | 'required';
 
 export interface BuyerSearchCriteria {
   sector: string;
+  sectorPreference: BuyerPreferenceMode;
   emirate: string;
+  locationPreference: BuyerPreferenceMode;
   maxBudgetAed: number | null;
   budgetFlexible: boolean;
   minAnnualProfitAed: number | null;
@@ -24,30 +27,36 @@ const UNKNOWN_VALUE = /^(?:unknown|not sure|to confirm|anywhere|any location|all
 
 export class BuyerCriteriaService {
   fromRecord(record: LeadCaptureRecord): BuyerSearchCriteria {
-    const sectorRaw = record.businessType.trim();
+    const sectorRaw = String(record.businessType || '').trim();
     const sector = GENERIC_SECTOR.test(sectorRaw) ? '' : sectorRaw;
     const maxBudgetAed = this.parseAedUpperBound(record.buyerBudgetAed);
     const budgetFlexible = /flexible|no fixed|open budget/i.test(
-      record.buyerBudgetAed
+      String(record.buyerBudgetAed || '')
     );
     const minAnnualProfitAed = this.parseAedLowerBound(
       record.buyerMinimumAnnualProfitAed
     );
     const minRoiPct = this.parsePercent(record.buyerMinimumRoiPct);
     const passivePreference = this.resolvePassivePreference(record);
+    const emirateRaw = String(record.buyerLocation || '').trim();
+    const emirate = UNKNOWN_VALUE.test(emirateRaw) ? '' : emirateRaw;
 
     return {
       sector,
-      emirate: UNKNOWN_VALUE.test(record.buyerLocation.trim())
-        ? ''
-        : record.buyerLocation.trim(),
+      sectorPreference: sector
+        ? this.preferenceMode(record.buyerSectorPreference, 'preferred')
+        : 'any',
+      emirate,
+      locationPreference: emirate
+        ? this.preferenceMode(record.buyerLocationPreference, 'preferred')
+        : 'any',
       maxBudgetAed,
       budgetFlexible,
       minAnnualProfitAed,
       minRoiPct,
       profitableOnly: Boolean(record.buyerProfitableOnly || minAnnualProfitAed),
       passivePreference,
-      excludedSectors: record.buyerExcludedSectors
+      excludedSectors: String(record.buyerExcludedSectors || '')
         .split(',')
         .map(value => value.trim())
         .filter(Boolean)
@@ -57,7 +66,7 @@ export class BuyerCriteriaService {
         !record.buyerMinimumAnnualProfitAed,
       ambiguousReturnAmountAed:
         record.buyerReturnPeriod === 'ambiguous'
-          ? this.extractReturnAmount(record.buyerAdditionalComments)
+          ? this.extractReturnAmount(String(record.buyerAdditionalComments || ''))
           : null,
     };
   }
@@ -76,21 +85,21 @@ export class BuyerCriteriaService {
             ? 'المبلغ المذكور'
             : 'the amount you mentioned';
       if (language === 'ru') {
-        return `Перед подбором уточню один момент: ${formatted} — это минимальная чистая прибыль за год или за месяц?`;
+        return `Уточню только одно: ${formatted} — минимальная чистая прибыль за год или за месяц?`;
       }
       if (language === 'ar') {
-        return `قبل البحث، أحتاج إلى توضيح واحد: هل ${formatted} هو الحد الأدنى لصافي الربح سنوياً أم شهرياً؟`;
+        return `توضيح واحد فقط: هل ${formatted} هو الحد الأدنى لصافي الربح سنوياً أم شهرياً؟`;
       }
-      return `Before I match listings, one clarification: is ${formatted} your minimum annual net profit or monthly net profit?`;
+      return `One clarification: is ${formatted} your minimum annual net profit or monthly net profit?`;
     }
     if (criteria.maxBudgetAed === null && !criteria.budgetFlexible) {
       if (language === 'ru') {
-        return 'Какой максимальный бюджет вы готовы выделить? Можно указать приблизительный диапазон.';
+        return 'Какой максимальный бюджет использовать для поиска? Можно приблизительно.';
       }
       if (language === 'ar') {
-        return 'ما الحد الأقصى للميزانية التي يمكنك تخصيصها؟ يكفي نطاق تقريبي.';
+        return 'ما الحد الأقصى للميزانية التي أستخدمها في البحث؟ يكفي رقم تقريبي.';
       }
-      return 'What is the maximum budget you can allocate? An approximate range is enough.';
+      return 'What maximum budget should I use for the search? An approximate figure is enough.';
     }
     return null;
   }
@@ -147,10 +156,10 @@ export class BuyerCriteriaService {
     if (criteria.passivePreference === 'required') {
       values.push(
         language === 'ru'
-          ? 'пассивное/управляемое без владельца ведение подтверждено описанием'
+          ? 'пассивное/управляемое ведение обязательно'
           : language === 'ar'
-            ? 'وجود إدارة تشغيلية تسمح بدور سلبي للمشتري'
-            : 'passive/manager-run operation evidenced in the listing'
+            ? 'التشغيل السلبي/المُدار إلزامي'
+            : 'passive/manager-run operation required'
       );
     } else if (criteria.passivePreference === 'preferred') {
       values.push(
@@ -161,8 +170,36 @@ export class BuyerCriteriaService {
             : 'passive operation preferred'
       );
     }
-    if (criteria.sector) values.push(criteria.sector);
-    if (criteria.emirate) values.push(criteria.emirate);
+    if (criteria.sector) {
+      values.push(
+        criteria.sectorPreference === 'required'
+          ? language === 'ru'
+            ? `только сектор: ${criteria.sector}`
+            : language === 'ar'
+              ? `القطاع إلزامي: ${criteria.sector}`
+              : `sector required: ${criteria.sector}`
+          : language === 'ru'
+            ? `предпочтительный сектор: ${criteria.sector}`
+            : language === 'ar'
+              ? `القطاع المفضل: ${criteria.sector}`
+              : `preferred sector: ${criteria.sector}`
+      );
+    }
+    if (criteria.emirate) {
+      values.push(
+        criteria.locationPreference === 'required'
+          ? language === 'ru'
+            ? `только локация: ${criteria.emirate}`
+            : language === 'ar'
+              ? `الموقع إلزامي: ${criteria.emirate}`
+              : `location required: ${criteria.emirate}`
+          : language === 'ru'
+            ? `предпочтительная локация: ${criteria.emirate}`
+            : language === 'ar'
+              ? `الموقع المفضل: ${criteria.emirate}`
+              : `preferred location: ${criteria.emirate}`
+      );
+    }
     if (criteria.excludedSectors.length > 0) {
       values.push(
         language === 'ru'
@@ -175,8 +212,17 @@ export class BuyerCriteriaService {
     return values;
   }
 
+  private preferenceMode(
+    value: string | undefined,
+    fallback: BuyerPreferenceMode
+  ): BuyerPreferenceMode {
+    return value === 'required' || value === 'preferred' || value === 'any'
+      ? value
+      : fallback;
+  }
+
   private resolvePassivePreference(record: LeadCaptureRecord): PassivePreference {
-    const explicit = record.buyerInvolvement.trim().toLowerCase();
+    const explicit = String(record.buyerInvolvement || '').trim().toLowerCase();
     if (
       /\b(?:open to either|either|active acceptable|active management is acceptable|passive not required|no passive requirement)\b/i.test(
         explicit
@@ -192,8 +238,7 @@ export class BuyerCriteriaService {
       return 'required';
     }
 
-    // Older stored records may only contain the original free-text request.
-    const comments = record.buyerAdditionalComments.toLowerCase();
+    const comments = String(record.buyerAdditionalComments || '').toLowerCase();
     if (/\b(?:passive not required|active management is acceptable|open to either)\b/i.test(comments)) {
       return 'any';
     }
@@ -206,20 +251,20 @@ export class BuyerCriteriaService {
     return 'any';
   }
 
-  private parseAedUpperBound(value: string): number | null {
-    const amounts = this.parseMoneyValues(value);
+  private parseAedUpperBound(value: string | undefined): number | null {
+    const amounts = this.parseMoneyValues(String(value || ''));
     return amounts.length > 0 ? Math.max(...amounts) : null;
   }
 
-  private parseAedLowerBound(value: string): number | null {
-    const amounts = this.parseMoneyValues(value);
+  private parseAedLowerBound(value: string | undefined): number | null {
+    const amounts = this.parseMoneyValues(String(value || ''));
     return amounts.length > 0 ? Math.min(...amounts) : null;
   }
 
   private parseMoneyValues(value: string): number[] {
     if (!value || /unknown|to confirm/i.test(value)) return [];
     const matches = value.matchAll(
-      /(?<!\d)(\d{1,3}(?:[,\s]\d{3})+(?:\.\d+)?|\d+(?:[.,]\d+)?)(?:\s*)(bn|billion|b|mn|mln|million|m|thousand|k)?/gi
+      /(?<!\d)(\d{1,3}(?:[,\s]\d{3})+(?:\.\d+)?|\d+(?:[.,]\d+)?)(?:\s*)(bn|billion|b|mn|mln|million|mil|mio|m|thousand|grand|k)?/gi
     );
     const values: number[] = [];
     for (const match of matches) {
@@ -232,24 +277,24 @@ export class BuyerCriteriaService {
       let parsed = Number.parseFloat(normalized);
       if (!Number.isFinite(parsed)) continue;
       if (/^(?:b|bn|billion)$/.test(suffix)) parsed *= 1_000_000_000;
-      if (/^(?:m|mn|mln|million)$/.test(suffix)) parsed *= 1_000_000;
-      if (/^(?:k|thousand)$/.test(suffix)) parsed *= 1_000;
+      if (/^(?:m|mn|mln|million|mil|mio)$/.test(suffix)) parsed *= 1_000_000;
+      if (/^(?:k|thousand|grand)$/.test(suffix)) parsed *= 1_000;
       const rounded = Math.round(parsed);
       if (Number.isSafeInteger(rounded) && rounded > 0) values.push(rounded);
     }
     return values;
   }
 
-  private parsePercent(value: string): number | null {
-    const match = value.match(/(\d+(?:\.\d+)?)\s*%?/);
+  private parsePercent(value: string | undefined): number | null {
+    const match = String(value || '').match(/(\d+(?:[.,]\d+)?)\s*(?:%|percent|pct)?/i);
     if (!match?.[1]) return null;
-    const parsed = Number.parseFloat(match[1]);
+    const parsed = Number.parseFloat(match[1].replace(',', '.'));
     return Number.isFinite(parsed) ? parsed : null;
   }
 
   private extractReturnAmount(value: string): number | null {
     const match = value.match(
-      /(?:profit|income|cash ?flow|earnings?|earns?|makes?|brings?|return)\D{0,35}?(?:aed|dhs?)?\s*(\d{1,3}(?:[,\s]\d{3})+|\d+(?:[.,]\d+)?)\s*(m|mn|mln|million|k|thousand)?/i
+      /(?:profit|income|cash ?flow|earnings?|earns?|makes?|brings?|return)\D{0,35}?(?:aed|dhs?)?\s*(\d{1,3}(?:[,\s]\d{3})+|\d+(?:[.,]\d+)?)\s*(m|mn|mln|million|mil|mio|k|thousand|grand)?/i
     );
     if (!match?.[1]) return null;
     return this.parseMoneyValues(`${match[1]}${match[2] || ''}`)[0] || null;

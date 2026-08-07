@@ -10,7 +10,7 @@ import type {
 } from './sales-message-intelligence.types';
 
 const PERSISTENCE_NAMESPACE = 'leadStates';
-const STATE_VERSION = 14;
+const STATE_VERSION = 15;
 const REENTRY_REPEAT_WINDOW_MS = 30 * 60 * 1000;
 const MAX_PROCESSED_MESSAGE_IDS = 500;
 
@@ -94,6 +94,8 @@ export interface LeadCaptureRecord {
   buyerReturnPeriod: string;
   buyerExcludedSectors: string;
   buyerProfitableOnly: boolean;
+  buyerSectorPreference: 'any' | 'preferred' | 'required';
+  buyerLocationPreference: 'any' | 'preferred' | 'required';
   contactPreference: string;
   nextStep: string;
   completionPercent: number;
@@ -177,6 +179,8 @@ interface LeadCaptureState {
   buyerReturnPeriod?: 'annual' | 'monthly' | 'ambiguous' | undefined;
   buyerExcludedSectors?: string | undefined;
   buyerProfitableOnly?: boolean | undefined;
+  buyerSectorPreference?: 'any' | 'preferred' | 'required' | undefined;
+  buyerLocationPreference?: 'any' | 'preferred' | 'required' | undefined;
   contactPreference?: string | undefined;
   nextStep?: 'submit' | 'details' | 'contact' | 'website' | 'later' | undefined;
   optionalDetailsMode: boolean;
@@ -203,6 +207,10 @@ interface LeadCaptureState {
   lastInputIssue?: string | undefined;
   pendingConfirmation?:
     | { field: LeadField; value: string; reason: string }
+    | undefined;
+  pendingBuyerClarification?:
+    | { kind: 'money_role'; amountAed: number; raw: string }
+    | { kind: 'non_aed_currency'; currency: string; raw: string }
     | undefined;
   priceGuidanceCount: number;
   paused: boolean;
@@ -288,6 +296,8 @@ const BUYER_CRITERIA_FIELDS: Array<keyof LeadCaptureState> = [
   'buyerReturnPeriod',
   'buyerExcludedSectors',
   'buyerProfitableOnly',
+  'buyerSectorPreference',
+  'buyerLocationPreference',
 ];
 
 const FIELD_TO_STATE_KEY: Record<LeadField, keyof LeadCaptureState> = {
@@ -390,6 +400,7 @@ export class LeadCaptureService {
         lastInputClassification: serialized.lastInputClassification,
         lastInputIssue: serialized.lastInputIssue,
         pendingConfirmation: serialized.pendingConfirmation,
+        pendingBuyerClarification: serialized.pendingBuyerClarification,
         priceGuidanceCount: serialized.priceGuidanceCount || 0,
         paused: serialized.paused || false,
         pendingRestartConfirmation: serialized.pendingRestartConfirmation || false,
@@ -500,6 +511,11 @@ export class LeadCaptureService {
       normalizedContent,
       fieldsUpdated
     );
+    const buyerClarificationHandled = this.applyPendingBuyerClarification(
+      state,
+      normalizedContent,
+      fieldsUpdated
+    );
 
     const objection = this.playbook.detectObjection(normalizedContent);
     if (objection) {
@@ -546,6 +562,7 @@ export class LeadCaptureService {
 
     if (
       !confirmationHandled &&
+      !buyerClarificationHandled &&
       !objection &&
       !blocksDeterministicAnswer &&
       !state.pendingConfirmation &&
@@ -594,6 +611,7 @@ export class LeadCaptureService {
       expectedBefore &&
       expectedStillMissing &&
       !confirmationHandled &&
+      !buyerClarificationHandled &&
       !objection &&
       !this.looksLikeQuestion(normalizedContent) &&
       !this.isExplicitUnknown(normalizedContent)
@@ -674,6 +692,37 @@ export class LeadCaptureService {
         stage: state.stage,
         owner: state.owner,
         shouldRespond: false,
+      };
+    }
+
+    if (state.pendingBuyerClarification) {
+      return {
+        stage: state.stage,
+        owner: state.owner,
+        shouldRespond: true,
+        directResponse: this.buyerClarificationQuestion(
+          state.language,
+          state.pendingBuyerClarification
+        ),
+      };
+    }
+
+    if (
+      state.inquiryPurpose === 'buying' &&
+      state.buyerReturnPeriod === 'ambiguous' &&
+      state.buyerReturnAmountAed
+    ) {
+      const amount = state.buyerReturnAmountAed;
+      const messages: Record<ConversationLanguage, string> = {
+        en: `Quick clarification: does ${amount} mean profit per year or per month? Reply “annual” or “monthly”.`,
+        ru: `Уточнение: ${amount} — это прибыль в год или в месяц? Ответьте «годовая» или «ежемесячная».`,
+        ar: `توضيح سريع: هل ${amount} هو الربح السنوي أم الشهري؟ أجب «سنوي» أو «شهري».`,
+      };
+      return {
+        stage: state.stage,
+        owner: state.owner,
+        shouldRespond: true,
+        directResponse: messages[state.language],
       };
     }
 
@@ -2050,6 +2099,61 @@ export class LeadCaptureService {
     return false;
   }
 
+  private applyPendingBuyerClarification(
+    state: LeadCaptureState,
+    content: string,
+    fieldsUpdated: string[]
+  ): boolean {
+    const pending = state.pendingBuyerClarification;
+    if (!pending || state.inquiryPurpose !== 'buying') return false;
+
+    if (pending.kind === 'money_role') {
+      const normalized = content.toLowerCase();
+      const budget = /\b(?:budget|price|purchase|spend|invest(?:ment)?)\b/i.test(normalized)
+        || /(?:бюджет|цена|влож)/iu.test(content)
+        || /(?:ميزانية|سعر|استثمار)/u.test(content);
+      const profit = /\b(?:profit|income|earnings?|cash ?flow|return)\b/i.test(normalized)
+        || /(?:прибыл|доход)/iu.test(content)
+        || /(?:ربح|دخل|عائد)/u.test(content);
+      if (budget && !profit) {
+        state.buyerBudgetAed = this.formatAedAmount(pending.amountAed);
+        state.pendingBuyerClarification = undefined;
+        fieldsUpdated.push('buyer_budget_aed');
+        return true;
+      }
+      if (profit && !budget) {
+        state.buyerReturnAmountAed = this.formatAedAmount(pending.amountAed);
+        state.buyerMinimumAnnualProfitAed = this.formatAedAmount(pending.amountAed);
+        state.buyerReturnPeriod = 'annual';
+        state.buyerProfitableOnly = true;
+        state.pendingBuyerClarification = undefined;
+        fieldsUpdated.push(
+          'buyer_return_period',
+          'buyer_minimum_annual_profit_aed',
+          'buyer_profitable_only'
+        );
+        return true;
+      }
+      return false;
+    }
+
+    if (pending.kind === 'non_aed_currency') {
+      const aed = this.extractMoneyExpression(content);
+      const amount = aed ? this.parseAedAmount(aed) : null;
+      const explicitlyAed = /\b(?:aed|dhs?|dirhams?)\b/i.test(content)
+        || /(?:дирхам|درهم)/iu.test(content);
+      if (amount !== null && explicitlyAed) {
+        state.buyerBudgetAed = this.formatAedAmount(amount);
+        state.pendingBuyerClarification = undefined;
+        fieldsUpdated.push('buyer_budget_aed');
+        return true;
+      }
+      return false;
+    }
+
+    return false;
+  }
+
   private registerInvalidAttempt(
     state: LeadCaptureState,
     field: LeadField,
@@ -2221,11 +2325,15 @@ export class LeadCaptureService {
         fieldsUpdated
       );
     } else if (state.inquiryPurpose === 'buying') {
-      const buyerBudget = this.extractMoneyByHints(content, [
-        /budget|invest(?:ment)? amount|under|up to|maximum|max(?:imum)?|not more than|below/i,
-        /бюджет|сумма инвестиц|до|не более|максимум/i,
-        /الميزانية|مبلغ الاستثمار|أقل من|حتى|الحد الأقصى/i,
-      ]);
+      const nonAed = this.detectNonAedCurrency(content);
+      const explicitlyAed = /\b(?:aed|dhs?|dirhams?)\b/i.test(content) || /(?:дирхам|درهم)/iu.test(content);
+      const buyerBudget = nonAed && !explicitlyAed
+        ? null
+        : this.extractMoneyByHints(content, [
+            /budget|invest(?:ment)? amount|under|up to|maximum|max(?:imum)?|not more than|below|can spend/i,
+            /бюджет|сумма инвестиц|до|не более|максимум/i,
+            /الميزانية|مبلغ الاستثمار|أقل من|حتى|الحد الأقصى/i,
+          ]);
       this.setIfMissing(
         state,
         'buyerBudgetAed',
@@ -2312,6 +2420,38 @@ export class LeadCaptureService {
       fieldsUpdated.push(expected);
       state.expectedField = undefined;
       return;
+    }
+
+    if (state.inquiryPurpose === 'buying' && expected === 'buyer_budget_aed') {
+      const nonAed = this.detectNonAedCurrency(content);
+      const explicitlyAed = /\b(?:aed|dhs?|dirhams?)\b/i.test(content) || /(?:дирхам|درهم)/iu.test(content);
+      if (nonAed && !explicitlyAed) return;
+    }
+
+    if (state.inquiryPurpose === 'buying' && expected === 'business_type') {
+      const genericSector = /\b(?:any|all)\s+(?:sector(?:s)?|industr(?:y|ies)|business(?:es)?)\b|\b(?:any business|anything(?: profitable)?|whatever (?:sector|industry|business)|whatever makes money|no sector preference|no industry preference|sector doesn't matter|industry doesn't matter|business type doesn't matter|don'?t care (?:about )?(?:the )?(?:sector|industry|business type)|don'?t care what business|open to any(?:thing)?|any kind of business)\b/i.test(content)
+        || /(?:любая\s+(?:сфера|отрасль)|любой\s+(?:сектор|бизнес)|без предпочтений по (?:сфере|отрасли))/iu.test(content)
+        || /(?:أي\s+(?:قطاع|مجال|مشروع)|لا تفضيل للقطاع)/u.test(content);
+      if (genericSector) {
+        state.businessType = 'Any profitable business';
+        state.buyerSectorPreference = 'any';
+        fieldsUpdated.push('business_type', 'buyer_sector_preference');
+        state.expectedField = undefined;
+        return;
+      }
+      const buyerSector = this.extractBuyerSectorPreference(content) || this.extractCompactBuyerSector(content);
+      if (buyerSector && !this.isBuyerCriteriaOnlyText(buyerSector)) {
+        state.businessType = buyerSector;
+        state.buyerSectorPreference = this.isStrictSectorPreference(content) ? 'required' : 'preferred';
+        fieldsUpdated.push('business_type', 'buyer_sector_preference');
+        state.expectedField = undefined;
+        return;
+      }
+      if (/\b(?:budget|spend|invest|profit|income|earnings?|cash\s*flow|return|roi|passive|hands[- ]?off|under|up to|between|maximum|max)\b|\d/i.test(content)) {
+        // The user answered with useful buyer criteria but did not name a
+        // sector. Do not turn the financial phrase itself into a sector.
+        return;
+      }
     }
 
     const choiceValue = this.extractChoiceValue(expected, content, state);
@@ -2599,6 +2739,8 @@ export class LeadCaptureService {
       buyerReturnPeriod: state.buyerReturnPeriod || '',
       buyerExcludedSectors: state.buyerExcludedSectors || '',
       buyerProfitableOnly: Boolean(state.buyerProfitableOnly),
+      buyerSectorPreference: state.buyerSectorPreference || 'preferred',
+      buyerLocationPreference: state.buyerLocationPreference || 'preferred',
       contactPreference: state.contactPreference || '',
       nextStep: state.nextStep || '',
       completionPercent: this.calculateCompletionPercent(state),
@@ -2864,6 +3006,11 @@ export class LeadCaptureService {
         : null;
     }
 
+    const correctedLocation = value.match(
+      /\b(?:actually|i mean|make that|instead|rather|sorry)\b[^,.;]{0,20}\b(Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\b/i
+    )?.[1];
+    if (correctedLocation) return this.cleanFreeTextAnswer(correctedLocation);
+
     const emirates = value.match(
       /\b(Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\b/i
     );
@@ -2891,29 +3038,78 @@ export class LeadCaptureService {
     return null;
   }
 
+  private normalizeBuyerCriteriaInput(value: string): string {
+    const arabicIndic = '٠١٢٣٤٥٦٧٨٩';
+    const easternArabicIndic = '۰۱۲۳۴۵۶۷۸۹';
+    let normalized = value.replace(/[٠-٩]/g, digit =>
+      String(arabicIndic.indexOf(digit))
+    );
+    normalized = normalized.replace(/[۰-۹]/g, digit =>
+      String(easternArabicIndic.indexOf(digit))
+    );
+
+    return normalized
+      .replace(/\b(?:budjet|buget|budegt|budgit)\b/gi, 'budget')
+      .replace(/\b(?:proffit|profitt|proffitt)\b/gi, 'profit')
+      .replace(/\bpasive\b/gi, 'passive')
+      .replace(/\b(?:milion|millon|milllion)\b/gi, 'million')
+      .replace(/\b(?:montly|monthy)\b/gi, 'monthly')
+      .replace(/\b(?:anual|annnual)\b/gi, 'annual')
+      .replace(/\bdubia\b/gi, 'Dubai')
+      .replace(/\babu\s+dabi\b/gi, 'Abu Dhabi')
+      .replace(/\bsharja\b/gi, 'Sharjah')
+      .trim();
+  }
+
   private applyBuyerCriteriaExtractions(
     state: LeadCaptureState,
     content: string,
     fieldsUpdated: string[]
   ): void {
-    const normalized = content.trim();
+    const normalized = this.normalizeBuyerCriteriaInput(content);
     const lowered = normalized.toLowerCase();
 
+    const nonAedCurrency = this.detectNonAedCurrency(normalized);
+    if (nonAedCurrency && !/\b(?:aed|dhs?|dirhams?)\b/i.test(normalized)) {
+      state.pendingBuyerClarification = {
+        kind: 'non_aed_currency',
+        currency: nonAedCurrency,
+        raw: normalized.slice(0, 300),
+      };
+    }
+
     const sectorPreference = this.extractBuyerSectorPreference(normalized);
-    if (sectorPreference && state.businessType !== sectorPreference) {
-      state.businessType = sectorPreference;
-      fieldsUpdated.push('business_type');
+    if (sectorPreference) {
+      if (state.businessType !== sectorPreference) {
+        state.businessType = sectorPreference;
+        fieldsUpdated.push('business_type');
+      }
+      const mode = this.isGenericBuyerSector(sectorPreference)
+        ? 'any'
+        : this.isStrictSectorPreference(normalized)
+          ? 'required'
+          : 'preferred';
+      if (state.buyerSectorPreference !== mode) {
+        state.buyerSectorPreference = mode;
+        fieldsUpdated.push('buyer_sector_preference');
+      }
     } else if (state.businessType && this.isGenericBuyerSector(state.businessType)) {
       if (state.businessType !== 'Any profitable business') {
         state.businessType = 'Any profitable business';
         fieldsUpdated.push('business_type');
       }
+      if (state.buyerSectorPreference !== 'any') {
+        state.buyerSectorPreference = 'any';
+        fieldsUpdated.push('buyer_sector_preference');
+      }
     }
 
-    const flexibleBudget = /\b(?:budget is flexible|flexible budget|no fixed budget|open budget)\b/i.test(normalized)
+    const flexibleBudget = /\b(?:budget is flexible|flexible budget|no fixed budget|open budget|unlimited budget|no budget limit|no maximum budget|budget doesn'?t matter|budget does not matter|no max(?:imum)?(?: budget)?)\b/i.test(normalized)
       || /(?:бюджет гибкий|без фиксированного бюджета)/iu.test(normalized)
       || /(?:الميزانية مرنة|لا توجد ميزانية ثابتة)/u.test(normalized);
-    const budget = this.extractBuyerBudgetRequirement(normalized);
+    const budget = state.pendingBuyerClarification?.kind === 'non_aed_currency'
+      ? null
+      : this.extractBuyerBudgetRequirement(normalized);
     if (flexibleBudget) {
       if (state.buyerBudgetAed !== 'Flexible / no fixed maximum') {
         state.buyerBudgetAed = 'Flexible / no fixed maximum';
@@ -2933,27 +3129,48 @@ export class LeadCaptureService {
     // value is the maximum budget and the second is minimum ANNUAL profit,
     // matching the order of the question shown to the user. Explicitly labelled
     // values above always remain authoritative.
-    this.applyCompactBuyerCriteriaFallback(
-      state,
-      normalized,
-      fieldsUpdated,
-      budget !== null || flexibleBudget
-    );
-
-    const buyerLocation = this.extractLocation(normalized, false);
-    const locationIntent = /\b(?:prefer|preferred|only|location|emirate|area|located|in)\b/i.test(normalized)
-      || /(?:предпоч|только|локац|эмират|район|\bв\b)/iu.test(normalized)
-      || /(?:أفضل|فقط|الموقع|الإمارة|المنطقة|في)/u.test(normalized);
-    if (
-      buyerLocation &&
-      locationIntent &&
-      state.buyerLocation !== buyerLocation
-    ) {
-      state.buyerLocation = buyerLocation;
-      fieldsUpdated.push('buyer_location');
+    if (state.pendingBuyerClarification?.kind !== 'non_aed_currency') {
+      this.applyCompactBuyerCriteriaFallback(
+        state,
+        normalized,
+        fieldsUpdated,
+        budget !== null || flexibleBudget
+      );
     }
 
-    const clearProfitRequirement = /\b(?:profit (?:is )?not required|profitability (?:is )?not required|pre[- ]?revenue is acceptable|loss[- ]?making is acceptable)\b/i.test(normalized)
+    const clearLocation = /\b(?:anywhere|any location|all emirates|no location preference|location doesn't matter|location does not matter|where doesn'?t matter|don'?t care where|don'?t care about location|open to any location|any emirate)\b/i.test(normalized)
+      || /(?:любая локация|любой эмират|локация не важна|без предпочтений по локации)/iu.test(normalized)
+      || /(?:أي مكان|أي إمارة|الموقع غير مهم|لا تفضيل للموقع)/u.test(normalized);
+    if (clearLocation) {
+      if (state.buyerLocation) {
+        state.buyerLocation = undefined;
+        fieldsUpdated.push('buyer_location');
+      }
+      if (state.buyerLocationPreference !== 'any') {
+        state.buyerLocationPreference = 'any';
+        fieldsUpdated.push('buyer_location_preference');
+      }
+    } else {
+      const buyerLocation = this.extractLocation(normalized, false);
+      const locationIntent = /\b(?:prefer|preferred|only|location|emirate|area|located|in|must|required|nice|okay|ok|fine)\b/i.test(normalized)
+        || /(?:предпоч|только|локац|эмират|район|\bв\b)/iu.test(normalized)
+        || /(?:أفضل|فقط|الموقع|الإمارة|المنطقة|في)/u.test(normalized);
+      if (buyerLocation && locationIntent) {
+        if (state.buyerLocation !== buyerLocation) {
+          state.buyerLocation = buyerLocation;
+          fieldsUpdated.push('buyer_location');
+        }
+        const mode = this.isStrictLocationPreference(normalized, buyerLocation)
+          ? 'required'
+          : 'preferred';
+        if (state.buyerLocationPreference !== mode) {
+          state.buyerLocationPreference = mode;
+          fieldsUpdated.push('buyer_location_preference');
+        }
+      }
+    }
+
+    const clearProfitRequirement = /\b(?:profit (?:is )?not required|profitability (?:is )?not required|forget (?:the )?profit requirement|remove (?:the )?profit requirement|pre[- ]?revenue is acceptable|loss[- ]?making is acceptable)\b/i.test(normalized)
       || /(?:прибыль не обязательна|можно без прибыли|убыточный бизнес допустим)/iu.test(normalized)
       || /(?:الربح غير مطلوب|يمكن أن يكون بدون ربح)/u.test(normalized);
     if (clearProfitRequirement) {
@@ -2977,13 +3194,13 @@ export class LeadCaptureService {
       }
     }
 
-    const openToActive = /\b(?:active management is acceptable|active involvement is acceptable|active is (?:fine|ok|acceptable)|passive (?:is )?not required|open to either|either active or passive|either passive or active|can manage (?:it|the business)|willing to manage)\b/i.test(normalized)
+    const openToActive = /\b(?:active management is acceptable|active involvement is acceptable|active is (?:fine|ok|acceptable)|passive (?:is )?not required|not passive|no need (?:for )?passive|forget passive|don't care (?:if )?(?:it is )?passive|do not care (?:if )?(?:it is )?passive|can be active|open to either|either active or passive|either passive or active|can manage (?:it|the business)|willing to manage|don'?t mind (?:managing|running|being involved)|do not mind (?:managing|running|being involved)|can be involved|okay with being involved|fine with being involved)\b/i.test(normalized)
       || /(?:можно активное управление|готов управлять|пассивность не обязательна|рассматриваю оба варианта)/iu.test(normalized)
       || /(?:الإدارة النشطة مقبولة|يمكنني إدارة المشروع|الدور السلبي غير مطلوب|منفتح على الخيارين)/u.test(normalized);
-    const passivePreferred = /\b(?:prefer(?:red)? passive|passive preferred|ideally passive|preferably passive)\b/i.test(normalized)
+    const passivePreferred = /\b(?:prefer(?:red)? passive|would prefer passive|passive preferred|ideally passive|preferably passive|passive if possible|hands[- ]?off if possible|prefer(?:red)? manager[- ]?run|would prefer manager[- ]?run|manager[- ]?run if possible|ideally manager[- ]?run)\b/i.test(normalized)
       || /(?:предпочтительно пассив|желательно пассив)/iu.test(normalized)
       || /(?:أفضل.*استثمار.*سلبي|يفضل.*دور.*سلبي)/u.test(normalized);
-    const passiveRequired = /\b(?:passive|passively|hands[- ]?off|absentee|without (?:me )?managing|manager[- ]?run|fully managed|managed business)\b/i.test(normalized)
+    const passiveRequired = /\b(?:passive|passively|hands[- ]?off|absentee|without (?:me )?managing|without owner involvement|no owner involvement|don't want to (?:manage|run|work in) (?:it|the business)|do not want to (?:manage|run|work in) (?:it|the business)|don't want a job|someone else (?:runs|manages) it|manager(?:ial)? (?:in place|already in place)|manager[- ]?run|fully managed|managed business)\b/i.test(normalized)
       || /(?:пассивн|без моего участия|управляющая команда)/iu.test(normalized)
       || /(?:استثمار سلبي|دون إدارتي|إدارة قائمة)/u.test(normalized);
     const activeRequired = /\b(?:operate|manage|run) (?:it|the business) (?:myself|personally)|active involvement required\b/i.test(normalized)
@@ -3005,9 +3222,9 @@ export class LeadCaptureService {
     }
 
     const roiMatch = normalized.match(
-      /(?:minimum|min|at least|over|more than|target|не менее|минимум)?\s*(\d+(?:[.,]\d+)?)\s*%\s*(?:roi|return|yield|доходност|окупаемост)|(?:roi|return|yield|доходност|окупаемост)\D{0,20}(\d+(?:[.,]\d+)?)\s*%/iu
+      /(?:minimum|min|at least|over|more than|target|не менее|минимум)?\s*(\d+(?:[.,]\d+)?)\s*(?:%|percent|pct)\s*(?:roi|return|yield|доходност|окупаемост)|(?:roi|return|yield|доходност|окупаемост)\D{0,20}(\d+(?:[.,]\d+)?)\s*(?:(?:%|percent|pct)\b)?|(?:minimum|min|at least|over|more than|target)\s+(\d+(?:[.,]\d+)?)\s+(?:roi|return|yield)\b/iu
     );
-    const roiRaw = roiMatch?.[1] || roiMatch?.[2];
+    const roiRaw = roiMatch?.[1] || roiMatch?.[2] || roiMatch?.[3];
     if (roiRaw) {
       const roi = Number.parseFloat(roiRaw.replace(',', '.'));
       if (Number.isFinite(roi) && roi >= 0 && roi <= 1000) {
@@ -3020,7 +3237,7 @@ export class LeadCaptureService {
     }
 
     const periodClarification = normalized.match(
-      /^(?:it is |that is |i mean |make it |это |имею в виду )?(annual|annually|yearly|per year|a year|monthly|per month|a month|годовая|годовой|в год|ежемесячная|ежемесячный|в месяц)(?=\s|[.,;!?]|$)/iu
+      /^(?:it is |that is |i mean |make it |это |имею в виду )?(annual|annually|yearly|per year|a year|p\.?a\.?|monthly|per month|a month|p\.?m\.?|годовая|годовой|в год|ежемесячная|ежемесячный|в месяц)(?=\s|[.,;!?]|$)/iu
     )?.[1]?.toLowerCase();
     if (
       periodClarification &&
@@ -3029,7 +3246,7 @@ export class LeadCaptureService {
     ) {
       const amount = this.parseAedAmount(state.buyerReturnAmountAed);
       if (amount !== null) {
-        const monthly = /month|месяц/u.test(periodClarification);
+        const monthly = /month|месяц|p\.?m\.?/u.test(periodClarification);
         state.buyerReturnPeriod = monthly ? 'monthly' : 'annual';
         state.buyerMinimumAnnualProfitAed = this.formatAedAmount(
           monthly ? amount * 12 : amount
@@ -3091,6 +3308,21 @@ export class LeadCaptureService {
       }
     }
 
+    const exclusionRemovals = this.extractBuyerExclusionRemovals(normalized);
+    if (exclusionRemovals.length > 0 && state.buyerExcludedSectors) {
+      const removalSet = new Set(exclusionRemovals.map(value => value.toLowerCase()));
+      const kept = state.buyerExcludedSectors
+        .split(',')
+        .map(value => value.trim())
+        .filter(Boolean)
+        .filter(value => !removalSet.has(value.toLowerCase()));
+      const rendered = kept.join(', ');
+      if (rendered !== state.buyerExcludedSectors) {
+        state.buyerExcludedSectors = rendered || undefined;
+        fieldsUpdated.push('buyer_excluded_sectors');
+      }
+    }
+
     const hasBuyerPreference = Boolean(
       state.buyerProfitableOnly ||
       state.buyerMinimumAnnualProfitAed ||
@@ -3123,32 +3355,49 @@ export class LeadCaptureService {
 
     const genericSector =
       /\b(?:any|all)\s+(?:sector(?:s)?|industr(?:y|ies)|business(?:es)?(?:\s+type)?s?)\b/i.test(value) ||
-      /\b(?:any business|whatever sector|whatever industry|no sector preference|no industry preference)\b/i.test(value) ||
+      /\b(?:any business|anything(?: profitable)?|whatever (?:sector|industry|business)|whatever makes money|no sector preference|no industry preference|sector doesn't matter|industry doesn't matter|business type doesn't matter|don'?t care (?:about )?(?:the )?(?:sector|industry|business type)|don'?t care what business|open to any(?:thing)?|any kind of business)\b/i.test(value) ||
       /(?:любая\s+(?:сфера|отрасль)|любой\s+(?:сектор|бизнес)|без предпочтений по (?:сфере|отрасли))/iu.test(value) ||
       /(?:أي\s+(?:قطاع|مجال|مشروع)|لا تفضيل للقطاع)/u.test(value);
 
-    if (genericSector && state.businessType !== 'Any profitable business') {
-      state.businessType = 'Any profitable business';
-      fieldsUpdated.push('business_type');
+    if (genericSector) {
+      if (state.businessType !== 'Any profitable business') {
+        state.businessType = 'Any profitable business';
+        fieldsUpdated.push('business_type');
+      }
+      if (state.buyerSectorPreference !== 'any') {
+        state.buyerSectorPreference = 'any';
+        fieldsUpdated.push('buyer_sector_preference');
+      }
     }
 
-    const compactSector = genericSector ? null : this.extractCompactBuyerSector(value);
-    if (compactSector && state.businessType !== compactSector) {
-      state.businessType = compactSector;
-      fieldsUpdated.push('business_type');
+    const explicitSector = this.extractBuyerSectorPreference(value);
+    const compactSector = genericSector || explicitSector
+      ? null
+      : this.extractCompactBuyerSector(value);
+    if (compactSector) {
+      if (state.businessType !== compactSector) {
+        state.businessType = compactSector;
+        fieldsUpdated.push('business_type');
+      }
+      const sectorMode = this.isStrictSectorPreference(value) ? 'required' : 'preferred';
+      if (state.buyerSectorPreference !== sectorMode) {
+        state.buyerSectorPreference = sectorMode;
+        fieldsUpdated.push('buyer_sector_preference');
+      }
     }
 
     const values = this.extractCompactBuyerMoneyValues(value);
     const hasBudgetWords =
-      /\b(?:budget|maximum budget|max budget|purchase price|can spend|invest(?:ment)? amount|up to|under|below|not more than)\b/i.test(value) ||
+      /\b(?:budget|maximum budget|max budget|purchase price|can spend|spend|invest(?:ment)? amount|up to|under|below|not more than)\b/i.test(value) ||
       /(?:бюджет|максимум|до|не более|готов вложить)/iu.test(value) ||
       /(?:الميزانية|الحد الأقصى|حتى|أستطيع دفع)/u.test(value);
     const hasProfitWords =
-      /\b(?:net\s+profit|profit|income|cash\s*flow|cashflow|earnings?|earns?|makes?|brings?|return)\b/i.test(value) ||
+      /\b(?:net\s+profit|profit|income|cash\s*flow|cashflow|earnings?|earns?|makes?(?!\s+it\b)|brings?(?!\s+it\b)|return|pays? me|net(?:s)? me|take[- ]?home|clear(?:s)? me)\b/i.test(value) ||
       /(?:прибыл|доход|денежн(?:ый|ого)? поток|зарабатывает|приносит)/iu.test(value) ||
       /(?:ربح|دخل|تدفق نقدي|يدر|عائد)/u.test(value);
 
-    const compactTuple = genericSector || values.length >= 2;
+    const compactBudgetRange = /(?:aed|dhs?|dirhams?)?\s*\d+(?:[.,]\d+)?\s*(?:k|m|mn|mln|million|mil|thousand|grand)?\s*(?:-|–|—|to)\s*(?:aed|dhs?|dirhams?)?\s*\d+(?:[.,]\d+)?\s*(?:k|m|mn|mln|million|mil|thousand|grand)?/i.test(value);
+    const compactTuple = (genericSector || values.length >= 2) && !hasBudgetWords && !hasProfitWords;
     const canTreatFirstAsBudget =
       !budgetAlreadyExplicit &&
       !hasBudgetWords &&
@@ -3170,6 +3419,7 @@ export class LeadCaptureService {
     // for minimum annual profit (or ROI) in that position.
     if (
       compactTuple &&
+      !compactBudgetRange &&
       !hasProfitWords &&
       values.length >= 2 &&
       values[1] !== undefined
@@ -3191,10 +3441,43 @@ export class LeadCaptureService {
       }
     }
 
+    const onlyMoneyLike = value
+      .toLowerCase()
+      .replace(/(?:aed|dhs?|dirhams?|now|actually|change|update|make it|set it|lower it|raise it|increase it|decrease it|reduce it|cap it|limit it|instead|new|same|please|to|at|around|about|roughly|approx(?:imately)?)/g, ' ')
+      .replace(/\d+(?:[.,]\d+)?\s*(?:bn|billion|b|mm|mn|mln|million|mil|mio|m|thousand|grand|k|lakh|lac|crore|cr)?/g, ' ')
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .trim();
+    if (
+      values.length === 1 &&
+      values[0] !== undefined &&
+      !hasBudgetWords &&
+      !hasProfitWords &&
+      !genericSector &&
+      !compactSector &&
+      this.hasValue(state.buyerBudgetAed) &&
+      !state.pendingBuyerClarification &&
+      onlyMoneyLike.length === 0
+    ) {
+      state.pendingBuyerClarification = {
+        kind: 'money_role',
+        amountAed: values[0],
+        raw: value.slice(0, 300),
+      };
+    }
+
+    if (
+      !state.businessType &&
+      (values.length > 0 || hasBudgetWords || hasProfitWords || /\b(?:passive|hands[- ]?off|roi|profitable)\b/i.test(value))
+    ) {
+      state.businessType = 'Any profitable business';
+      state.buyerSectorPreference = 'any';
+      fieldsUpdated.push('business_type', 'buyer_sector_preference');
+    }
+
     // A standalone percentage in the same compact schema is interpreted as
     // minimum ROI. This makes \"any sector 10m 15% passive\" work naturally.
     if (compactTuple) {
-      const percent = value.match(/(?<![\p{L}\p{N}])(\d+(?:[.,]\d+)?)\s*%(?![\p{L}\p{N}])/u)?.[1];
+      const percent = value.match(/(?<![\p{L}\p{N}])(\d+(?:[.,]\d+)?)\s*(?:%|percent|pct)(?![\p{L}\p{N}])/iu)?.[1];
       if (percent) {
         const roi = Number.parseFloat(percent.replace(',', '.'));
         if (Number.isFinite(roi) && roi >= 0 && roi <= 1000) {
@@ -3210,66 +3493,114 @@ export class LeadCaptureService {
   }
 
   private extractCompactBuyerSector(value: string): string | null {
-    const firstMoney = value.search(/(?:aed|dhs?|dirhams?)?\s*\d{1,3}(?:[, ]\d{3})+|(?:aed|dhs?|dirhams?)?\s*\d+(?:[.,]\d+)?\s*(?:bn|billion|b|mn|mln|million|m|thousand|k)?/i);
+    const firstClause = value.split(/[,;]/, 1)[0] || '';
+    if (/^\s*(?:no|not|except|excluding|avoid|anything but|anything except)\b/i.test(firstClause)) return null;
+    if (/\b(?:Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\b/i.test(firstClause) && !/\b(?:restaurants?|cafes?|retail|trading|clinics?|health|salons?|technology|tech|manufacturing|logistics|services?|education|food|beauty|fitness|pharmacy)\b/i.test(firstClause)) return null;
+    if (this.looksLikeBuyerFinancialPhrase(firstClause) && !/\b(?:restaurants?|cafes?|retail|trading|clinics?|health|salons?|technology|tech|manufacturing|logistics|services?|education|food|beauty|fitness|pharmacy)\b/i.test(firstClause)) {
+      return null;
+    }
+    const firstMoney = value.search(/(?:aed|dhs?|dirhams?)?\s*\d{1,3}(?:[, .]\d{3})+|(?:aed|dhs?|dirhams?)?\s*\d+(?:[.,]\d+)?\s*(?:bn|billion|b|mm|mn|mln|million|mil|mio|m|thousand|grand|k|lakh|lac|crore|cr)?/i);
     if (firstMoney <= 0) return null;
 
     let candidate = value.slice(0, firstMoney).trim();
+    candidate = (candidate.split(/[,;]/)[0] || candidate).trim();
     candidate = candidate
       .replace(/^(?:sector|industry|business type)\s*[:=-]?\s*/i, '')
       .replace(/^(?:looking for|want(?: to buy)?|buy|seeking|interested in)\s+(?:a|an|the)?\s*/i, '')
       .replace(/(?:\s+in)?\s+(?:Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\s*$/i, '')
+      .replace(/\s+(?:only|exclusively|strictly)\s*$/i, '')
       .trim();
-    if (!candidate || this.isBuyerCriteriaOnlyText(candidate)) return null;
+    if (!candidate || this.isBuyerCriteriaOnlyText(candidate) || this.looksLikeBuyerFinancialPhrase(candidate)) return null;
 
-    const normalized = this.normalizeBusinessText(candidate);
+    const normalized = this.normalizeBuyerSectorCandidate(candidate);
     if (!normalized || this.isGenericBuyerSector(normalized)) return null;
     return normalized;
   }
 
   private extractCompactBuyerMoneyValues(value: string): number[] {
-    const values: number[] = [];
-    const pattern = /(?:^|[^\p{L}\p{N}])(?:aed|dhs?|dirhams?)?\s*(\d{1,3}(?:[, ]\d{3})+|\d+(?:[.,]\d+)?)\s*(bn|billion|b|mn|mln|million|m|thousand|k)?(?=$|[^\p{L}\p{N}%])/giu;
+    const matches: Array<{ amount: number; index: number }> = [];
+    const pattern = /(?:^|[^\p{L}\p{N}])(?:aed|dhs?|dirhams?|дирхам(?:ов|а)?|درهم)?\s*(\d{1,3}(?:[, .]\d{3})+|\d+(?:[.,]\d+)?)\s*(bn|billion|b|mm|mn|mln|million|mil|mio|m|thousand|grand|k|lakh|lac|crore|cr|млрд|миллиард(?:а|ов)?|млн|миллион(?:а|ов)?|тыс(?:яч[аи]?)?|مليار|مليون|ألف)?(?=$|[^\p{L}\p{N}%])/giu;
     for (const match of value.matchAll(pattern)) {
       const raw = match[1];
       if (!raw) continue;
       const amount = this.scaleMoneyNumber(raw, match[2] || '');
       if (amount === null || amount < 1_000 || amount > 100_000_000_000) continue;
-      // Avoid interpreting obvious calendar years as financial criteria.
       if (!match[2] && amount >= 1900 && amount <= 2100) continue;
-      values.push(amount);
-      if (values.length >= 3) break;
+      matches.push({ amount, index: match.index ?? 0 });
+    }
+
+    matches.push(...this.extractWordMoneyMatches(value));
+    matches.sort((a, b) => a.index - b.index);
+
+    const values: number[] = [];
+    for (const match of matches) {
+      if (values.length >= 5) break;
+      // Keep repeated amounts when they appear in different slots, but avoid a
+      // numeric and word parser reporting the exact same source fragment.
+      const previous = matches.find(
+        candidate => candidate !== match && candidate.index === match.index && candidate.amount === match.amount
+      );
+      if (previous && matches.indexOf(previous) < matches.indexOf(match)) continue;
+      values.push(match.amount);
     }
     return values;
   }
 
   private extractBuyerSectorPreference(value: string): string | null {
     const patterns = [
-      /(?:looking for|want to (?:buy|acquire)|interested in|seeking)\s+(?:(?:a|an|the)\s+)?(.+?)(?=\s+(?:in|under|below|up to|with (?:a\s+)?budget|within (?:a\s+)?budget|that|which|if)\b|[,.;]|$)/i,
+      /(?:looking for|want to (?:buy|acquire)|interested in|seeking|i want|i need|i prefer)\s+(?:(?:a|an|the)\s+)?(.+?)(?=\s+(?:in|under|below|up to|with (?:a\s+)?budget|within (?:a\s+)?budget|that|which|if)\b|[,.;]|$)/i,
+      /(?:sector|industry|business type)\s*(?:must be|has to be|required)?\s*[:=-]?\s*(.+?)(?=\s+(?:in|under|below|up to|with|budget)\b|[,.;]|$)/i,
       /(?:buy|acquire)\s+(?:(?:a|an|the)\s+)?(.+?)(?=\s+(?:in|under|below|up to|with|for)\b|[,.;]|$)/i,
       /(?:sector|industry|business type)\s*(?:is|to|=|:)?\s*(.+?)(?=\s+(?:in|under|below|up to|with|budget)\b|[,.;]|$)/i,
       /(?:ищу|хочу купить|интересует|рассматриваю)\s+(.+?)(?=\s+(?:в|до|с бюджетом|бюджет)\b|[,.;]|$)/iu,
       /(?:أبحث عن|أريد شراء|مهتم بـ)\s*(.+?)(?=\s+(?:في|بميزانية|حتى)\b|[,.;]|$)/u,
+      /\b(?:actually|i mean|make that|instead|rather)\s+(?:(?:a|an|the)\s+)?([a-z][a-z &/-]{1,50}?)(?=\s+(?:in|under|below|up to|with|budget|max|cap)\b|[,.;]|$)/i,
+      /\b(?:maybe|perhaps|ideally|preferably)\s+(?:(?:a|an|the)\s+)?([a-z][a-z &/-]{1,50}?)(?=\s+(?:in|under|below|up to|with|budget|max|cap)\b|[,.;]|$)/i,
     ];
     for (const pattern of patterns) {
       const match = value.match(pattern);
       if (!match?.[1]) continue;
-      const candidate = this.normalizeBusinessText(match[1]);
+      const candidate = this.normalizeBuyerSectorCandidate(match[1]);
       if (!candidate || this.isBuyerCriteriaOnlyText(candidate)) continue;
+      if (/\b(?:Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\b/i.test(candidate)) continue;
       return this.isGenericBuyerSector(candidate)
         ? 'Any profitable business'
         : candidate;
     }
 
-    const beforeLocation = this.extractBusinessType(value, false);
-    if (beforeLocation && !this.isBuyerCriteriaOnlyText(beforeLocation)) {
-      return this.isGenericBuyerSector(beforeLocation)
-        ? 'Any profitable business'
-        : beforeLocation;
+    // Preserve natural phrases such as "Healthcare business in Abu Dhabi",
+    // but do not turn "I can spend between..." into a business sector.
+    const beforeKnownLocation = value.match(
+      /^(.{2,100}?)\s+(?:in|at|based in|located in)\s+(?:Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\b/i
+    )?.[1];
+    if (beforeKnownLocation) {
+      const candidate = this.normalizeBuyerSectorCandidate(beforeKnownLocation);
+      if (
+        candidate &&
+        !this.isBuyerCriteriaOnlyText(candidate) &&
+        !this.looksLikeBuyerFinancialPhrase(candidate)
+      ) {
+        return this.isGenericBuyerSector(candidate) ? 'Any profitable business' : candidate;
+      }
     }
     return null;
   }
 
+  private normalizeBuyerSectorCandidate(value: string): string {
+    return (this.normalizeBusinessText(value) || '')
+      .replace(/\s+(?:only|exclusively|strictly|(?:is\s+)?a\s+must|required)$/i, '')
+      .replace(/^(?:only|exclusively|strictly|ideally|preferably|maybe|perhaps|possibly|open to|prefer(?:red)?|i(?:'d| would)? prefer)\s+(?:a|an|the)?\s*/i, '')
+      .trim();
+  }
+
+  private looksLikeBuyerFinancialPhrase(value: string): boolean {
+    return /\b(?:budget|spend|invest|investment|capital|price|profit|income|earnings?|cash\s*flow|return|roi|yield|passive|hands[- ]?off|between|under|below|up to|maximum|max|minimum|min|per month|per year|million|mil|grand|thousand|crore|lakh|couple|point)\b|\d/i.test(value);
+  }
+
   private isGenericBuyerSector(value: string): boolean {
+    if (/\b(?:whatever makes money|don'?t care what business|don'?t care (?:about )?(?:the )?(?:sector|industry|business type)|open to any(?:thing)?|any kind of business)\b/i.test(value)) {
+      return true;
+    }
     const normalized = value
       .toLowerCase()
       .replace(/\b(?:cash[- ]?generating|profitable|passive|investment|opportunity|established|good|any)\b/g, ' ')
@@ -3295,21 +3626,60 @@ export class LeadCaptureService {
   }
 
   private extractBuyerBudgetRequirement(value: string): number | null {
-    if (/\b(?:budget is flexible|flexible budget|no fixed budget)\b/i.test(value)) {
+    if (/\b(?:budget is flexible|flexible budget|no fixed budget|open budget|unlimited budget|no budget limit|no maximum budget|budget doesn'?t matter|budget does not matter|no max(?:imum)?(?: budget)?)\b/i.test(value)) {
       return null;
     }
-    const amountPattern = '(\\d{1,3}(?:[, ]\\d{3})+|\\d+(?:[.,]\\d+)?)\\s*(b|bn|billion|m|mn|mln|million|k|thousand)?';
-    const patterns = [
-      new RegExp(`(?:budget|maximum budget|max budget|purchase price|can spend|invest(?:ment)? amount|up to|under|below|not more than)\\D{0,25}(?:aed|dhs?|dirhams?)?\\s*${amountPattern}`, 'i'),
-      new RegExp(`(?:aed|dhs?|dirhams?)?\\s*${amountPattern}\\D{0,20}(?:budget|maximum|max|to spend)`, 'i'),
-      new RegExp(`(?:бюджет|максимум|до|не более|готов вложить)\\D{0,25}(?:aed|дирхам(?:ов|а)?)?\\s*${amountPattern}`, 'iu'),
-      new RegExp(`(?:الميزانية|الحد الأقصى|حتى|أستطيع دفع)\\D{0,25}(?:درهم)?\\s*${amountPattern}`, 'u'),
+
+    // An unlabeled monetary range in the first buyer description is normally
+    // a purchase-price range (e.g. "500k-1m" or "1 to 2m"). Treat its
+    // upper end as the maximum budget, but never steal a range explicitly
+    // labelled as profit/income/ROI.
+    if (!/\b(?:profit|income|earnings?|cash\s*flow|cashflow|roi|return|yield)\b/i.test(value)) {
+      const range = value.match(
+        /(?:aed|dhs?|dirhams?|дирхам(?:ов|а)?|درهم)?\s*(\d+(?:[.,]\d+)?)\s*(k|m|mn|mln|million|mil|thousand|grand|млн|миллион(?:а|ов)?|тыс(?:яч[аи]?)?|مليون|ألف)?\s*(?:-|–|—|to|до|إلى)\s*(?:aed|dhs?|dirhams?|дирхам(?:ов|а)?|درهم)?\s*(\d+(?:[.,]\d+)?)\s*(k|m|mn|mln|million|mil|thousand|grand|млн|миллион(?:а|ов)?|тыс(?:яч[аи]?)?|مليون|ألف)?/iu
+      );
+      if (range?.[1] && range?.[3]) {
+        const rightScale = range[4] || '';
+        const leftScale = range[2] || rightScale;
+        const left = this.scaleMoneyNumber(range[1], leftScale);
+        const right = this.scaleMoneyNumber(range[3], rightScale);
+        if (left !== null && right !== null && Math.max(left, right) >= 1_000) {
+          return Math.max(left, right);
+        }
+      }
+    }
+
+    const hints = [
+      /\b(?:maximum budget|max budget|budget|can spend|able to spend|spend|investment amount|capital|purchase price|price ceiling|up to|under|below|not more than|ceiling|max(?:imum)?|tops?|cap)\b/i,
+      /(?:бюджет|максимум|до|не более|готов вложить|лимит)/iu,
+      /(?:الميزانية|الحد الأقصى|حتى|أستطيع دفع)/u,
     ];
-    for (const pattern of patterns) {
-      const match = value.match(pattern);
-      if (!match?.[1]) continue;
-      const amount = this.scaleMoneyNumber(match[1], match[2] || '');
-      if (amount !== null && amount >= 1000) return amount;
+    for (const pattern of hints) {
+      const match = pattern.exec(value);
+      if (!match || match.index === undefined) continue;
+      const before = value.slice(Math.max(0, match.index - 70), match.index);
+      const after = value.slice(match.index + match[0].length, match.index + match[0].length + 100);
+      const boundaryPattern = /\b(?:profit|income|earnings?|cash\s*flow|cashflow|roi|return|yield|pays? me|nets? me|brings?|generates?|location|sector|industry|passive|manager)\b/i;
+      const boundedAfter = after.split(boundaryPattern)[0] || '';
+      const boundedBefore = before.split(/[,;]|\b(?:profit|income|earnings?|cash\s*flow|roi|return|yield)\b/i).pop() || before;
+      const beforeValues = this.extractCompactBuyerMoneyValues(boundedBefore);
+      const afterValues = this.extractCompactBuyerMoneyValues(boundedAfter);
+
+      const hintLower = match[0].toLowerCase();
+      const prefixStyle = /can spend|able to spend|spend|investment amount|capital|purchase price|up to|under|below|not more than|ceiling|максимум|готов|лимит|حتى|أستطيع/.test(hintLower);
+      // "2m budget" should prefer the amount immediately before "budget";
+      // "budget 2m" and "can spend 2m" should prefer the following amount.
+      if (/(?:budget|бюджет|الميزانية|max|maximum|tops?|cap)/.test(hintLower) && beforeValues.length > 0 && afterValues.length === 0) {
+        return Math.max(...beforeValues);
+      }
+      if (afterValues.length > 0) {
+        if (/\b(?:actually|i mean|make that|instead|rather|sorry)\b/i.test(boundedAfter)) {
+          return afterValues[afterValues.length - 1] ?? null;
+        }
+        return Math.max(...afterValues);
+      }
+      if (beforeValues.length > 0) return Math.max(...beforeValues);
+      if (!prefixStyle && beforeValues.length > 0) return Math.max(...beforeValues);
     }
     return null;
   }
@@ -3317,28 +3687,61 @@ export class LeadCaptureService {
   private extractBuyerReturnRequirement(
     value: string
   ): { amount: number; period: 'annual' | 'monthly' | 'ambiguous' } | null {
-    const amountPattern = '(\\d{1,3}(?:[, ]\\d{3})+|\\d+(?:[.,]\\d+)?)\\s*(b|bn|billion|m|mn|mln|million|k|thousand)?';
-    const patterns = [
-      new RegExp(`(?:net\\s+profit|profit|income|cash\\s*flow|cashflow|earnings?|earns?|makes?|brings?|return)\\D{0,40}?(?:more than|over|at least|minimum|min|above|of)?\\s*(?:aed|dhs?|dirhams?)?\\s*${amountPattern}`, 'i'),
-      new RegExp(`(?:more than|over|at least|minimum|min|above)?\\s*(?:aed|dhs?|dirhams?)?\\s*${amountPattern}\\D{0,30}(?:net\\s+profit|profit|income|cash\\s*flow|cashflow|earnings?|return)`, 'i'),
-      new RegExp(`(?:прибыл|доход|денежн(?:ый|ого)? поток|зарабатывает|приносит)\\D{0,40}?(?:не менее|больше|свыше|от)?\\s*(?:aed|дирхам(?:ов|а)?)?\\s*${amountPattern}`, 'iu'),
-      new RegExp(`(?:ربح|دخل|تدفق نقدي|يدر|عائد)\\D{0,40}?(?:أكثر من|على الأقل)?\\s*(?:درهم)?\\s*${amountPattern}`, 'u'),
+    const profitPatterns = [
+      /\b(?:net\s+profit|net\s+income|profit|income|ebitda|cash\s*flow|cashflow|earnings?|earns?|makes?(?!\s+(?:it|money)\b)|brings?(?!\s+it\b)|generates?|return|pays? me|nets? me|take[- ]?home|clears? me)\b/i,
+      /(?:прибыл|доход|денежн(?:ый|ого)? поток|зарабатывает|приносит)/iu,
+      /(?:ربح|دخل|تدفق نقدي|يدر|عائد)/u,
     ];
-    let match: RegExpMatchArray | null = null;
-    for (const pattern of patterns) {
-      match = value.match(pattern);
-      if (match?.[1]) break;
-    }
-    if (!match?.[1]) return null;
-    const amount = this.scaleMoneyNumber(match[1], match[2] || '');
-    if (!amount || amount < 1000) return null;
 
-    const monthly = /\b(?:monthly|per month|a month|each month)\b/i.test(value)
+    let amount: number | null = null;
+    for (const pattern of profitPatterns) {
+      const hint = pattern.exec(value);
+      if (!hint || hint.index === undefined) continue;
+      const after = value.slice(hint.index + hint[0].length, hint.index + hint[0].length + 75)
+        .split(/\b(?:budget|purchase price|asking price|sector|location)\b/i)[0] || '';
+      const afterValues = this.extractCompactBuyerMoneyValues(after);
+      if (afterValues.length > 0) {
+        amount = /\b(?:actually|i mean|make that|instead|rather|sorry)\b/i.test(after)
+          ? (afterValues[afterValues.length - 1] ?? null)
+          : (afterValues[0] ?? null);
+        break;
+      }
+      const before = value.slice(Math.max(0, hint.index - 60), hint.index)
+        .split(/[,;]|\b(?:budget|purchase price|asking price|sector|location)\b/i)
+        .pop() || '';
+      const beforeValues = this.extractCompactBuyerMoneyValues(before);
+      if (beforeValues.length > 0) {
+        amount = beforeValues[beforeValues.length - 1] ?? null;
+        break;
+      }
+    }
+
+    const monthly = /\b(?:monthly|per month|a month|each month|p\.?m\.?|p\/m|pcm)\b|\/(?:mo|month)\b/i.test(value)
       || /(?:ежемесяч|в месяц|за месяц)/iu.test(value)
       || /(?:شهري|في الشهر|كل شهر)/u.test(value);
-    const annual = /\b(?:annual|annually|yearly|per year|a year|each year|12 months)\b/i.test(value)
+    const annual = /\b(?:annual|annually|yearly|per year|a year|each year|12 months|p\.?a\.?|p\/a)\b|\/(?:yr|year)\b/i.test(value)
       || /(?:годов|в год|за год|ежегод)/iu.test(value)
       || /(?:سنوي|في السنة|كل سنة)/u.test(value);
+    const weekly = /\b(?:weekly|per week|a week|each week|p\/w)\b|\/(?:wk|week)\b/i.test(value);
+    const quarterly = /\b(?:quarterly|per quarter|a quarter|each quarter|p\/q)\b/i.test(value);
+
+    // In a buyer-search sentence, a clearly periodic money target is normally
+    // an earnings target even when the user omits the word "profit":
+    // "budget 2m, want 25k per month". We only use this fallback when a
+    // monthly/annual marker is present, which avoids guessing from a bare sum.
+    if (amount === null && (monthly || annual || weekly || quarterly)) {
+      const periodic = value.match(
+        /(?:\b(?:want|need|target|at least|min(?:imum)?|more than|over|around|about)\b\s*)?([^,;]{0,35}?\b(?:per month|a month|monthly|p\.?m\.?|p\/m|pcm|per year|a year|annual(?:ly)?|yearly|p\.?a\.?|p\/a|per week|a week|weekly|p\/w|per quarter|a quarter|quarterly|p\/q)\b)/i
+      )?.[1];
+      if (periodic) {
+        const values = this.extractCompactBuyerMoneyValues(periodic);
+        if (values.length > 0) amount = values[values.length - 1] ?? null;
+      }
+    }
+
+    if (amount === null || amount < 1_000) return null;
+    if (weekly) return { amount: amount * 52, period: 'annual' };
+    if (quarterly) return { amount: amount * 4, period: 'annual' };
     return {
       amount,
       period: monthly ? 'monthly' : annual ? 'annual' : 'ambiguous',
@@ -3348,15 +3751,15 @@ export class LeadCaptureService {
   private extractBuyerExclusions(value: string): string[] {
     const results: string[] = [];
     const patterns = [
-      /\b(?:no|not|exclude|excluding|avoid|except)\s+(?!(?:more than|required|important|sure|fixed|available)\b)([^,.;]{2,80})/gi,
-      /\b(?:anything but|everything except)\s+([^,.;]{2,80})/gi,
+      /\b(?:no|not|exclude|excluding|avoid|except)\s+(?!(?:more than|less than|required|important|sure|fixed|available|want|need|care|manage|run|work|passive|active|owner involvement|sector preference|location preference)\b)([^,.;]{2,80})/gi,
+      /\b(?:anything but|anything except|everything except)\s+([^,.;]{2,80})/gi,
       /(?:не рассматриваю|исключить|без)\s+([^,.;]{2,80})/giu,
       /(?:لا أريد|استبعاد|باستثناء)\s+([^,.;]{2,80})/gu,
     ];
     for (const pattern of patterns) {
       for (const match of value.matchAll(pattern)) {
         const raw = match[1]
-          ?.split(/\b(?:with|under|below|up to|budget|profit|income|return|in dubai|in abu dhabi)\b/i)[0]
+          ?.split(/\b(?:with|under|below|up to|budget|max(?:imum)?|cap|tops?|profit|income|return|roi|passive|manager|location|in dubai|in abu dhabi)\b/i)[0]
           ?.trim();
         if (!raw) continue;
         for (const part of raw.split(/\s+(?:or|and|или|и|أو|و)\s+|\//iu)) {
@@ -3365,11 +3768,38 @@ export class LeadCaptureService {
             .replace(/\b(?:business(?:es)?|sector|industry)\b/gi, '')
             .replace(/(?:бизнес|сектор|отрасль|مشروع|قطاع)/giu, '')
             .trim();
-          if (clean.length >= 2 && clean.length <= 50) results.push(clean);
+          const exclusionNoise = /^(?:preference|preferences|location|budget|price|profit|income|return|roi|passive|active|management|manage|run|work|owner|involvement|fixed|limit|maximum|anything|everything)$/i.test(clean)
+            || /\b(?:preference|doesn't matter|does not matter|not required|is fine|is okay|acceptable)\b/i.test(clean);
+          if (!exclusionNoise && clean.length >= 2 && clean.length <= 50) results.push(clean);
         }
       }
     }
     return Array.from(new Set(results.map(item => item.toLowerCase())));
+  }
+
+  private extractBuyerExclusionRemovals(value: string): string[] {
+    const results: string[] = [];
+    const patterns = [
+      /\b(?:allow|include|restaurants? are fine|gyms? are fine|okay with|ok with|fine with)\s+([^,.;]{2,60})/gi,
+      /\b([^,.;]{2,40})\s+(?:is|are)\s+(?:fine|okay|ok|acceptable)\b/gi,
+      /(?:можно|разрешить|теперь рассматриваю)\s+([^,.;]{2,60})/giu,
+      /(?:مسموح|لا مانع من|أقبل)\s+([^,.;]{2,60})/gu,
+    ];
+    for (const pattern of patterns) {
+      for (const match of value.matchAll(pattern)) {
+        const raw = match[1]?.trim();
+        if (!raw) continue;
+        for (const part of raw.split(/\s+(?:or|and|или|и|أو|و)\s+|\//iu)) {
+          const clean = part
+            .replace(/^(?:a|an|the)\s+/i, '')
+            .replace(/\b(?:business(?:es)?|sector|industry)\b/gi, '')
+            .trim()
+            .toLowerCase();
+          if (clean.length >= 2 && clean.length <= 50) results.push(clean);
+        }
+      }
+    }
+    return Array.from(new Set(results));
   }
 
   private extractMoneyByHints(value: string, hints: RegExp[]): string | null {
@@ -3457,25 +3887,165 @@ export class LeadCaptureService {
 
   private scaleMoneyNumber(raw: string, unit: string): number | null {
     const compact = raw.replace(/\s/g, '');
-    const normalizedNumber = /^\d{1,3}(?:,\d{3})+$/.test(compact)
+    const groupedWithComma = /^\d{1,3}(?:,\d{3})+$/.test(compact);
+    const groupedWithDot = /^\d{1,3}(?:\.\d{3}){1,3}$/.test(compact);
+    const normalizedNumber = groupedWithComma
       ? compact.replace(/,/g, '')
-      : compact.includes(',') && !compact.includes('.')
-        ? compact.replace(',', '.')
-        : compact.replace(/,/g, '');
+      : groupedWithDot
+        ? compact.replace(/\./g, '')
+        : compact.includes(',') && !compact.includes('.')
+          ? compact.replace(',', '.')
+          : compact.replace(/,/g, '');
     const base = Number.parseFloat(normalizedNumber);
     if (!Number.isFinite(base)) return null;
     const normalized = unit.toLowerCase();
-    const multiplier = /^(b|bn|billion)$/u.test(normalized)
+    const multiplier = /^(b|bn|billion|млрд|миллиард|миллиарда|миллиардов|مليار)$/u.test(normalized)
       ? 1_000_000_000
-      : /^(m|mn|mln|million|млн|миллион|миллиона|миллионов|مليون)$/u.test(
-          normalized
-        )
+      : /^(m|mm|mn|mln|million|mil|mio|млн|миллион|миллиона|миллионов|مليون)$/u.test(normalized)
         ? 1_000_000
-        : /^(k|thousand|тыс|тысяча|тысячи|тысяч|ألف)$/u.test(normalized)
-          ? 1_000
-          : 1;
+        : /^(crore|cr)$/u.test(normalized)
+          ? 10_000_000
+          : /^(lakh|lac)$/u.test(normalized)
+            ? 100_000
+            : /^(k|thousand|grand|тыс|тысяча|тысячи|тысяч|ألف)$/u.test(normalized)
+              ? 1_000
+              : 1;
     const amount = Math.round(base * multiplier);
     return Number.isSafeInteger(amount) ? amount : null;
+  }
+
+  private extractWordMoneyMatches(value: string): Array<{ amount: number; index: number }> {
+    const matches: Array<{ amount: number; index: number }> = [];
+    const occupied: Array<[number, number]> = [];
+    const simple = value.toLowerCase().replace(/-/g, ' ');
+    const words: Record<string, number> = {
+      quarter: 0.25, half: 0.5, a: 1, one: 1, two: 2, couple: 2,
+      three: 3, few: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8,
+      nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14,
+      fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19,
+      twenty: 20,
+    };
+    const unitMultiplier = (unit: string): number =>
+      /billion/i.test(unit) ? 1_000_000_000
+        : /million|mil/i.test(unit) ? 1_000_000
+          : /lakh|lac/i.test(unit) ? 100_000
+            : /crore/i.test(unit) ? 10_000_000
+              : 1_000;
+    const overlaps = (start: number, end: number): boolean =>
+      occupied.some(([left, right]) => start < right && end > left);
+    const add = (amount: number, index: number, length: number): void => {
+      if (!Number.isSafeInteger(amount) || amount < 1_000 || amount > 100_000_000_000) return;
+      if (overlaps(index, index + length)) return;
+      matches.push({ amount, index });
+      occupied.push([index, index + length]);
+    };
+
+    const wordKeys = Object.keys(words)
+      .filter(key => !['quarter', 'half', 'a', 'couple', 'few'].includes(key))
+      .join('|');
+    for (const match of simple.matchAll(
+      new RegExp(`\\b(${wordKeys})\\s+and\\s+(?:a\\s+)?half\\s+(million|mil|billion|thousand)\\b`, 'gi')
+    )) {
+      const whole = match[1] ? words[match[1].toLowerCase()] : undefined;
+      if (whole !== undefined && match[2]) add(Math.round((whole + 0.5) * unitMultiplier(match[2])), match.index ?? 0, match[0].length);
+    }
+    for (const match of simple.matchAll(/\b(\d+(?:[.,]\d+)?)\s+and\s+(?:a\s+)?half\s+(million|mil|billion|thousand)\b/gi)) {
+      if (!match[1] || !match[2]) continue;
+      const whole = Number.parseFloat(match[1].replace(',', '.'));
+      if (Number.isFinite(whole)) add(Math.round((whole + 0.5) * unitMultiplier(match[2])), match.index ?? 0, match[0].length);
+    }
+    for (const match of simple.matchAll(/\b(?:a|one)\s+(million|billion)\s+and\s+(?:a\s+)?half\b/gi)) {
+      if (match[1]) add(Math.round(1.5 * unitMultiplier(match[1])), match.index ?? 0, match[0].length);
+    }
+
+    const decimals: Record<string, number> = {
+      one: 0.1, two: 0.2, three: 0.3, four: 0.4, five: 0.5,
+      six: 0.6, seven: 0.7, eight: 0.8, nine: 0.9,
+    };
+    for (const match of simple.matchAll(
+      new RegExp(`\\b(${wordKeys})\\s+point\\s+(one|two|three|four|five|six|seven|eight|nine)\\s+(million|billion)\\b`, 'gi')
+    )) {
+      const whole = match[1] ? words[match[1].toLowerCase()] : undefined;
+      const decimal = match[2] ? decimals[match[2].toLowerCase()] : undefined;
+      if (whole !== undefined && decimal !== undefined && match[3]) {
+        add(Math.round((whole + decimal) * unitMultiplier(match[3])), match.index ?? 0, match[0].length);
+      }
+    }
+
+    const numberWordMap: Record<string, number> = {
+      zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7,
+      eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13,
+      fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18,
+      nineteen: 19, twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60,
+      seventy: 70, eighty: 80, ninety: 90,
+    };
+    for (const match of simple.matchAll(
+      /\b((?:(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|and)\s+){1,8})(thousand|million|billion)\b/gi
+    )) {
+      if (!match[1] || !match[2]) continue;
+      const tokens = match[1].trim().split(/\s+/).filter(token => token !== 'and');
+      let current = 0;
+      let valid = false;
+      for (const token of tokens) {
+        if (token === 'hundred') {
+          current = Math.max(1, current) * 100;
+          valid = true;
+          continue;
+        }
+        const number = numberWordMap[token];
+        if (number === undefined) {
+          valid = false;
+          break;
+        }
+        current += number;
+        valid = true;
+      }
+      if (valid && current > 0) add(Math.round(current * unitMultiplier(match[2])), match.index ?? 0, match[0].length);
+    }
+
+    const simpleUnit = new RegExp(
+      `\\b(${Object.keys(words).join('|')})\\s+(?:a\\s+)?(billion|million|mil|thousand|grand|lakh|lac|crore)\\b`,
+      'gi'
+    );
+    for (const match of simple.matchAll(simpleUnit)) {
+      const base = match[1] ? words[match[1].toLowerCase()] : undefined;
+      if (base === undefined || !match[2]) continue;
+      add(Math.round(base * unitMultiplier(match[2])), match.index ?? 0, match[0].length);
+    }
+
+    return matches.sort((a, b) => a.index - b.index);
+  }
+
+  private extractWordMoneyValues(value: string): number[] {
+    return this.extractWordMoneyMatches(value).map(match => match.amount);
+  }
+
+  private detectNonAedCurrency(value: string): string | null {
+    if (!this.extractCompactBuyerMoneyValues(value).length && !this.extractWordMoneyValues(value).length) {
+      return null;
+    }
+    if (/\bUSD\b|\bUS dollars?\b|\bdollars?\b|\$/i.test(value)) return 'USD';
+    if (/\bEUR\b|\beuros?\b|€/i.test(value)) return 'EUR';
+    if (/\bGBP\b|\bBritish pounds?\b|£/i.test(value)) return 'GBP';
+    if (/\bSAR\b|\bSaudi riyals?\b/i.test(value)) return 'SAR';
+    return null;
+  }
+
+  private isStrictSectorPreference(value: string): boolean {
+    const sectorWord = '(?:sectors?|industr(?:y|ies)|business(?:es)?|restaurants?|cafes?|retail|services?|trading|clinics?|health|salons?|technology|tech|manufacturing|logistics|education|food|beauty|fitness|pharmacy)';
+    return new RegExp(`\\b(?:only|exclusively|strictly)\\b.{0,35}\\b${sectorWord}\\b`, 'i').test(value)
+      || new RegExp(`\\b${sectorWord}\\b.{0,20}\\b(?:only|required|must|is a must)\\b`, 'i').test(value)
+      || /\b(?:must|require(?:d)?|has to be)\b.{0,35}\b(?:sector|industry|restaurant|retail|service|trading|clinic|health|salon|technology|manufacturing|logistics)\b/i.test(value)
+      || /(?:только|обязательно).{0,35}(?:сектор|сфера|отрасль|ресторан|ритейл|услуг|клиник)/iu.test(value)
+      || /(?:فقط|إلزامي).{0,35}(?:قطاع|مجال|مطعم|تجزئة|خدمات|عيادة)/u.test(value);
+  }
+
+  private isStrictLocationPreference(value: string, location: string): boolean {
+    const escaped = location.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const locationOnly = new RegExp(`(?:only\\s+(?:in\\s+)?${escaped}|${escaped}\\s+only|must\\s+be\\s+(?:in\\s+)?${escaped}|strictly\\s+(?:in\\s+)?${escaped}|${escaped}\\s+(?:is\\s+)?a\\s+must)`, 'i');
+    return locationOnly.test(value)
+      || /(?:только|обязательно)\s+(?:в\s+)?(?:Дубай|Абу-?Даби|Шардж|Аджман|Фуджейр)/iu.test(value)
+      || /(?:فقط|إلزامي)\s+(?:في\s+)?(?:دبي|أبوظبي|الشارقة|عجمان|الفجيرة)/u.test(value);
   }
 
   private formatAedAmount(amount: number): string {
@@ -4083,6 +4653,30 @@ export class LeadCaptureService {
     };
     const base = questions[language][field] || questions.en[field] || 'Please provide the requested information.';
     return isRetry ? `${this.retryPrefix(language)} ${base}` : base;
+  }
+
+  private buyerClarificationQuestion(
+    language: ConversationLanguage,
+    pending: NonNullable<LeadCaptureState['pendingBuyerClarification']>
+  ): string {
+    if (pending.kind === 'non_aed_currency') {
+      if (language === 'ru') {
+        return `Вы указали сумму в ${pending.currency}. Для сопоставления листингов нужен лимит в AED. Какой максимальный бюджет использовать в дирхамах?`;
+      }
+      if (language === 'ar') {
+        return `ذكرت المبلغ بعملة ${pending.currency}. المطابقة تعمل بحد أقصى بالدرهم. ما الميزانية القصوى التي أستخدمها بالدرهم؟`;
+      }
+      return `You gave the amount in ${pending.currency}. Listing matching uses an AED maximum. What maximum budget should I use in AED?`;
+    }
+
+    const amount = `AED ${pending.amountAed.toLocaleString('en-US')}`;
+    if (language === 'ru') {
+      return `Уточню ${amount}: это новый максимальный бюджет или минимальная годовая прибыль? Ответьте «бюджет» или «прибыль».`;
+    }
+    if (language === 'ar') {
+      return `توضيح ${amount}: هل هو الحد الأقصى الجديد للميزانية أم الحد الأدنى للربح السنوي؟ أرسل «ميزانية» أو «ربح».`;
+    }
+    return `Quick clarification for ${amount}: is that the new maximum budget or minimum annual profit? Reply “budget” or “profit”.`;
   }
 
   private confirmationQuestion(

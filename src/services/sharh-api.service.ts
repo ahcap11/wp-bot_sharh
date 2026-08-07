@@ -10,6 +10,21 @@ import { BuyerCriteriaService } from './buyer-criteria.service';
 
 export type PublicListingRow = Record<string, unknown>;
 
+export interface BuyerMatchRelaxation {
+  criterion: string;
+  label: string;
+  suggestedValue: string | number | boolean | null;
+  resultCount: number;
+}
+
+export interface BuyerMatchAnalysis {
+  items: PublicListingRow[];
+  exactMatchCount: number;
+  nearMatches: PublicListingRow[];
+  relaxations: BuyerMatchRelaxation[];
+  limitingCriteria: string[];
+}
+
 export interface IndicativeValuationResult {
   low: number;
   mid: number;
@@ -174,6 +189,12 @@ export class SharhApiService {
     if (criteria.passivePreference !== 'any') {
       params.set('passive_preference', criteria.passivePreference);
     }
+    if (criteria.sector && criteria.sectorPreference !== 'any') {
+      params.set('sector_preference', criteria.sectorPreference);
+    }
+    if (criteria.emirate && criteria.locationPreference !== 'any') {
+      params.set('location_preference', criteria.locationPreference);
+    }
     for (const excluded of criteria.excludedSectors) {
       params.append('excluded_sector', excluded);
     }
@@ -206,6 +227,113 @@ export class SharhApiService {
     return this.extractRows(result.data)
       .slice(0, Math.max(1, Math.min(3, limit)))
       .map(row => this.filterPublicListing(row));
+  }
+
+  async searchBuyerMatchAnalysis(
+    record: LeadCaptureRecord,
+    limit: number = 3
+  ): Promise<BuyerMatchAnalysis> {
+    const empty: BuyerMatchAnalysis = {
+      items: [],
+      exactMatchCount: 0,
+      nearMatches: [],
+      relaxations: [],
+      limitingCriteria: [],
+    };
+    if (!this.config.enabled || record.inquiryPurpose !== 'buying') {
+      return empty;
+    }
+
+    const criteria = this.buyerCriteria.fromRecord(record);
+    const params = new URLSearchParams();
+    if (criteria.sector) {
+      params.set('q', criteria.sector);
+      params.set('sector', criteria.sector);
+      params.set('sector_preference', criteria.sectorPreference);
+    }
+    if (criteria.emirate) {
+      params.set('emirate', criteria.emirate);
+      params.set('location_preference', criteria.locationPreference);
+    }
+    if (criteria.maxBudgetAed !== null) params.set('max_price_aed', String(criteria.maxBudgetAed));
+    if (criteria.minAnnualProfitAed !== null) params.set('min_profit_aed', String(criteria.minAnnualProfitAed));
+    if (criteria.minRoiPct !== null) params.set('min_roi_pct', String(criteria.minRoiPct));
+    if (criteria.profitableOnly) params.set('profitable_only', 'true');
+    if (criteria.passivePreference !== 'any') params.set('passive_preference', criteria.passivePreference);
+    for (const excluded of criteria.excludedSectors) params.append('excluded_sector', excluded);
+    params.set('limit', String(Math.max(1, Math.min(5, limit))));
+
+    const hasCriterion = Boolean(
+      criteria.sector ||
+      criteria.emirate ||
+      criteria.maxBudgetAed !== null ||
+      criteria.minAnnualProfitAed !== null ||
+      criteria.minRoiPct !== null ||
+      criteria.profitableOnly ||
+      criteria.passivePreference !== 'any' ||
+      criteria.excludedSectors.length > 0
+    );
+    if (!hasCriterion) return empty;
+
+    const result = await this.request<unknown>(
+      'GET',
+      `/api/v1/bot/listings/match-analysis?${params.toString()}`
+    );
+    if (!result.ok || !this.isRecord(result.data)) {
+      // Rolling deploy safety: if the backend has not yet picked up the richer
+      // match-analysis endpoint, fall back to the older exact-match endpoint
+      // instead of making buyer search appear empty.
+      const legacyItems = await this.searchBuyerMatches(record, limit);
+      return {
+        ...empty,
+        items: legacyItems,
+        exactMatchCount: legacyItems.length,
+      };
+    }
+
+    const data = result.data;
+    const sanitizeRows = (value: unknown): PublicListingRow[] =>
+      Array.isArray(value)
+        ? value
+            .filter(value => this.isRecord(value))
+            .map(row => this.filterPublicListing(row))
+            .slice(0, Math.max(1, Math.min(5, limit)))
+        : [];
+    const relaxations: BuyerMatchRelaxation[] = Array.isArray(data['relaxations'])
+      ? data['relaxations']
+          .filter(value => this.isRecord(value))
+          .map(row => ({
+            criterion: typeof row['criterion'] === 'string' ? row['criterion'].slice(0, 80) : '',
+            label: typeof row['label'] === 'string' ? row['label'].slice(0, 300) : '',
+            suggestedValue:
+              typeof row['suggested_value'] === 'string' ||
+              typeof row['suggested_value'] === 'number' ||
+              typeof row['suggested_value'] === 'boolean'
+                ? row['suggested_value']
+                : null,
+            resultCount:
+              typeof row['result_count'] === 'number' && Number.isFinite(row['result_count'])
+                ? Math.max(0, Math.round(row['result_count']))
+                : 0,
+          }))
+          .filter(row => Boolean(row.criterion && row.label))
+          .slice(0, 3)
+      : [];
+    const limitingCriteria = Array.isArray(data['limiting_criteria'])
+      ? data['limiting_criteria']
+          .filter((value): value is string => typeof value === 'string')
+          .map(value => value.slice(0, 80))
+          .slice(0, 3)
+      : [];
+    const exactRaw = Number(data['exact_match_count']);
+
+    return {
+      items: sanitizeRows(data['items']),
+      exactMatchCount: Number.isFinite(exactRaw) ? Math.max(0, Math.round(exactRaw)) : 0,
+      nearMatches: sanitizeRows(data['near_matches']),
+      relaxations,
+      limitingCriteria,
+    };
   }
 
   async calculateIndicativeValuation(
@@ -724,7 +852,7 @@ export class SharhApiService {
 
   private extractRows(data: unknown): PublicListingRow[] {
     if (Array.isArray(data)) {
-      return data.filter(this.isRecord);
+      return data.filter(value => this.isRecord(value));
     }
     if (!this.isRecord(data)) {
       return [];
@@ -733,7 +861,7 @@ export class SharhApiService {
     for (const key of ['items', 'results', 'data']) {
       const candidate = data[key];
       if (Array.isArray(candidate)) {
-        return candidate.filter(this.isRecord);
+        return candidate.filter(value => this.isRecord(value));
       }
     }
 
@@ -890,6 +1018,8 @@ export class SharhApiService {
         buyer_return_period: record.buyerReturnPeriod || null,
         buyer_excluded_sectors: this.splitText(record.buyerExcludedSectors, ','),
         buyer_profitable_only: record.buyerProfitableOnly,
+        buyer_sector_preference: record.buyerSectorPreference || 'preferred',
+        buyer_location_preference: record.buyerLocationPreference || 'preferred',
         contact_preference: record.contactPreference || null,
       },
       completion_percent: record.completionPercent,

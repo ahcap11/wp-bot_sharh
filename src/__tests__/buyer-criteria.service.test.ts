@@ -70,3 +70,34 @@ describe('BuyerCriteriaService', () => {
     );
   });
 });
+
+// Hard/soft preference semantics are intentionally separate from the text
+// itself. Ordinary sector/location wording is preferred; explicit only/must is
+// stored by LeadCaptureService as required.
+describe('BuyerCriteriaService preference modes', () => {
+  const service = new BuyerCriteriaService();
+
+  it('uses preferred sector and location by default for a normal buyer request', () => {
+    const criteria = service.fromRecord(record({
+      businessType: 'Cafe',
+      buyerLocation: 'Dubai',
+      buyerSectorPreference: 'preferred',
+      buyerLocationPreference: 'preferred',
+    }));
+
+    expect(criteria.sectorPreference).toBe('preferred');
+    expect(criteria.locationPreference).toBe('preferred');
+  });
+
+  it('keeps explicit required preference modes hard', () => {
+    const criteria = service.fromRecord(record({
+      businessType: 'Restaurant',
+      buyerLocation: 'Dubai',
+      buyerSectorPreference: 'required',
+      buyerLocationPreference: 'required',
+    }));
+
+    expect(criteria.sectorPreference).toBe('required');
+    expect(criteria.locationPreference).toBe('required');
+  });
+});

@@ -11,6 +11,7 @@ import { PersistenceService } from './persistence.service';
 import { AccessControlService } from './access-control.service';
 import { MessageDeliveryService } from './message-delivery.service';
 import { SharhApiService } from './sharh-api.service';
+import type { BuyerMatchAnalysis, BuyerMatchRelaxation, PublicListingRow } from './sharh-api.service';
 import { SharhSyncService } from './sharh-sync.service';
 import { FunnelQualityService } from './funnel-quality.service';
 import { ConversationSafetyService } from './conversation-safety.service';
@@ -885,8 +886,12 @@ export class ChatbotService {
 
     try {
       const currentBefore = this.leadCaptureService.getCurrentRecord(chatId);
-      const listingSelection =
+      const buyerComparison =
         currentBefore?.inquiryPurpose === 'buying'
+          ? this.resolveBuyerComparison(chatId, message.content)
+          : null;
+      const listingSelection =
+        currentBefore?.inquiryPurpose === 'buying' && !buyerComparison
           ? this.resolveBuyerListingSelection(chatId, message.content)
           : null;
       if (listingSelection) {
@@ -1062,15 +1067,22 @@ export class ChatbotService {
           `${message.id}-price-guidance`
         );
       } else if (record?.inquiryPurpose === 'buying') {
-        const listingResponse = await this.buildBuyerListingResponse(
-          chatId,
-          message.content,
-          record,
-          directive,
-          interpretation?.action === 'show_listings'
-        );
-        if (listingResponse) {
-          directive = { ...directive, directResponse: listingResponse };
+        const comparisonResponse = buyerComparison
+          ? await this.buildBuyerComparisonResponse(buyerComparison, record.language)
+          : null;
+        if (comparisonResponse) {
+          directive = { ...directive, directResponse: comparisonResponse };
+        } else {
+          const listingResponse = await this.buildBuyerListingResponse(
+            chatId,
+            message.content,
+            record,
+            directive,
+            interpretation?.action === 'show_listings'
+          );
+          if (listingResponse) {
+            directive = { ...directive, directResponse: listingResponse };
+          }
         }
       }
 
@@ -1247,7 +1259,7 @@ export class ChatbotService {
   ): string {
     if (!expectedField || !record) return '';
     const updates = new Set(
-      record.fieldsUpdated
+      (record.fieldsUpdated || '')
         .split(',')
         .map(value => value.trim())
         .filter(Boolean)
@@ -1327,6 +1339,30 @@ export class ChatbotService {
 
     const record =
       salesTurn?.record || this.leadCaptureService?.getCurrentRecord(chatId) || undefined;
+    const buyerCriteriaChanged = Boolean(
+      record?.inquiryPurpose === 'buying' &&
+      record.fieldsUpdated
+        .split(',')
+        .map(value => value.trim())
+        .some(field => [
+          'business_type',
+          'buyer_location',
+          'buyer_budget_aed',
+          'buyer_involvement',
+          'buyer_minimum_annual_profit_aed',
+          'buyer_minimum_roi_pct',
+          'buyer_return_period',
+          'buyer_excluded_sectors',
+          'buyer_profitable_only',
+          'buyer_sector_preference',
+          'buyer_location_preference',
+        ].includes(field))
+    );
+    if (buyerCriteriaChanged) {
+      // A revised criterion triggers a fresh backend search. Never replace that
+      // result with the generic “criteria already saved” anti-repeat message.
+      return candidate;
+    }
     const language = record?.language || 'en';
     const expectedField = salesTurn?.directive.expectedField;
     const lower = incomingContent.toLowerCase();
@@ -1699,6 +1735,7 @@ export class ChatbotService {
     }
 
     const explicitRequest = this.isListingRequest(message);
+    const showClosest = this.isClosestBuyerRequest(message);
     const changed = new Set(
       record.fieldsUpdated
         .split(',')
@@ -1706,7 +1743,13 @@ export class ChatbotService {
         .filter(Boolean)
     );
     const hasSearchCriteria = Boolean(
-      record.specificListingCode || record.businessType || record.buyerLocation || record.buyerBudgetAed
+      record.specificListingCode ||
+      record.businessType ||
+      record.buyerLocation ||
+      record.buyerBudgetAed ||
+      record.buyerMinimumAnnualProfitAed ||
+      record.buyerMinimumRoiPct ||
+      record.buyerInvolvement
     );
     const criteriaChanged = [
       'specific_listing_code',
@@ -1720,12 +1763,14 @@ export class ChatbotService {
       'buyer_return_period',
       'buyer_excluded_sectors',
       'buyer_profitable_only',
+      'buyer_sector_preference',
+      'buyer_location_preference',
     ].some(field => changed.has(field));
 
-    if (!force && !explicitRequest && !criteriaChanged) {
+    if (!force && !explicitRequest && !criteriaChanged && !showClosest) {
       return null;
     }
-    if (!hasSearchCriteria && !explicitRequest) {
+    if (!hasSearchCriteria && !explicitRequest && !showClosest) {
       return null;
     }
 
@@ -1741,7 +1786,9 @@ export class ChatbotService {
     const fingerprint = [
       record.specificListingCode,
       record.businessType.toLowerCase(),
+      record.buyerSectorPreference,
       record.buyerLocation.toLowerCase(),
+      record.buyerLocationPreference,
       record.buyerBudgetAed.toLowerCase(),
       record.buyerInvolvement.toLowerCase(),
       record.buyerAdditionalComments.toLowerCase(),
@@ -1751,19 +1798,50 @@ export class ChatbotService {
       record.buyerExcludedSectors.toLowerCase(),
       String(record.buyerProfitableOnly),
     ].join('|');
-    if (!force && !explicitRequest && this.buyerMatchFingerprints.get(chatId) === fingerprint) {
+    if (
+      !force &&
+      !explicitRequest &&
+      !showClosest &&
+      this.buyerMatchFingerprints.get(chatId) === fingerprint
+    ) {
       return null;
     }
 
-    const rows = record.specificListingCode
-      ? await this.sharhApiService.searchPublicListings(record.specificListingCode)
-      : await this.sharhApiService.searchBuyerMatches(record, 3);
+    const hadPreviousSearch = this.buyerMatchFingerprints.has(chatId);
+    const isCriteriaRefinement = Boolean(
+      hadPreviousSearch &&
+      criteriaChanged &&
+      !explicitRequest &&
+      !record.specificListingCode
+    );
+
+    let analysis: BuyerMatchAnalysis | undefined;
+    let rows: PublicListingRow[];
+    let nearMode = false;
+    if (record.specificListingCode) {
+      rows = await this.sharhApiService.searchPublicListings(record.specificListingCode);
+    } else {
+      analysis = await this.sharhApiService.searchBuyerMatchAnalysis(record, 3);
+      rows = analysis.items;
+      if (showClosest && rows.length === 0 && analysis.nearMatches.length > 0) {
+        rows = analysis.nearMatches;
+        nearMode = true;
+      }
+    }
 
     this.buyerMatchFingerprints.set(chatId, fingerprint);
     this.persistence?.setItem(BUYER_MATCHES_NAMESPACE, chatId, fingerprint);
 
     const nextPrompt = directive.directResponse?.trim() || '';
-    const response = this.formatBuyerListingResults(chatId, record, criteria, rows);
+    const response = this.formatBuyerListingResults(
+      chatId,
+      record,
+      criteria,
+      rows,
+      isCriteriaRefinement ? changed : undefined,
+      analysis,
+      nearMode
+    );
     const appendNextPrompt = Boolean(
       nextPrompt &&
       !/open a result|replying with its number|refine the search|открыть вариант|أرسل رقمه/i.test(nextPrompt)
@@ -1775,7 +1853,10 @@ export class ChatbotService {
     chatId: string,
     record: LeadCaptureRecord,
     criteria: BuyerSearchCriteria,
-    rows: Array<Record<string, unknown>>
+    rows: PublicListingRow[],
+    refinementFields?: Set<string>,
+    analysis?: BuyerMatchAnalysis,
+    nearMode: boolean = false
   ): string {
     const language = record.language;
     if (rows.length === 0) {
@@ -1787,61 +1868,106 @@ export class ChatbotService {
             : `Listing ${record.specificListingCode} is not currently available among published opportunities. The request is saved.`;
       }
 
+      const refinementSummary = refinementFields
+        ? this.buyerCriteriaRefinementSummary(record, criteria, refinementFields)
+        : '';
+      const relaxation = analysis?.relaxations[0];
+      const relaxationLine = relaxation
+        ? this.formatBuyerRelaxation(relaxation, language)
+        : '';
+      const sanityLine = this.buyerCriteriaSanityNote(criteria, language);
+      const closest = analysis?.nearMatches[0];
+      const closestCode = closest ? String(closest['public_code'] || '').trim().toUpperCase() : '';
+      const closestTitle = closest ? String(closest['title'] || '').trim() : '';
+      const hardGaps = closest && Array.isArray(closest['hard_gap_labels'])
+        ? closest['hard_gap_labels']
+            .map(value => this.localizeBuyerMatchLabel(String(value), language))
+            .filter(Boolean)
+            .slice(0, 2)
+        : [];
+      const closestLine = closestCode
+        ? language === 'ru'
+          ? `Ближайший вариант: ${closestCode}${closestTitle ? ` — ${closestTitle}` : ''}${hardGaps.length ? `. Не проходит по: ${hardGaps.join(', ')}` : ''}. Напишите «показать ближайшие», если хотите увидеть такие варианты.`
+          : language === 'ar'
+            ? `أقرب خيار: ${closestCode}${closestTitle ? ` — ${closestTitle}` : ''}${hardGaps.length ? `. لا يطابق: ${hardGaps.join('، ')}` : ''}. اكتب «اعرض الأقرب» لرؤية هذه الخيارات.`
+            : `Closest available: ${closestCode}${closestTitle ? ` — ${closestTitle}` : ''}${hardGaps.length ? `. It misses: ${hardGaps.join(', ')}` : ''}. Send “show closest” to see these options.`
+        : '';
+
+      if (refinementSummary) {
+        const noMatch = language === 'ru'
+          ? 'Точного совпадения по обновлённым обязательным критериям пока нет.'
+          : language === 'ar'
+            ? 'لا توجد مطابقة دقيقة لجميع الشروط الإلزامية بعد التعديل.'
+            : 'There is still no exact published match for all revised hard criteria.';
+        return [refinementSummary, noMatch, sanityLine, relaxationLine, closestLine]
+          .filter(Boolean)
+          .join('\n');
+      }
+
       const summary = this.buyerCriteriaService.compactSummary(criteria, language);
       const rendered = summary.map(item => `• ${item}`).join('\n');
-      if (language === 'ru') {
-        return [
-          'Сейчас нет опубликованного листинга, который одновременно соответствует всем обязательным критериям:',
-          rendered,
-          'Случайные или финансово неподтверждённые варианты показываться не будут. Критерии сохранены. Для нового поиска можно написать, например: «прибыль от 250K в год», «можно активное управление» или «бюджет 1.5M».',
-        ].filter(Boolean).join('\n');
-      }
-      if (language === 'ar') {
-        return [
-          'لا يوجد حالياً إعلان منشور يطابق جميع الشروط الإلزامية معاً:',
-          rendered,
-          'لن أعرض خيارات عشوائية أو بيانات مالية غير معلنة. تم حفظ المعايير. يمكنك تعديل البحث بعبارات مثل: «ربح سنوي 250K»، أو «الإدارة النشطة مقبولة»، أو «الميزانية 1.5M».',
-        ].filter(Boolean).join('\n');
-      }
-      return [
-        'There is currently no published listing that meets all hard criteria at the same time:',
-        rendered,
-        'I will not substitute random listings or listings with missing required financial data. Your criteria are saved. To revise the search, send a change such as “annual profit 250K”, “active management is acceptable”, or “budget 1.5M”.',
-      ].filter(Boolean).join('\n');
+      const intro = language === 'ru'
+        ? 'Точного опубликованного совпадения по всем обязательным критериям сейчас нет.'
+        : language === 'ar'
+          ? 'لا توجد حالياً مطابقة منشورة دقيقة لجميع الشروط الإلزامية.'
+          : 'There is currently no exact published match meeting every hard criterion.';
+      const safeguard = language === 'ru'
+        ? 'Случайные варианты или листинги с неизвестными обязательными финансовыми данными подставляться не будут.'
+        : language === 'ar'
+          ? 'لن أستبدلها بخيارات عشوائية أو بإعلانات تفتقد البيانات المالية الإلزامية.'
+          : 'I will not substitute random listings or treat missing required financial data as a match.';
+      return [intro, rendered, sanityLine, relaxationLine, closestLine, safeguard]
+        .filter(Boolean)
+        .join('\n');
     }
 
     const codes = rows
       .map(row => String(row['public_code'] || '').trim().toUpperCase())
       .filter(code => /^SH-\d{4,}$/.test(code))
-      .slice(0, 3);
+      .slice(0, 5);
     if (codes.length) {
       this.buyerListingCodes.set(chatId, codes);
       this.persistence?.setItem(BUYER_LISTING_CODES_NAMESPACE, chatId, codes);
     }
 
     const exactCode = Boolean(record.specificListingCode);
-    const header = exactCode
+    const refinementSummary = refinementFields
+      ? this.buyerCriteriaRefinementSummary(record, criteria, refinementFields)
+      : '';
+    const header = nearMode
       ? language === 'ru'
-        ? 'Опубликованный листинг:'
+        ? 'Ближайшие опубликованные варианты. Они НЕ соответствуют всем обязательным критериям:'
         : language === 'ar'
-          ? 'الإعلان المنشور:'
-          : 'Published listing:'
-      : language === 'ru'
-        ? 'Опубликованные варианты, соответствующие обязательным критериям:'
-        : language === 'ar'
-          ? 'الخيارات المنشورة المطابقة للشروط الإلزامية:'
-          : 'Published options meeting all hard criteria:';
+          ? 'أقرب الخيارات المنشورة. هذه الخيارات لا تطابق جميع الشروط الإلزامية:'
+          : 'Closest published options. These do NOT meet every hard criterion:'
+      : exactCode
+        ? language === 'ru'
+          ? 'Опубликованный листинг:'
+          : language === 'ar'
+            ? 'الإعلان المنشور:'
+            : 'Published listing:'
+        : refinementSummary
+          ? language === 'ru'
+            ? `${refinementSummary}\nНовые точные совпадения:`
+            : language === 'ar'
+              ? `${refinementSummary}\nالمطابقات الدقيقة الجديدة:`
+              : `${refinementSummary}\nExact matches for the revised criteria:`
+          : language === 'ru'
+            ? 'Лучшие опубликованные совпадения:'
+            : language === 'ar'
+              ? 'أفضل المطابقات المنشورة:'
+              : 'Best published matches:';
 
-    const criteriaItems = exactCode
+    const criteriaItems = exactCode || refinementSummary || nearMode
       ? []
       : this.buyerCriteriaService.compactSummary(criteria, language);
     const criteriaBlock = criteriaItems.length > 0
       ? [
           language === 'ru'
-            ? 'Применённые критерии:'
+            ? 'Критерии:'
             : language === 'ar'
-              ? 'المعايير المطبقة:'
-              : 'Applied criteria:',
+              ? 'المعايير:'
+              : 'Criteria:',
           ...criteriaItems.map(item => `• ${item}`),
         ].join('\n')
       : '';
@@ -1861,6 +1987,7 @@ export class ChatbotService {
         row['annual_profit_aed'] ?? row['ebitda']
       );
       const roi = this.readPositiveNumber(row['roi_pct']);
+      const matchScore = this.readPositiveNumber(row['match_score']);
       const passive = row['passive_evidence'] === true;
       const reasons = Array.isArray(row['match_reasons'])
         ? row['match_reasons']
@@ -1872,8 +1999,22 @@ export class ChatbotService {
             .map(value => this.localizeBuyerMatchLabel(String(value), language))
             .filter(Boolean)
         : [];
+      const hardGaps = Array.isArray(row['hard_gap_labels'])
+        ? row['hard_gap_labels']
+            .map(value => this.localizeBuyerMatchLabel(String(value), language))
+            .filter(Boolean)
+        : [];
       const details = [location, sector, priceText].filter(Boolean).join(' · ');
       const metrics: string[] = [];
+      if (matchScore !== null && !exactCode) {
+        metrics.push(
+          language === 'ru'
+            ? `Совпадение: ${Math.round(matchScore)}%`
+            : language === 'ar'
+              ? `درجة المطابقة: ${Math.round(matchScore)}%`
+              : `Match: ${Math.round(matchScore)}%`
+        );
+      }
       if (annualProfit !== null) {
         metrics.push(
           language === 'ru'
@@ -1883,31 +2024,36 @@ export class ChatbotService {
               : `Annual profit: AED ${annualProfit.toLocaleString('en-US')}`
         );
       }
-      if (roi !== null) {
-        metrics.push(`ROI: ${roi.toLocaleString('en-US')}%`);
-      }
+      if (roi !== null) metrics.push(`ROI: ${roi.toLocaleString('en-US')}%`);
       if (passive) {
         metrics.push(
           language === 'ru'
-            ? 'Пассивное/управляемое ведение указано в листинге'
+            ? 'Управляемый/пассивный формат указан'
             : language === 'ar'
-              ? 'الإدارة التشغيلية المناسبة لدور سلبي مذكورة في الإعلان'
-              : 'Passive/manager-run operation indicated in listing'
+              ? 'التشغيل المُدار/السلبي مذكور'
+              : 'Manager-run/passive operation indicated'
         );
       }
-      const matchLine = reasons.length > 0
+      const matchLine = reasons.length > 0 && !nearMode
         ? language === 'ru'
-          ? `Почему подходит: ${reasons.join(', ')}`
+          ? `Почему подходит: ${reasons.slice(0, 4).join(', ')}`
           : language === 'ar'
-            ? `سبب المطابقة: ${reasons.join(', ')}`
-            : `Why it fits: ${reasons.join(', ')}`
+            ? `سبب المطابقة: ${reasons.slice(0, 4).join('، ')}`
+            : `Why it fits: ${reasons.slice(0, 4).join(', ')}`
         : '';
-      const gapLine = gaps.length > 0
+      const softGapLine = gaps.length > 0
         ? language === 'ru'
-          ? `Ограничение: ${gaps.join(', ')}`
+          ? `Предпочтение не выполнено: ${gaps.slice(0, 2).join(', ')}`
           : language === 'ar'
-            ? `ملاحظة: ${gaps.join(', ')}`
-            : `Caveat: ${gaps.join(', ')}`
+            ? `تفضيل غير متحقق: ${gaps.slice(0, 2).join('، ')}`
+            : `Preference gap: ${gaps.slice(0, 2).join(', ')}`
+        : '';
+      const hardGapLine = nearMode && hardGaps.length > 0
+        ? language === 'ru'
+          ? `Не проходит по: ${hardGaps.slice(0, 3).join(', ')}`
+          : language === 'ar'
+            ? `لا يطابق: ${hardGaps.slice(0, 3).join('، ')}`
+            : `Misses: ${hardGaps.slice(0, 3).join(', ')}`
         : '';
       const webBase = (process.env['SHARH_WEB_BASE_URL'] || 'https://sharh.ae').replace(/\/$/, '');
       const listingId = String(row['id'] || '').trim();
@@ -1917,23 +2063,361 @@ export class ChatbotService {
         details ? `   ${details}` : '',
         metrics.length ? `   ${metrics.join(' · ')}` : '',
         matchLine ? `   ${matchLine}` : '',
-        gapLine ? `   ${gapLine}` : '',
+        softGapLine ? `   ${softGapLine}` : '',
+        hardGapLine ? `   ${hardGapLine}` : '',
         url ? `   ${url}` : '',
       ].filter(Boolean).join('\n');
     });
 
     const footer = exactCode
       ? language === 'ru'
-        ? 'Финансовые и операционные данные основаны на опубликованном листинге и подлежат проверке в due diligence.'
+        ? 'Финансовые и операционные данные взяты из опубликованного листинга и требуют проверки в due diligence.'
         : language === 'ar'
-          ? 'البيانات المالية والتشغيلية مأخوذة من الإعلان المنشور وتخضع للتحقق أثناء الفحص النافي للجهالة.'
+          ? 'البيانات المالية والتشغيلية مأخوذة من الإعلان المنشور وتحتاج إلى التحقق أثناء الفحص النافي للجهالة.'
           : 'Financial and operating data come from the published listing and remain subject to due diligence.'
       : language === 'ru'
-        ? 'Ответьте номером или кодом SH-XXXX. Финансовые показатели и пассивность необходимо подтвердить в due diligence.'
+        ? 'Можно ответить номером, написать «сравни 1 и 2» или изменить любой критерий одной фразой.'
         : language === 'ar'
-          ? 'أرسل الرقم أو رمز SH-XXXX. يجب التحقق من الأرقام المالية وطبيعة الإدارة أثناء الفحص النافي للجهالة.'
-          : 'Reply with the number or SH-XXXX code. Financial figures and passive-operation claims must be confirmed in due diligence.';
+          ? 'يمكنك الرد بالرقم، أو كتابة «قارن 1 و2»، أو تعديل أي معيار بعبارة واحدة.'
+          : 'Reply with a number, say “compare 1 and 2”, or change any criterion in one phrase.';
     return [header, criteriaBlock, ...lines, footer].filter(Boolean).join('\n');
+  }
+
+  private buyerCriteriaSanityNote(
+    criteria: BuyerSearchCriteria,
+    language: LeadCaptureRecord['language']
+  ): string {
+    if (criteria.maxBudgetAed === null || criteria.minAnnualProfitAed === null) {
+      return '';
+    }
+    if (criteria.maxBudgetAed <= 0 || criteria.minAnnualProfitAed <= 0) return '';
+
+    const impliedPct = (criteria.minAnnualProfitAed / criteria.maxBudgetAed) * 100;
+    if (!Number.isFinite(impliedPct) || impliedPct < 75) return '';
+
+    const pct = Math.round(impliedPct);
+    return language === 'ru'
+      ? `Проверка критериев: минимальная прибыль относительно максимальной цены означает не менее ${pct}% в год. Я сохранил это именно как вы указали, но такой фильтр очень жёсткий.`
+      : language === 'ar'
+        ? `مراجعة المعايير: الحد الأدنى للربح مقابل الحد الأقصى للسعر يعني ما لا يقل عن ${pct}% سنوياً. أبقيت الشرط كما طلبته، لكنه شديد التقييد.`
+        : `Criteria check: minimum profit versus maximum price implies at least ${pct}% per year. I kept it exactly as requested, but that is an unusually restrictive filter.`;
+  }
+
+  private formatBuyerRelaxation(
+    relaxation: BuyerMatchRelaxation,
+    language: LeadCaptureRecord['language']
+  ): string {
+    const count = relaxation.resultCount;
+    const number = typeof relaxation.suggestedValue === 'number'
+      ? relaxation.suggestedValue
+      : null;
+    const resultText = language === 'ru'
+      ? `${count} вариант${count === 1 ? '' : count >= 2 && count <= 4 ? 'а' : 'ов'}`
+      : language === 'ar'
+        ? `${count} خيار`
+        : `${count} option${count === 1 ? '' : 's'}`;
+
+    let change = relaxation.label;
+    if (relaxation.criterion === 'budget' && number !== null) {
+      change = language === 'ru'
+        ? `увеличить максимальный бюджет до AED ${number.toLocaleString('en-US')}`
+        : language === 'ar'
+          ? `رفع الحد الأقصى للميزانية إلى ${number.toLocaleString('en-US')} درهم`
+          : `increase maximum budget to AED ${number.toLocaleString('en-US')}`;
+    } else if (relaxation.criterion === 'annual_profit' && number !== null) {
+      change = language === 'ru'
+        ? `снизить минимальную годовую прибыль до AED ${number.toLocaleString('en-US')}`
+        : language === 'ar'
+          ? `خفض الحد الأدنى للربح السنوي إلى ${number.toLocaleString('en-US')} درهم`
+          : `lower minimum annual profit to AED ${number.toLocaleString('en-US')}`;
+    } else if (relaxation.criterion === 'roi' && number !== null) {
+      change = language === 'ru'
+        ? `снизить минимальный ROI до ${number}%`
+        : language === 'ar'
+          ? `خفض الحد الأدنى للعائد إلى ${number}%`
+          : `lower minimum ROI to ${number}%`;
+    } else if (relaxation.criterion === 'passive') {
+      change = language === 'ru'
+        ? 'разрешить активное/операционное участие владельца'
+        : language === 'ar'
+          ? 'السماح بدور تشغيلي نشط للمالك'
+          : 'allow active or owner-operated businesses';
+    } else if (relaxation.criterion === 'location') {
+      change = language === 'ru'
+        ? 'сделать локацию предпочтением, а не обязательным условием'
+        : language === 'ar'
+          ? 'جعل الموقع تفضيلاً بدلاً من شرط إلزامي'
+          : 'treat location as a preference rather than a requirement';
+    } else if (relaxation.criterion === 'sector') {
+      change = language === 'ru'
+        ? 'сделать сферу предпочтением, а не обязательным условием'
+        : language === 'ar'
+          ? 'جعل القطاع تفضيلاً بدلاً من شرط إلزامي'
+          : 'treat sector as a preference rather than a requirement';
+    }
+
+    return language === 'ru'
+      ? `Минимальное полезное изменение: ${change} → ${resultText}.`
+      : language === 'ar'
+        ? `أصغر تعديل مفيد: ${change} ← ${resultText}.`
+        : `Smallest useful change: ${change} → ${resultText}.`;
+  }
+
+  private isClosestBuyerRequest(content: string): boolean {
+    return /\b(?:show|see|give|display)?\s*(?:the\s+)?(?:closest|nearest|best available|near matches?|almost matches?)\b|\bshow\s+(?:those|them)\s+anyway\b|(?:покаж(?:и|ите)?\s+(?:ближайш|похож|почти)|ближайшие варианты)|(?:اعرض\s+(?:الأقرب|المشابه)|أقرب الخيارات)/iu.test(content);
+  }
+
+  private resolveBuyerComparison(chatId: string, content: string): string[] | null {
+    const normalized = content.trim().toLowerCase();
+    const hasCompareIntent = /\b(?:compare|comparison|versus|vs\.?|difference|which is better|better one)\b|(?:сравн|против|какой лучше|разниц)|(?:قارن|مقارنة|مقابل|أيهما أفضل)/iu.test(normalized);
+    if (!hasCompareIntent) return null;
+
+    const directCodes = Array.from(
+      new Set(
+        (content.match(/\bSH-\d{1,12}\b/giu) || []).map(code => code.toUpperCase())
+      )
+    ).slice(0, 3);
+    if (directCodes.length >= 2) return directCodes;
+
+    const cached = this.buyerListingCodes.get(chatId) || [];
+    if (cached.length < 2) return null;
+    const indexes: number[] = [];
+    for (const match of normalized.matchAll(/(?:^|[^\d])([1-5])(?=$|[^\d])/g)) {
+      const value = Number.parseInt(match[1] || '', 10) - 1;
+      if (value >= 0 && value < cached.length && !indexes.includes(value)) indexes.push(value);
+    }
+    const ordinalMap: Array<[RegExp, number]> = [
+      [/\bfirst\b|\b1st\b|перв(?:ый|ую|ого)|الأول/u, 0],
+      [/\bsecond\b|\b2nd\b|втор(?:ой|ую|ого)|الثاني/u, 1],
+      [/\bthird\b|\b3rd\b|трет(?:ий|ью|ьего)|الثالث/u, 2],
+      [/\bfourth\b|\b4th\b|четверт|الرابع/u, 3],
+      [/\bfifth\b|\b5th\b|пят|الخامس/u, 4],
+    ];
+    for (const [pattern, index] of ordinalMap) {
+      if (index < cached.length && pattern.test(normalized) && !indexes.includes(index)) indexes.push(index);
+    }
+    const codes = indexes.slice(0, 3).map(index => cached[index]).filter((code): code is string => Boolean(code));
+    return codes.length >= 2 ? codes : null;
+  }
+
+  private async buildBuyerComparisonResponse(
+    codes: string[],
+    language: LeadCaptureRecord['language']
+  ): Promise<string | null> {
+    if (!this.sharhApiService || codes.length < 2) return null;
+    const fetched = await Promise.all(
+      codes.slice(0, 3).map(async code => ({
+        code,
+        row: (await this.sharhApiService!.searchPublicListings(code))[0],
+      }))
+    );
+    const available = fetched.filter(
+      (item): item is { code: string; row: PublicListingRow } => Boolean(item.row)
+    );
+    if (available.length < 2) {
+      return language === 'ru'
+        ? 'Не удалось загрузить как минимум два из выбранных опубликованных листингов. Выберите другие номера или коды SH-XXXX.'
+        : language === 'ar'
+          ? 'تعذر تحميل إعلانين منشورين على الأقل من الخيارات المحددة. اختر أرقاماً أو رموز SH-XXXX أخرى.'
+          : 'I could not load at least two of the selected published listings. Choose different numbers or SH-XXXX codes.';
+    }
+
+    const metrics = available.map(({ code, row }) => {
+      const price = this.readPositiveNumber(row['parsed_price_aed'] ?? row['price_int'] ?? row['asking'] ?? row['price']);
+      let profit = this.readPositiveNumber(row['annual_profit_aed'] ?? row['ebitda']);
+      if (profit === null) {
+        const monthly = this.readPositiveNumber(row['monthly_net_profit']);
+        if (monthly !== null) profit = monthly * 12;
+      }
+      const roi = price && profit !== null ? Math.round((profit / price) * 1000) / 10 : null;
+      return {
+        code,
+        title: String(row['title'] || 'Business opportunity').trim(),
+        sector: String(row['sector'] || '').trim(),
+        location: String(row['emirate'] || row['region'] || '').trim(),
+        price,
+        profit,
+        roi,
+      };
+    });
+
+    const heading = language === 'ru'
+      ? `Сравнение ${metrics.map(item => item.code).join(' vs ')}:`
+      : language === 'ar'
+        ? `مقارنة ${metrics.map(item => item.code).join(' مقابل ')}:`
+        : `Comparison — ${metrics.map(item => item.code).join(' vs ')}:`;
+    const lines = metrics.map(item => {
+      const price = item.price === null ? '—' : `AED ${item.price.toLocaleString('en-US')}`;
+      const profit = item.profit === null ? '—' : `AED ${item.profit.toLocaleString('en-US')}`;
+      const roi = item.roi === null ? '—' : `${item.roi}%`;
+      return [
+        `${item.code} — ${item.title}`,
+        [item.location, item.sector].filter(Boolean).join(' · '),
+        language === 'ru'
+          ? `Цена: ${price} · Годовая прибыль: ${profit} · ROI: ${roi}`
+          : language === 'ar'
+            ? `السعر: ${price} · الربح السنوي: ${profit} · ROI: ${roi}`
+            : `Price: ${price} · Annual profit: ${profit} · ROI: ${roi}`,
+      ].filter(Boolean).join('\n');
+    });
+
+    const roiKnown = metrics.filter(item => item.roi !== null);
+    const priceKnown = metrics.filter(item => item.price !== null);
+    const notes: string[] = [];
+    if (roiKnown.length >= 2) {
+      const best = [...roiKnown].sort((a, b) => (b.roi || 0) - (a.roi || 0))[0];
+      if (best) {
+        notes.push(
+          language === 'ru'
+            ? `${best.code} имеет самый высокий раскрытый ROI.`
+            : language === 'ar'
+              ? `${best.code} لديه أعلى عائد معلن.`
+              : `${best.code} has the highest disclosed ROI.`
+        );
+      }
+    }
+    if (priceKnown.length >= 2) {
+      const cheapest = [...priceKnown].sort((a, b) => (a.price || 0) - (b.price || 0))[0];
+      if (cheapest) {
+        notes.push(
+          language === 'ru'
+            ? `${cheapest.code} требует наименьшего раскрытого бюджета.`
+            : language === 'ar'
+              ? `${cheapest.code} يتطلب أقل ميزانية معلنة.`
+              : `${cheapest.code} has the lowest disclosed asking price.`
+        );
+      }
+    }
+    const dueDiligence = language === 'ru'
+      ? 'Сравнение основано только на опубликованных данных; финансовые показатели требуют due diligence.'
+      : language === 'ar'
+        ? 'المقارنة مبنية فقط على البيانات المنشورة؛ الأرقام المالية تحتاج إلى فحص نافي للجهالة.'
+        : 'This comparison uses published data only; financial figures remain subject to due diligence.';
+    return [heading, ...lines, notes.join(' '), dueDiligence].filter(Boolean).join('\n\n');
+  }
+
+  private buyerCriteriaRefinementSummary(
+    record: LeadCaptureRecord,
+    criteria: BuyerSearchCriteria,
+    changed: Set<string>
+  ): string {
+    const language = record.language;
+    const updates: string[] = [];
+
+    const money = (value: number | null): string =>
+      value === null ? '' : `AED ${value.toLocaleString('en-US')}`;
+
+    if (changed.has('buyer_budget_aed')) {
+      const value = criteria.budgetFlexible
+        ? language === 'ru'
+          ? 'гибкий'
+          : language === 'ar'
+            ? 'مرنة'
+            : 'flexible'
+        : money(criteria.maxBudgetAed);
+      if (value) {
+        updates.push(
+          language === 'ru'
+            ? `бюджет → ${value}`
+            : language === 'ar'
+              ? `الميزانية ← ${value}`
+              : `budget → ${value}`
+        );
+      }
+    }
+
+    if (changed.has('buyer_minimum_annual_profit_aed') && criteria.minAnnualProfitAed !== null) {
+      const value = money(criteria.minAnnualProfitAed);
+      updates.push(
+        language === 'ru'
+          ? `минимальная годовая прибыль → ${value}`
+          : language === 'ar'
+            ? `الحد الأدنى للربح السنوي ← ${value}`
+            : `minimum annual profit → ${value}`
+      );
+    }
+
+    if (changed.has('buyer_minimum_roi_pct') && criteria.minRoiPct !== null) {
+      updates.push(
+        language === 'ru'
+          ? `минимальный ROI → ${criteria.minRoiPct}%`
+          : language === 'ar'
+            ? `الحد الأدنى للعائد ← ${criteria.minRoiPct}%`
+            : `minimum ROI → ${criteria.minRoiPct}%`
+      );
+    }
+
+    if (changed.has('buyer_involvement')) {
+      const involvement = criteria.passivePreference === 'required'
+        ? language === 'ru'
+          ? 'только пассивное/управляемое'
+          : language === 'ar'
+            ? 'تشغيل سلبي/مُدار مطلوب'
+            : 'passive/manager-run required'
+        : criteria.passivePreference === 'preferred'
+          ? language === 'ru'
+            ? 'пассивное предпочтительно'
+            : language === 'ar'
+              ? 'التشغيل السلبي مفضل'
+              : 'passive preferred'
+          : language === 'ru'
+            ? 'активное управление допустимо'
+            : language === 'ar'
+              ? 'الإدارة النشطة مقبولة'
+              : 'active management acceptable';
+      updates.push(involvement);
+    }
+
+    if (changed.has('business_type') || changed.has('buyer_sector_preference')) {
+      const sectorBase = criteria.sector || (language === 'ru' ? 'любая сфера' : language === 'ar' ? 'أي قطاع' : 'any sector');
+      const sector = criteria.sector && criteria.sectorPreference === 'required'
+        ? `${sectorBase}${language === 'ru' ? ' (обязательно)' : language === 'ar' ? ' (إلزامي)' : ' (required)'}`
+        : criteria.sector && criteria.sectorPreference === 'preferred'
+          ? `${sectorBase}${language === 'ru' ? ' (предпочтительно)' : language === 'ar' ? ' (مفضل)' : ' (preferred)'}`
+          : sectorBase;
+      updates.push(
+        language === 'ru'
+          ? `сфера → ${sector}`
+          : language === 'ar'
+            ? `القطاع ← ${sector}`
+            : `sector → ${sector}`
+      );
+    }
+
+    if (changed.has('buyer_location') || changed.has('buyer_location_preference')) {
+      const locationBase = criteria.emirate || (language === 'ru' ? 'без ограничения' : language === 'ar' ? 'بدون تفضيل' : 'no preference');
+      const location = criteria.emirate && criteria.locationPreference === 'required'
+        ? `${locationBase}${language === 'ru' ? ' (обязательно)' : language === 'ar' ? ' (إلزامي)' : ' (required)'}`
+        : criteria.emirate && criteria.locationPreference === 'preferred'
+          ? `${locationBase}${language === 'ru' ? ' (предпочтительно)' : language === 'ar' ? ' (مفضل)' : ' (preferred)'}`
+          : locationBase;
+      updates.push(
+        language === 'ru'
+          ? `локация → ${location}`
+          : language === 'ar'
+            ? `الموقع ← ${location}`
+            : `location → ${location}`
+      );
+    }
+
+    if (changed.has('buyer_excluded_sectors') && criteria.excludedSectors.length > 0) {
+      const value = criteria.excludedSectors.join(', ');
+      updates.push(
+        language === 'ru'
+          ? `исключить → ${value}`
+          : language === 'ar'
+            ? `استبعاد ← ${value}`
+            : `exclude → ${value}`
+      );
+    }
+
+    if (updates.length === 0) return '';
+    const joined = updates.slice(0, 3).join('; ');
+    return language === 'ru'
+      ? `Обновлено: ${joined}.`
+      : language === 'ar'
+        ? `تم التحديث: ${joined}.`
+        : `Updated: ${joined}.`;
   }
 
   private localizeBuyerMatchLabel(
@@ -1966,6 +2450,56 @@ export class ChatbotService {
         ru: 'пассивное управление не подтверждено описанием',
         ar: 'التشغيل السلبي غير مثبت في الوصف',
       },
+      'preferred sector not met': {
+        en: 'preferred sector not met',
+        ru: 'предпочтительная сфера не совпадает',
+        ar: 'القطاع المفضل غير متحقق',
+      },
+      'preferred location not met': {
+        en: 'preferred location not met',
+        ru: 'предпочтительная локация не совпадает',
+        ar: 'الموقع المفضل غير متحقق',
+      },
+      'required sector not met': {
+        en: 'required sector not met',
+        ru: 'обязательная сфера не совпадает',
+        ar: 'القطاع الإلزامي غير متحقق',
+      },
+      'required location not met': {
+        en: 'required location not met',
+        ru: 'обязательная локация не совпадает',
+        ar: 'الموقع الإلزامي غير متحقق',
+      },
+      'above budget': {
+        en: 'above budget',
+        ru: 'выше бюджета',
+        ar: 'أعلى من الميزانية',
+      },
+      'minimum annual profit not met': {
+        en: 'minimum annual profit not met',
+        ru: 'ниже минимальной годовой прибыли',
+        ar: 'أقل من الحد الأدنى للربح السنوي',
+      },
+      'minimum roi not met': {
+        en: 'minimum ROI not met',
+        ru: 'ниже минимального ROI',
+        ar: 'أقل من الحد الأدنى للعائد',
+      },
+      'roi cannot be calculated': {
+        en: 'ROI cannot be calculated from disclosed data',
+        ru: 'ROI нельзя рассчитать по раскрытым данным',
+        ar: 'لا يمكن حساب العائد من البيانات المعلنة',
+      },
+      'positive earnings not disclosed': {
+        en: 'positive profit is not disclosed',
+        ru: 'положительная прибыль не раскрыта',
+        ar: 'لم يتم الإفصاح عن ربح إيجابي',
+      },
+      'not profitable': {
+        en: 'not profitable on disclosed figures',
+        ru: 'по раскрытым данным прибыль отсутствует',
+        ar: 'غير مربح وفق الأرقام المعلنة',
+      },
       'asking price not disclosed': {
         en: 'asking price is not disclosed',
         ru: 'цена не раскрыта',
@@ -1992,10 +2526,38 @@ export class ChatbotService {
   }
 
   private resolveBuyerListingSelection(chatId: string, content: string): string | null {
-    const match = content.trim().match(/^([1-3])$/);
-    if (!match?.[1]) return null;
-    const index = Number.parseInt(match[1], 10) - 1;
-    return this.buyerListingCodes.get(chatId)?.[index] || null;
+    const cached = this.buyerListingCodes.get(chatId) || [];
+    if (!cached.length) return null;
+    const normalized = content.trim().toLowerCase();
+    if (/\b(?:compare|versus|vs\.?)\b|(?:сравн|قارن)/iu.test(normalized)) return null;
+
+    let index: number | null = null;
+    const direct = normalized.match(/^#?\s*([1-5])\s*(?:please|pls)?$/i)?.[1];
+    const labelled = normalized.match(/\b(?:option|listing|number|no\.?|result)\s*#?\s*([1-5])\b/i)?.[1];
+    const action = normalized.match(/\b(?:open|show|view|tell me (?:more )?about|details? (?:for|on)?)\s+(?:the\s+)?(?:option\s+|listing\s+|result\s+)?#?\s*([1-5])\b/i)?.[1];
+    const numeric = direct || labelled || action;
+    if (numeric) index = Number.parseInt(numeric, 10) - 1;
+
+    if (index === null) {
+      const ordinalMap: Array<[RegExp, number]> = [
+        [/\bfirst(?: one)?\b|\b1st\b|перв(?:ый|ую|ого)|الأول/u, 0],
+        [/\bsecond(?: one)?\b|\b2nd\b|втор(?:ой|ую|ого)|الثاني/u, 1],
+        [/\bthird(?: one)?\b|\b3rd\b|трет(?:ий|ью|ьего)|الثالث/u, 2],
+        [/\bfourth(?: one)?\b|\b4th\b|четверт|الرابع/u, 3],
+        [/\bfifth(?: one)?\b|\b5th\b|пят|الخامس/u, 4],
+      ];
+      const selectionIntent = /\b(?:open|show|view|details?|tell me|more about|choose|select|take|interested)\b|(?:покаж|открой|подроб|выбира|интерес)|(?:اعرض|افتح|تفاصيل|اختر|مهتم)/iu.test(normalized);
+      for (const [pattern, candidate] of ordinalMap) {
+        if (pattern.test(normalized) && (selectionIntent || normalized.split(/\s+/).length <= 3)) {
+          index = candidate;
+          break;
+        }
+      }
+    }
+
+    return index !== null && index >= 0 && index < cached.length
+      ? cached[index] || null
+      : null;
   }
 
   private isListingRequest(content: string): boolean {

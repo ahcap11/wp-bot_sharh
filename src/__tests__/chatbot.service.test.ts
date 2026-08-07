@@ -282,6 +282,39 @@ describe('ChatbotService', () => {
       buyerProfitableOnly: true,
     } as import('../services/lead-capture.service').LeadCaptureRecord;
 
+    it('gives a concise delta response when a saved buyer search is refined and still has no match', () => {
+      const internal = chatbotService as unknown as {
+        buyerCriteriaService: {
+          fromRecord: (record: typeof buyerRecord) => unknown;
+        };
+        formatBuyerListingResults: (
+          chatId: string,
+          record: typeof buyerRecord,
+          criteria: unknown,
+          rows: Array<Record<string, unknown>>,
+          refinementFields?: Set<string>
+        ) => string;
+      };
+      const refined = {
+        ...buyerRecord,
+        buyerBudgetAed: 'AED 1,500,000',
+        buyerMinimumAnnualProfitAed: 'AED 250,000',
+      };
+      const criteria = internal.buyerCriteriaService.fromRecord(refined);
+      const result = internal.formatBuyerListingResults(
+        'buyer-chat',
+        refined,
+        criteria,
+        [],
+        new Set(['buyer_budget_aed', 'buyer_minimum_annual_profit_aed'])
+      );
+
+      expect(result).toContain('Updated: budget → AED 1,500,000; minimum annual profit → AED 250,000.');
+      expect(result).toContain('There is still no exact published match');
+      expect(result).not.toContain('Your criteria are saved');
+      expect(result).not.toContain('To revise the search');
+    });
+
     it('does not substitute random listings when no hard match exists', () => {
       const internal = chatbotService as unknown as {
         buyerCriteriaService: {
@@ -335,6 +368,7 @@ describe('ChatbotService', () => {
             annual_profit_aed: 330000,
             roi_pct: 36.7,
             passive_evidence: true,
+            match_score: 92,
             match_reasons: [
               'within budget',
               'minimum annual earnings met',
@@ -344,10 +378,97 @@ describe('ChatbotService', () => {
         ]
       );
 
+      expect(result).toContain('Match: 92%');
       expect(result).toContain('Annual profit: AED 330,000');
       expect(result).toContain('ROI: 36.7%');
       expect(result).toContain('Why it fits: within budget');
       expect(result).not.toContain('You can also refine the search');
+    });
+
+
+    it('explains the smallest useful relaxation and closest safe alternative', () => {
+      const internal = chatbotService as unknown as {
+        buyerCriteriaService: { fromRecord: (record: typeof buyerRecord) => unknown };
+        formatBuyerListingResults: (
+          chatId: string,
+          record: typeof buyerRecord,
+          criteria: unknown,
+          rows: Array<Record<string, unknown>>,
+          refinementFields?: Set<string>,
+          analysis?: unknown
+        ) => string;
+      };
+      const criteria = internal.buyerCriteriaService.fromRecord(buyerRecord);
+      const result = internal.formatBuyerListingResults(
+        'buyer-chat',
+        buyerRecord,
+        criteria,
+        [],
+        undefined,
+        {
+          items: [],
+          exactMatchCount: 0,
+          nearMatches: [
+            {
+              public_code: 'SH-0091',
+              title: 'Owner-operated services business',
+              hard_gap_labels: ['passive operation not evidenced'],
+            },
+          ],
+          relaxations: [
+            {
+              criterion: 'passive',
+              label: 'Allow active or owner-operated businesses',
+              suggestedValue: 'any',
+              resultCount: 4,
+            },
+          ],
+          limitingCriteria: ['passive'],
+        }
+      );
+
+      expect(result).toContain('Smallest useful change: allow active or owner-operated businesses → 4 options.');
+      expect(result).toContain('Closest available: SH-0091');
+      expect(result).toContain('passive operation is not evidenced');
+      expect(result).toContain('show closest');
+    });
+
+    it('labels best-available results as non-exact and shows the hard gap', () => {
+      const internal = chatbotService as unknown as {
+        buyerCriteriaService: { fromRecord: (record: typeof buyerRecord) => unknown };
+        formatBuyerListingResults: (
+          chatId: string,
+          record: typeof buyerRecord,
+          criteria: unknown,
+          rows: Array<Record<string, unknown>>,
+          refinementFields?: Set<string>,
+          analysis?: unknown,
+          nearMode?: boolean
+        ) => string;
+      };
+      const criteria = internal.buyerCriteriaService.fromRecord(buyerRecord);
+      const result = internal.formatBuyerListingResults(
+        'buyer-chat',
+        buyerRecord,
+        criteria,
+        [
+          {
+            id: 'listing-near',
+            public_code: 'SH-0092',
+            title: 'Near match',
+            parsed_price_aed: 900000,
+            annual_profit_aed: 320000,
+            match_score: 80,
+            hard_gap_labels: ['passive operation not evidenced'],
+          },
+        ],
+        undefined,
+        undefined,
+        true
+      );
+
+      expect(result).toContain('These do NOT meet every hard criterion');
+      expect(result).toContain('Misses: passive operation is not evidenced');
     });
   });
 
