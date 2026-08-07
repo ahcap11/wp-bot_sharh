@@ -139,7 +139,7 @@ export interface NavigationResult {
   resetAiUsage?: boolean | undefined;
   restartConfirmed?: boolean | undefined;
   continueFunnel?: boolean | undefined;
-  action?: 'back' | 'change' | 'review' | 'restart' | 'switch' | 'pause' | 'resume' | 'help' | undefined;
+  action?: 'back' | 'change' | 'review' | 'continue' | 'restart' | 'switch' | 'pause' | 'resume' | 'help' | undefined;
 }
 
 interface LeadCaptureState {
@@ -1259,7 +1259,7 @@ export class LeadCaptureService {
     state.lastUserMessageAt = now;
 
     if (state.status === 'qualified') {
-      const newCasePurpose = this.detectNewCasePurpose(lower, state.awaitingReentryChoice);
+      const newCasePurpose = this.detectNewCasePurpose(lower, state.awaitingReentryChoice, state.inquiryPurpose);
       if (newCasePurpose) {
         const language = state.language;
         this.beginSeparateCase(state, newCasePurpose);
@@ -1305,13 +1305,16 @@ export class LeadCaptureService {
         };
       }
 
-      if (state.awaitingReentryChoice && this.isCurrentCaseReference(lower)) {
+      if (
+        state.awaitingReentryChoice &&
+        (this.isCurrentCaseReference(lower) || this.isSameCasePurposeReference(lower, state.inquiryPurpose))
+      ) {
         state.awaitingReentryChoice = false;
         this.persist(chatId);
         return {
           handled: true,
           response: this.currentCaseStatus(state),
-          action: 'review',
+          action: 'continue',
         };
       }
 
@@ -4322,13 +4325,17 @@ export class LeadCaptureService {
     return /^(?:new request|another request|new case|another case|i have another one|новый запрос|другой запрос|ещё один запрос|طلب جديد|طلب آخر)$/iu.test(value);
   }
 
-  private detectNewCasePurpose(value: string, awaitingChoice: boolean): LeadInquiryPurpose | null {
+  private detectNewCasePurpose(
+    value: string,
+    awaitingChoice: boolean,
+    currentPurpose?: LeadInquiryPurpose
+  ): LeadInquiryPurpose | null {
     const buying =
       /\b(?:i\s+(?:want|would like|need|plan)\s+to|looking\s+to|interested\s+to)\s+(?:buy|purchase|acquire)\b/iu.test(value) ||
       /\b(?:another|new)\s+(?:buyer|buying|acquisition)\s+(?:request|case)?\b/iu.test(value) ||
       /(?:хочу|нужно|планирую)\s+(?:купить|приобрести)|новый запрос на покупку/iu.test(value) ||
       /(?:أريد|أرغب)\s+(?:شراء|الاستحواذ)|طلب شراء جديد/u.test(value) ||
-      (awaitingChoice && /^(?:buy|buying|buyer|purchase|покупка|купить|شراء)$/iu.test(value));
+      (awaitingChoice && currentPurpose !== 'buying' && /^(?:buy|buying|buyer|purchase|покупка|купить|شراء)$/iu.test(value));
     if (buying) return 'buying';
 
     const selling =
@@ -4338,8 +4345,18 @@ export class LeadCaptureService {
       /\b(?:sell|selling|list)\b.*\b(?:another|new|different)\s+(?:business|company|one)\b/iu.test(value) ||
       /(?:хочу|нужно|планирую)\s+продать|ещ[ёе] один бизнес|новый запрос на продажу/iu.test(value) ||
       /(?:أريد|أرغب)\s+بيع|مشروع آخر للبيع|طلب بيع جديد/u.test(value) ||
-      (awaitingChoice && /^(?:sell|selling|seller|продажа|продать|بيع)$/iu.test(value));
+      (awaitingChoice && currentPurpose !== 'selling' && /^(?:sell|selling|seller|продажа|продать|بيع)$/iu.test(value));
     return selling ? 'selling' : null;
+  }
+
+  private isSameCasePurposeReference(value: string, purpose?: LeadInquiryPurpose): boolean {
+    if (purpose === 'buying') {
+      return /^(?:buy|buying|buyer|purchase|покупка|купить|شراء)$/iu.test(value);
+    }
+    if (purpose === 'selling') {
+      return /^(?:sell|selling|seller|продажа|продать|بيع)$/iu.test(value);
+    }
+    return false;
   }
 
   private isCurrentCaseReference(value: string): boolean {
@@ -4381,12 +4398,47 @@ export class LeadCaptureService {
   private contextualReentryPrompt(state: LeadCaptureState): string {
     const name = state.clientName ? `, ${state.clientName}` : '';
     const label = this.currentCaseLabel(state);
+    const summary = this.currentCaseCompactSummary(state);
     const messages: Record<ConversationLanguage, string> = {
-      en: `Hello${name}. Your ${label} request is saved with SHARH. Are you asking about that request, selling another business, or looking to buy?`,
-      ru: `Здравствуйте${name}. Ваш запрос «${label}» сохранён в SHARH. Вы хотите уточнить этот запрос, продать другой бизнес или подобрать бизнес для покупки?`,
-      ar: `مرحباً${name}. طلب ${label} محفوظ لدى SHARH. هل تسأل عن هذا الطلب، أم تريد بيع مشروع آخر، أم تبحث عن مشروع للشراء؟`,
+      en: state.inquiryPurpose === 'buying'
+        ? `Welcome back${name}. Your buyer search is saved${summary ? `: ${summary}` : ''}. Continue this search, start a new one, or sell a business?`
+        : `Welcome back${name}. Your ${label} request is saved with SHARH${summary ? `: ${summary}` : ''}. Continue it, sell another business, or look to buy?`,
+      ru: state.inquiryPurpose === 'buying'
+        ? `С возвращением${name}. Ваш поиск бизнеса сохранён${summary ? `: ${summary}` : ''}. Продолжить его, начать новый или продать бизнес?`
+        : `С возвращением${name}. Ваш запрос «${label}» сохранён в SHARH${summary ? `: ${summary}` : ''}. Продолжить его, создать новый запрос на продажу или подобрать бизнес?`,
+      ar: state.inquiryPurpose === 'buying'
+        ? `مرحباً مجدداً${name}. بحث الشراء محفوظ${summary ? `: ${summary}` : ''}. هل تريد متابعة هذا البحث، بدء بحث جديد، أم بيع مشروع؟`
+        : `مرحباً مجدداً${name}. طلب ${label} محفوظ لدى SHARH${summary ? `: ${summary}` : ''}. هل تريد متابعته، بدء طلب بيع جديد، أم البحث عن مشروع للشراء؟`,
     };
     return messages[state.language];
+  }
+
+  private currentCaseCompactSummary(state: LeadCaptureState): string {
+    const parts: string[] = [];
+    if (state.inquiryPurpose === 'buying') {
+      if (state.businessType && !/^any profitable business$/i.test(state.businessType)) parts.push(state.businessType);
+      else if (state.buyerSectorPreference === 'any') {
+        parts.push(state.language === 'ru' ? 'любой сектор' : state.language === 'ar' ? 'أي قطاع' : 'any sector');
+      }
+      if (state.buyerLocation) parts.push(state.buyerLocation);
+      if (state.buyerBudgetAed) {
+        parts.push(state.language === 'ru' ? `до ${state.buyerBudgetAed}` : state.language === 'ar' ? `حتى ${state.buyerBudgetAed}` : `up to ${state.buyerBudgetAed}`);
+      }
+      if (state.buyerMinimumAnnualProfitAed) {
+        parts.push(
+          state.language === 'ru'
+            ? `прибыль от ${state.buyerMinimumAnnualProfitAed}/год`
+            : state.language === 'ar'
+              ? `ربح من ${state.buyerMinimumAnnualProfitAed}/سنة`
+              : `profit from ${state.buyerMinimumAnnualProfitAed}/year`
+        );
+      }
+      return parts.slice(0, 4).join(' · ');
+    }
+    if (state.businessType) parts.push(state.businessType);
+    if (state.businessLocation) parts.push(state.businessLocation);
+    if (state.desiredSellingPriceAed) parts.push(`expected ${state.desiredSellingPriceAed}`);
+    return parts.slice(0, 3).join(' · ');
   }
 
   private shortReentryPrompt(state: LeadCaptureState): string {
@@ -4399,6 +4451,17 @@ export class LeadCaptureService {
   }
 
   private currentCaseStatus(state: LeadCaptureState): string {
+    if (state.inquiryPurpose === 'buying') {
+      const summary = this.currentCaseCompactSummary(state);
+      const suffix = summary ? `: ${summary}` : '';
+      const messages: Record<ConversationLanguage, string> = {
+        en: `Continuing your buyer search${suffix}. Tell me what you want changed, or ask for the current options.`,
+        ru: `Продолжаем ваш поиск бизнеса${suffix}. Напишите, что изменить, или попросите показать текущие варианты.`,
+        ar: `سأتابع بحث الشراء الحالي${suffix}. اكتب ما تريد تغييره أو اطلب عرض الخيارات الحالية.`,
+      };
+      return messages[state.language];
+    }
+
     const label = this.currentCaseLabel(state);
     const submitted = state.submittedForReview;
     const messages: Record<ConversationLanguage, string> = {

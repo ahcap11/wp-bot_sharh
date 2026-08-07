@@ -340,7 +340,7 @@ describe('ChatbotService', () => {
       expect(result).toContain('I will not substitute random listings');
     });
 
-    it('shows verified match economics and reasons without the duplicated menu', () => {
+    it('shows readable match economics without exposing an arbitrary score', () => {
       const internal = chatbotService as unknown as {
         buyerCriteriaService: {
           fromRecord: (record: typeof buyerRecord) => unknown;
@@ -378,10 +378,10 @@ describe('ChatbotService', () => {
         ]
       );
 
-      expect(result).toContain('Match: 92%');
-      expect(result).toContain('Annual profit: AED 330,000');
-      expect(result).toContain('ROI: 36.7%');
-      expect(result).toContain('Why it fits: within budget');
+      expect(result).not.toContain('Match: 92%');
+      expect(result).toContain('profit AED 330,000/yr');
+      expect(result).toContain('ROI 36.7%');
+      expect(result).toContain('manager-run indicated');
       expect(result).not.toContain('You can also refine the search');
     });
 

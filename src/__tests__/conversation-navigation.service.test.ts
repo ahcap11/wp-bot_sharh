@@ -168,6 +168,24 @@ describe('conversation navigation and seller terms', () => {
     expect(secondGreeting.response).toBe('How can I help with your SHARH request?');
   });
 
+  it('continues an existing buyer search when the buyer simply replies buy', () => {
+    turn('buy');
+    turn('Any profitable business in Dubai, budget AED 1m, minimum annual profit AED 100k');
+    expect(service.getCurrentRecord(chatId)?.status).toBe('qualified');
+
+    const greeting = service.handleNavigationCommand(chatId, 'Hello');
+    expect(greeting.response).toContain('buyer search is saved');
+    const before = service.getCurrentRecord(chatId);
+
+    const continued = service.handleNavigationCommand(chatId, 'Buy');
+    const after = service.getCurrentRecord(chatId);
+    expect(continued.restartConfirmed).not.toBe(true);
+    expect(continued.response).toContain('Continuing your buyer search');
+    expect(after?.inquiryPurpose).toBe('buying');
+    expect(after?.buyerBudgetAed).toBe(before?.buyerBudgetAed);
+    expect(after?.buyerLocation).toBe(before?.buyerLocation);
+  });
+
   it('creates separate buyer and seller cases without leaking previous answers', () => {
     turn('sell');
     turn('yes');
