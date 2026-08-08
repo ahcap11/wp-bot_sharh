@@ -1193,7 +1193,7 @@ export class LeadCaptureService {
       }
 
       const revenue = this.extractMoneyByHints(content, [
-        /revenue|turnover|annual sales|yearly sales|per year|annually/i,
+        /revenue|turnov(?:er|r)|annual sales|yearly sales|sales.{0,20}(?:last|previous)\s+(?:yr|year)|(?:last|previous)\s+(?:yr|year).{0,20}sales|per year|annually/i,
         /выручк|оборот|годов.*доход|за год/i,
         /الإيراد|المبيعات السنوية|سنوي/i,
       ]);
@@ -1202,7 +1202,7 @@ export class LeadCaptureService {
         changed = true;
       }
 
-      const explicitPrice = /asking(?: price)?|selling price|sell(?:ing)? for|selling at|desired price|expected price|valuation|цена продаж|سعر البيع/iu.test(content);
+      const explicitPrice = /asking(?: price)?|selling price|sell(?:ing|ng)? for|selling at|sell(?:ing|ng)?(?=\s+(?:aed|dhs?|dirhams?|usd|\$)?\s*\d)|desired price|expected price|valuation|цена продаж|سعر البيع/iu.test(content);
       const promptedForPrice = /selling price|price range|expected price|expected selling price|цена продажи|سعر البيع/iu.test(previousBotPrompt);
       if (explicitPrice || promptedForPrice) {
         const price = this.extractMoneyExpression(content);
@@ -2301,14 +2301,53 @@ export class LeadCaptureService {
       fieldsUpdated
     );
 
-    const businessType = this.extractBusinessType(content);
-    this.setIfMissing(
-      state,
-      'businessType',
-      businessType,
-      'business_type',
-      fieldsUpdated
-    );
+    const isCorrection = /\b(?:actually|i mean|make that|instead|rather|correction|correct that|change(?: it)? to|sorry)\b/i.test(content)
+      || /(?:на самом деле|точнее|исправ|замени|вместо)/iu.test(content)
+      || /(?:في الواقع|تصحيح|بدلاً من|غيّر)/u.test(content);
+
+    let businessType = this.extractBusinessType(content);
+    // A location correction such as "actually Sharjah" used to turn the
+    // filler word "Actually" into the business type. Discourse markers are
+    // never useful business titles on their own.
+    if (businessType && /^(?:actually|instead|rather|sorry|correction)$/i.test(businessType)) {
+      businessType = null;
+    }
+    if (
+      !businessType &&
+      isCorrection &&
+      state.inquiryPurpose === 'selling' &&
+      !/\d/.test(content)
+    ) {
+      const correctionBody = content
+        .replace(/\b(?:actually|i mean|make that|instead|rather|correction|correct that|change(?: it)? to|sorry)\b/gi, ' ')
+        .replace(/(?:на самом деле|точнее|исправ|замени|вместо|في الواقع|تصحيح|بدلاً من|غيّر)/giu, ' ')
+        .trim();
+      const correctionIsOnlyLocation = Boolean(
+        this.extractLocation(correctionBody, false) &&
+        /^(?:Business Bay|Dubai Marina|Downtown Dubai|Dubai Silicon Oasis|Dubai Investment Park|Palm Jumeirah|International City|Motor City|Bur Dubai|Al Barsha|Al Quoz|Deira|JLT|JVC|JBR|DSO|DIP|Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)$/i.test(correctionBody)
+      );
+      businessType = correctionIsOnlyLocation
+        ? null
+        : this.extractBusinessType(correctionBody, true);
+    }
+    if (
+      isCorrection &&
+      state.inquiryPurpose === 'selling' &&
+      businessType &&
+      state.businessType &&
+      businessType !== state.businessType
+    ) {
+      state.businessType = businessType;
+      fieldsUpdated.push('business_type');
+    } else {
+      this.setIfMissing(
+        state,
+        'businessType',
+        businessType,
+        'business_type',
+        fieldsUpdated
+      );
+    }
 
     const location = this.extractLocation(content);
     if (location) {
@@ -2321,10 +2360,10 @@ export class LeadCaptureService {
           fieldsUpdated
         );
       } else {
-        const mergedLocation = this.mergeSellerLocation(
-          state.businessLocation,
-          location
-        );
+        const mergedLocation =
+          isCorrection && state.businessLocation
+            ? location
+            : this.mergeSellerLocation(state.businessLocation, location);
         if (mergedLocation && mergedLocation !== state.businessLocation) {
           state.businessLocation = mergedLocation;
           fieldsUpdated.push('business_location');
@@ -2334,30 +2373,69 @@ export class LeadCaptureService {
 
     if (state.inquiryPurpose === 'selling') {
       const annualRevenue = this.extractMoneyByHints(content, [
-        /revenue|turnover|annual sales|yearly sales|per year|annually/i,
+        /revenue|turnov(?:er|r)|annual sales|yearly sales|sales.{0,20}(?:last|previous)\s+(?:yr|year)|(?:last|previous)\s+(?:yr|year).{0,20}sales|per year|annually/i,
         /выручк|оборот|годов.*доход|за год/i,
         /الإيراد|المبيعات السنوية|سنوي/i,
       ]);
-      this.setIfMissing(
-        state,
-        'annualRevenueAed',
-        annualRevenue,
-        'annual_revenue_aed',
-        fieldsUpdated
-      );
+      if (
+        isCorrection &&
+        annualRevenue &&
+        annualRevenue !== 'Unknown / to confirm' &&
+        state.annualRevenueAed &&
+        annualRevenue !== state.annualRevenueAed
+      ) {
+        state.annualRevenueAed = annualRevenue;
+        fieldsUpdated.push('annual_revenue_aed');
+      } else {
+        this.setIfMissing(
+          state,
+          'annualRevenueAed',
+          annualRevenue,
+          'annual_revenue_aed',
+          fieldsUpdated
+        );
+      }
 
       const askingPrice = this.extractMoneyByHints(content, [
-        /asking(?: price)?|selling price|sell(?:ing)? for|selling at|desired price|expected price|valuation|price/i,
-        /цена продаж|хочу получить|ожидаемая цена|оценк|стоимост/i,
+        /asking(?: price)?|selling price|sell(?:ing|ng)? for|sell(?:ing|ng)?\b.{0,60}\bfor(?=\s+(?:aed|dhs?|dirhams?|usd|\$)?\s*\d)|selling at|sell(?:ing|ng)?(?=\s+(?:aed|dhs?|dirhams?|usd|\$)?\s*\d)|desired price|expected price|valuation|price/i,
+        /цена(?:\s+продаж[иы]?)?(?=\s*[:=-]?\s*\d)|хочу получить|ожидаемая цена|оценк|стоимост/i,
         /سعر البيع|السعر المطلوب|التقييم/i,
       ]);
-      this.setIfMissing(
-        state,
-        'desiredSellingPriceAed',
-        askingPrice,
-        'desired_selling_price_aed',
-        fieldsUpdated
-      );
+      const compactUnlabelledPrice =
+        !askingPrice &&
+        state.termsAccepted === true &&
+        !state.desiredSellingPriceAed
+          ? this.extractCompactSellerAskingPrice(content, state)
+          : null;
+      const correctionPrice =
+        askingPrice ||
+        compactUnlabelledPrice ||
+        (
+          isCorrection &&
+          state.status === 'qualified' &&
+          !annualRevenue &&
+          !/\b(?:revenue|turnover|sales|profit|expenses?|opex|rent|salary|payroll)\b/i.test(content)
+            ? this.extractMoneyExpression(content)
+            : null
+        );
+      if (
+        isCorrection &&
+        correctionPrice &&
+        correctionPrice !== 'Unknown / to confirm' &&
+        state.desiredSellingPriceAed &&
+        correctionPrice !== state.desiredSellingPriceAed
+      ) {
+        state.desiredSellingPriceAed = correctionPrice;
+        fieldsUpdated.push('desired_selling_price_aed');
+      } else {
+        this.setIfMissing(
+          state,
+          'desiredSellingPriceAed',
+          correctionPrice,
+          'desired_selling_price_aed',
+          fieldsUpdated
+        );
+      }
 
       const monthlyExpenses = this.extractMoneyByHints(content, [
         /operating expenses|monthly expenses|opex|costs per month/i,
@@ -2373,7 +2451,7 @@ export class LeadCaptureService {
       );
 
       const monthlyProfit = this.extractMoneyByHints(content, [
-        /net profit|monthly profit|profit per month/i,
+        /net profit|monthly profit|profit per month|\bprofit\b(?=[^,;]{0,35}\b(?:monthly|per month|a month|p\.?m\.?)\b)/i,
         /чист.*прибыл|прибыл.*месяц/i,
         /صافي الربح|الربح الشهري/i,
       ]);
@@ -2507,8 +2585,8 @@ export class LeadCaptureService {
     }
 
     if (state.inquiryPurpose === 'buying' && expected === 'business_type') {
-      const genericSector = /\b(?:any|all)\s+(?:sector(?:s)?|industr(?:y|ies)|business(?:es)?)\b|\b(?:any business|anything(?: profitable)?|whatever (?:sector|industry|business)|whatever makes money|no sector preference|no industry preference|sector doesn't matter|industry doesn't matter|business type doesn't matter|don'?t care (?:about )?(?:the )?(?:sector|industry|business type)|don'?t care what business|open to any(?:thing)?|any kind of business)\b/i.test(content)
-        || /(?:любая\s+(?:сфера|отрасль)|любой\s+(?:сектор|бизнес)|без предпочтений по (?:сфере|отрасли))/iu.test(content)
+      const genericSector = /\b(?:any|all)\s+(?:sector(?:s)?|industr(?:y|ies)|business(?:es)?)\b|\b(?:any business|anything(?: profitable)?|whatever (?:sector|industry|business)|whatever makes money|any profitable business|no sector preference|no industry preference|sector doesn't matter|industry doesn't matter|business type doesn't matter|don'?t care (?:about )?(?:the )?(?:sector|industry|business type)|do not care (?:about )?(?:the )?(?:sector|industry|business type)|don'?t care what business|do not care what business|open to any(?:thing)?|any kind of business)\b/i.test(content)
+        || /(?:любая\s+(?:сфера|отрасль)|любой\s+(?:прибыльный\s+)?бизнес|любой\s+сектор|без предпочтений по (?:сфере|отрасли))/iu.test(content)
         || /(?:أي\s+(?:قطاع|مجال|مشروع)|لا تفضيل للقطاع)/u.test(content);
       if (genericSector) {
         state.businessType = 'Any profitable business';
@@ -2529,6 +2607,18 @@ export class LeadCaptureService {
         // The user answered with useful buyer criteria but did not name a
         // sector. Do not turn the financial phrase itself into a sector.
         return;
+      }
+    }
+
+    if (expected === 'business_location' && state.inquiryPurpose === 'selling') {
+      const inlinePrice = this.extractMoneyExpression(content);
+      if (
+        inlinePrice &&
+        inlinePrice !== 'Unknown / to confirm' &&
+        !this.hasValue(state.desiredSellingPriceAed)
+      ) {
+        state.desiredSellingPriceAed = inlinePrice;
+        fieldsUpdated.push('desired_selling_price_aed');
       }
     }
 
@@ -2940,6 +3030,7 @@ export class LeadCaptureService {
     const normalized = value.toLowerCase();
     const sellingMatch =
       /\b(sell|selling|seller|sale|list my business)\b/.test(normalized) ||
+      /\b(?:want out|exit (?:my|the) business|exit the company|sell my stake|sell our stake|dispose of (?:my|our|the) business)\b/.test(normalized) ||
       /(продать|продаю|продажа|продавец|выставить бизнес)/i.test(value) ||
       /(بيع|أبيع|بائع|عرض مشروعي للبيع)/i.test(value);
     const buyingMatch =
@@ -2959,12 +3050,10 @@ export class LeadCaptureService {
 
     if (sellingMatch && !buyingMatch) return 'selling';
     if (buyingMatch && !sellingMatch) return 'buying';
-    if (sellingMatch && buyingMatch) {
-      if (/sell my business|продать.*бизнес|بيع.*مشروع/i.test(value)) {
-        return 'selling';
-      }
-      return 'buying';
-    }
+    // If the user explicitly wants to sell and buy, do not silently pick one
+    // side of the funnel. The normal purpose question lets them choose which
+    // case to handle first while keeping the interaction simple.
+    if (sellingMatch && buyingMatch) return null;
     return null;
   }
 
@@ -3053,16 +3142,82 @@ export class LeadCaptureService {
     const canonicalSector = this.extractCanonicalBusinessSector(value);
     if (canonicalSector) return canonicalSector;
 
+    const describesWhatBusinessDoes = value.match(
+      /\b(?:i|we)\s+(?:have|own|run|operate)\s+(?:a\s+|an\s+|the\s+)?business\b[^,.;]{0,80}?\b(?:that|which)\s+(?:sells?|offers?|provides?|does)\s+([^,.;]{2,100})/i
+    );
+    if (describesWhatBusinessDoes?.[1]) {
+      const normalized = this.normalizeBusinessText(describesWhatBusinessDoes[1]);
+      if (normalized && !this.looksLikeBusinessStatus(normalized)) return normalized;
+    }
+
+    const directActivity = value.match(
+      /^\s*(?:i|we)\s+(?:sell|offer|provide)\s+([^,.;]{2,100})/i
+    );
+    if (directActivity?.[1]) {
+      const normalized = this.normalizeBusinessText(directActivity[1]);
+      if (normalized && !this.looksLikeBusinessStatus(normalized)) return normalized;
+    }
+
+    const locationFirstBusiness = value.match(
+      /^\s*(?:in\s+)?(?:Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\s+(?:i|we)\s+(?:have|own|run|operate)\s+(?:a\s+|an\s+|the\s+)?([^,.;]{2,100})/i
+    );
+    if (locationFirstBusiness?.[1]) {
+      const normalized = this.normalizeBusinessText(locationFirstBusiness[1]);
+      if (normalized && !this.looksLikeBusinessStatus(normalized)) return normalized;
+    }
+
+    // Lazy seller inputs commonly look like "Cafe JLT 500k" or
+    // "Cafe, Business Bay, AED 500k". Treat well-known Dubai areas as
+    // location boundaries before the generic "business ..." parser below;
+    // otherwise "Business Bay" can be misread as a business description.
+    const compactBeforeKnownArea = value.match(
+      /^(.{2,80}?)[,\s]+(?:JLT|JVC|JBR|Business Bay|Dubai Marina|Downtown Dubai|Al Quoz|Deira|Bur Dubai|Al Barsha|Palm Jumeirah|Dubai Silicon Oasis|DSO|Dubai Investment Park|DIP|Motor City|International City)\b(?=\s|[,.;]|$)/i
+    );
+    if (compactBeforeKnownArea?.[1]) {
+      const normalized = this.normalizeBusinessText(compactBeforeKnownArea[1]);
+      if (
+        normalized &&
+        !/^(?:in|at|near|around|from)$/i.test(normalized) &&
+        !this.looksLikeBusinessStatus(normalized) &&
+        !this.looksLikeBuyerFinancialPhrase(normalized)
+      ) {
+        return normalized;
+      }
+    }
+
+    const compactBeforeKnownLocation = value.match(
+      /^(.{2,80}?)\s+(?:Dubai|Abu Dhabi|Sharjah|Ajman|Fujair|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\b(?=\s|[,.;]|$)/i
+    );
+    if (compactBeforeKnownLocation?.[1]) {
+      const normalized = this.normalizeBusinessText(compactBeforeKnownLocation[1]);
+      if (
+        normalized &&
+        !/^(?:in|at|near|around|from)$/i.test(normalized) &&
+        !this.looksLikeBusinessStatus(normalized) &&
+        !this.looksLikeBuyerFinancialPhrase(normalized)
+      ) {
+        return normalized;
+      }
+    }
+
     const beforeKnownLocation = value.match(
-      /^(.+?)\s+(?:in|located in|based in)\s+(?:Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\b/i
+      /^(.+?)\s+(?:in|located in|based in)\s+(?:Dubai|Abu Dhabi|Sharjah|Ajman|Fujair|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\b/i
     );
     if (beforeKnownLocation?.[1]) {
       const normalized = this.normalizeBusinessText(beforeKnownLocation[1]);
       if (normalized) return normalized;
     }
 
+    const beforeKnownArea = value.match(
+      /^(.+?)\s+(?:in|located in|based in)\s+(?:JLT|JVC|JBR|Business Bay|Dubai Marina|Downtown Dubai|Al Quoz|Deira|Bur Dubai|Al Barsha|Palm Jumeirah|Dubai Silicon Oasis|DSO|Dubai Investment Park|DIP|Motor City|International City)\b/i
+    );
+    if (beforeKnownArea?.[1]) {
+      const normalized = this.normalizeBusinessText(beforeKnownArea[1]);
+      if (normalized) return normalized;
+    }
+
     const patterns: RegExp[] = [
-      /(?:business\s*(?:type|is|does|category)?|we (?:are|run)|i (?:run|own))\s*[:=-]?\s*(.+)$/i,
+      /(?:business(?!\s+bay\b)\s*(?:type|is|does|category)?|we (?:are|run)|i (?:run|own))\s*[:=-]?\s*(.+)$/i,
       /(?:it is|it's)\s+(?:a|an)\s+(.+)$/i,
       /(?:бизнес|компания|мы занимаемся|я владею|сфера)\s*[:=-]?\s*(.+)$/i,
       /(?:نشاط|المشروع|الشركة|أملك|ندير)\s*[:=-]?\s*(.+)$/i,
@@ -3140,11 +3295,72 @@ export class LeadCaptureService {
     );
   }
 
+  private extractKnownUaeArea(value: string): string | null {
+    const areas: Array<[RegExp, string]> = [
+      [/\bJLT\b/i, 'JLT, Dubai'],
+      [/\bJVC\b/i, 'JVC, Dubai'],
+      [/\bJBR\b/i, 'JBR, Dubai'],
+      [/\bBusiness Bay\b/i, 'Business Bay, Dubai'],
+      [/\bDubai Marina\b/i, 'Dubai Marina'],
+      [/\bDowntown Dubai\b/i, 'Downtown Dubai'],
+      [/\bAl Quoz\b/i, 'Al Quoz, Dubai'],
+      [/\bDeira\b/i, 'Deira, Dubai'],
+      [/\bBur Dubai\b/i, 'Bur Dubai'],
+      [/\bAl Barsha\b/i, 'Al Barsha, Dubai'],
+      [/\bPalm Jumeirah\b/i, 'Palm Jumeirah, Dubai'],
+      [/\b(?:Dubai Silicon Oasis|DSO)\b/i, 'Dubai Silicon Oasis, Dubai'],
+      [/\b(?:Dubai Investment Park|DIP)\b/i, 'Dubai Investment Park, Dubai'],
+      [/\bMotor City\b/i, 'Motor City, Dubai'],
+      [/\bInternational City\b/i, 'International City, Dubai'],
+    ];
+    for (const [pattern, label] of areas) {
+      if (pattern.test(value)) return label;
+    }
+    return null;
+  }
+
   private extractLocation(
     value: string,
     allowWholeAnswer: boolean = false
   ): string | null {
     if (allowWholeAnswer) {
+      let clean = this.cleanFreeTextAnswer(value);
+      // Lazy users often answer the location question with the next figure in
+      // the same message ("Dubai Marina 500k"). Preserve the area but keep the
+      // money out of the location field; the expected-field handler captures
+      // that figure separately as the asking price.
+      if (clean) {
+        clean = clean
+          .replace(/\b(?:aed|dhs?|dirhams?|usd|us\s*dollars?)?\s*\d+(?:[.,]\d+)?\s*(?:bn|billion|b|mm|mn|mln|million|mil|mio|m|thousand|grand|k|lakh|lac|crore|cr)?\s*(?:aed|dhs?|dirhams?|usd|us\s*dollars?)?\b/giu, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+      // When the bot explicitly asked for location, preserve a concise area
+      // answer but normalize places we know. This avoids CRM variants such as
+      // "dubai", "DUBAI" and "JLT Dubai" becoming separate labels.
+      if (
+        clean &&
+        clean.length <= 100 &&
+        this.isMeaningfulFreeText(clean) &&
+        !/\b(?:revenue|turnover|sales|profit|asking|expected|selling price|budget|price|aed|dhs?|usd|employee|staff)\b/i.test(clean)
+      ) {
+        const knownArea = this.extractKnownUaeArea(clean);
+        if (knownArea) return knownArea;
+        const zone = this.extractKnownFreeZone(clean);
+        const emirate = clean.match(
+          /\b(Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\b/i
+        )?.[1];
+        const canonicalEmirate = emirate
+          ? this.canonicalizeEmirate(emirate)
+          : null;
+        if (zone) return canonicalEmirate ? `${zone}, ${canonicalEmirate}` : zone;
+        if (canonicalEmirate && clean.toLowerCase() === emirate?.toLowerCase()) {
+          return canonicalEmirate;
+        }
+        if (canonicalEmirate) return clean;
+        // Area-only replies are valid when location was the active question.
+        if (clean.split(/\s+/).length <= 8) return clean;
+      }
       const known = this.extractLocation(value, false);
       if (known) return known;
       return this.isMeaningfulFreeText(value)
@@ -3152,18 +3368,23 @@ export class LeadCaptureService {
         : null;
     }
 
+    const knownArea = this.extractKnownUaeArea(value);
+    if (knownArea) return knownArea;
+
     const freeZone = this.extractKnownFreeZone(value);
     const freeZoneEmirate = value.match(
       /\b(Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\b/i
     )?.[1];
     if (freeZone) {
-      return freeZoneEmirate ? `${freeZone}, ${freeZoneEmirate}` : freeZone;
+      return freeZoneEmirate
+        ? `${freeZone}, ${this.canonicalizeEmirate(freeZoneEmirate)}`
+        : freeZone;
     }
 
     const correctedLocation = value.match(
       /\b(?:actually|i mean|make that|instead|rather|sorry)\b[^,.;]{0,20}\b(Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\b/i
     )?.[1];
-    if (correctedLocation) return this.cleanFreeTextAnswer(correctedLocation);
+    if (correctedLocation) return this.canonicalizeEmirate(correctedLocation);
 
     const emirates = value.match(
       /\b(Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\b/i
@@ -3173,23 +3394,55 @@ export class LeadCaptureService {
         /(?:in|located in|based in|area|district|район|в|منطقة|في)\s+([^,.!?]{2,80})/i
       );
       const candidate = (area?.[1] || emirates[0])
-        .split(/\b(?:annual|yearly|monthly|revenue|turnover|sales|profit|asking|expected|selling price|budget|under|up to|maximum|max|lease|rent)\b/i)[0]
+        .split(/\b(?:that|which|where)\s+(?:sells?|offers?|provides?|does|is|has)\b|\b(?:i|we)\s+(?:have|own|run|operate)\b|\bfor(?=\s+(?:aed|dhs?|dirhams?|usd|\$)?\s*\d)|\bwant(?:ing)?(?=\s+(?:aed|dhs?|dirhams?|usd|\$)?\s*\d)|\b(?:annual|yearly|monthly|revenue|turnover|sales|profit|asking|expected|selling price|budget|under|up to|maximum|max|lease|rent)\b/i)[0]
         ?.trim();
-      return this.cleanFreeTextAnswer(candidate || emirates[0]);
+      const locationCandidate = (candidate || emirates[0])
+        .replace(/\s+(?:aed|dhs?|dirhams?|usd|\$)?\s*\d+(?:[.,]\d+)?\s*(?:bn|billion|b|mm|mn|mln|million|mil|mio|m|thousand|grand|k|lakh|lac|crore|cr)?(?:\s*(?:aed|dhs?|dirhams?|usd))?\s*$/i, '')
+        .trim();
+      const cleanedCandidate = this.cleanFreeTextAnswer(locationCandidate || emirates[0]);
+      if (cleanedCandidate && cleanedCandidate.toLowerCase() === emirates[0].toLowerCase()) {
+        return this.canonicalizeEmirate(emirates[0]);
+      }
+      return cleanedCandidate;
     }
-    if (/(дубай|абу-?даби|шардж|аджман|фуджейр|рас-?эль-?хайм|умм-?эль-?кувейн)/i.test(value)) {
-      const candidate = value
-        .split(/(?:годов|ежемесяч|выруч|оборот|прибыл|цена|бюджет|до\s+\d)/i)[0]
-        ?.trim();
-      return this.cleanFreeTextAnswer(candidate || value);
+    const russianLocation = value.match(
+      /(дуба(?:й|е|я)(?:\s+марина)?|абу-?даби|шардж[ае]?|аджман|фуджейр[ае]?|рас-?эль-?хайм[ае]?|умм-?эль-?кувейн[ае]?)/i
+    )?.[1]?.toLowerCase();
+    if (russianLocation) {
+      if (/дуба(?:й|е|я)\s+марина/.test(russianLocation)) return 'Dubai Marina';
+      if (/^дуба(?:й|е|я)/.test(russianLocation)) return 'Dubai';
+      if (/абу/.test(russianLocation)) return 'Abu Dhabi';
+      if (/шардж/.test(russianLocation)) return 'Sharjah';
+      if (/аджман/.test(russianLocation)) return 'Ajman';
+      if (/фуджейр/.test(russianLocation)) return 'Fujairah';
+      if (/рас/.test(russianLocation)) return 'Ras Al Khaimah';
+      if (/умм/.test(russianLocation)) return 'Umm Al Quwain';
     }
-    if (/(دبي|أبوظبي|الشارقة|عجمان|الفجيرة|رأس الخيمة|أم القيوين)/i.test(value)) {
-      const candidate = value
-        .split(/(?:سنوي|شهري|الإيراد|المبيعات|الربح|السعر|الميزانية)/u)[0]
-        ?.trim();
-      return this.cleanFreeTextAnswer(candidate || value);
+    const arabicLocation = value.match(
+      /(دبي|أبو\s*ظبي|أبوظبي|الشارقة|عجمان|الفجيرة|رأس الخيمة|أم القيوين)/u
+    )?.[1];
+    if (arabicLocation) {
+      if (arabicLocation === 'دبي') return 'Dubai';
+      if (/أبو/.test(arabicLocation)) return 'Abu Dhabi';
+      if (arabicLocation === 'الشارقة') return 'Sharjah';
+      if (arabicLocation === 'عجمان') return 'Ajman';
+      if (arabicLocation === 'الفجيرة') return 'Fujairah';
+      if (arabicLocation === 'رأس الخيمة') return 'Ras Al Khaimah';
+      if (arabicLocation === 'أم القيوين') return 'Umm Al Quwain';
     }
     return null;
+  }
+
+  private canonicalizeEmirate(value: string): string {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'dubai') return 'Dubai';
+    if (normalized === 'abu dhabi') return 'Abu Dhabi';
+    if (normalized === 'sharjah') return 'Sharjah';
+    if (normalized === 'ajman') return 'Ajman';
+    if (normalized === 'fujair' || normalized === 'fujairah') return 'Fujairah';
+    if (normalized === 'rak' || normalized === 'ras al khaimah') return 'Ras Al Khaimah';
+    if (normalized === 'umm al quwain') return 'Umm Al Quwain';
+    return value.trim();
   }
 
   private normalizeBuyerCriteriaInput(value: string): string {
@@ -3305,8 +3558,16 @@ export class LeadCaptureService {
         fieldsUpdated.push('buyer_location_preference');
       }
     } else {
-      const buyerLocation = this.extractLocation(normalized, false);
-      const locationIntent = /\b(?:prefer|preferred|only|location|emirate|area|located|in|must|required|nice|okay|ok|fine)\b/i.test(normalized)
+      const explicitLocationReplacement = normalized.match(
+        /\bnot\s+(?:Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\s*[,;:\-]\s*(Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)(?:\s+instead)?\b/i
+      )?.[1] || normalized.match(
+        /\b(?:make it|make that|change(?: location)? to|switch to)\s+(Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\b/i
+      )?.[1];
+      const buyerLocation = explicitLocationReplacement
+        ? this.canonicalizeEmirate(explicitLocationReplacement)
+        : this.extractLocation(normalized, false);
+      const standaloneKnownLocation = /^(?:Business Bay|Dubai Marina|Downtown Dubai|Dubai Silicon Oasis|Dubai Investment Park|Palm Jumeirah|International City|Motor City|Bur Dubai|Al Barsha|Al Quoz|Deira|JLT|JVC|JBR|DSO|DIP|Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)$/i.test(normalized.trim());
+      const locationIntent = Boolean(explicitLocationReplacement) || standaloneKnownLocation || /\b(?:prefer|preferred|only|location|emirate|area|located|in|must|required|nice|okay|ok|fine|actually|instead|rather|change|make that|make it|switch|sorry)\b/i.test(normalized)
         || /(?:предпоч|только|локац|эмират|район|\bв\b)/iu.test(normalized)
         || /(?:أفضل|فقط|الموقع|الإمارة|المنطقة|في)/u.test(normalized);
       if (buyerLocation && locationIntent) {
@@ -3425,6 +3686,16 @@ export class LeadCaptureService {
           (state.buyerReturnPeriod === 'annual' || state.buyerReturnPeriod === 'monthly')
         ) {
           period = state.buyerReturnPeriod;
+        } else if (
+          period === 'ambiguous' &&
+          state.messageCount <= 3 &&
+          this.hasValue(state.buyerBudgetAed) &&
+          this.hasValue(state.businessType) &&
+          this.hasValue(state.buyerLocation)
+        ) {
+          // The initial buyer prompt explicitly asks for minimum ANNUAL profit.
+          // In that compact reply, "profit 100k" inherits the prompt's period.
+          period = 'annual';
         }
 
         state.buyerReturnAmountAed = this.formatAedAmount(requirement.amount);
@@ -3509,8 +3780,8 @@ export class LeadCaptureService {
 
     const genericSector =
       /\b(?:any|all)\s+(?:sector(?:s)?|industr(?:y|ies)|business(?:es)?(?:\s+type)?s?)\b/i.test(value) ||
-      /\b(?:any business|anything(?: profitable)?|whatever (?:sector|industry|business)|whatever makes money|no sector preference|no industry preference|sector doesn't matter|industry doesn't matter|business type doesn't matter|don'?t care (?:about )?(?:the )?(?:sector|industry|business type)|don'?t care what business|open to any(?:thing)?|any kind of business)\b/i.test(value) ||
-      /(?:любая\s+(?:сфера|отрасль)|любой\s+(?:сектор|бизнес)|без предпочтений по (?:сфере|отрасли))/iu.test(value) ||
+      /\b(?:any business|anything(?: profitable)?|whatever (?:sector|industry|business)|whatever makes money|any profitable business|no sector preference|no industry preference|sector doesn't matter|industry doesn't matter|business type doesn't matter|don'?t care (?:about )?(?:the )?(?:sector|industry|business type)|do not care (?:about )?(?:the )?(?:sector|industry|business type)|don'?t care what business|do not care what business|open to any(?:thing)?|any kind of business)\b/i.test(value) ||
+      /(?:любая\s+(?:сфера|отрасль)|любой\s+(?:прибыльный\s+)?бизнес|любой\s+сектор|без предпочтений по (?:сфере|отрасли))/iu.test(value) ||
       /(?:أي\s+(?:قطاع|مجال|مشروع)|لا تفضيل للقطاع)/u.test(value);
 
     if (genericSector) {
@@ -3547,7 +3818,7 @@ export class LeadCaptureService {
       /(?:الميزانية|الحد الأقصى|حتى|أستطيع دفع)/u.test(value);
     const hasProfitWords =
       /\b(?:net\s+profit|profit|income|cash\s*flow|cashflow|earnings?|earns?|makes?(?!\s+it\b)|brings?(?!\s+it\b)|return|pays? me|net(?:s)? me|take[- ]?home|clear(?:s)? me)\b/i.test(value) ||
-      /(?:прибыл|доход|денежн(?:ый|ого)? поток|зарабатывает|приносит)/iu.test(value) ||
+      /(?:прибыл(?:ь|и|ью|ей)(?=$|[^\p{L}])|доход|денежн(?:ый|ого)? поток|зарабатывает|приносит)/iu.test(value) ||
       /(?:ربح|دخل|تدفق نقدي|يدر|عائد)/u.test(value);
 
     const compactBudgetRange = /(?:aed|dhs?|dirhams?)?\s*\d+(?:[.,]\d+)?\s*(?:k|m|mn|mln|million|mil|thousand|grand)?\s*(?:-|–|—|to)\s*(?:aed|dhs?|dirhams?)?\s*\d+(?:[.,]\d+)?\s*(?:k|m|mn|mln|million|mil|thousand|grand)?/i.test(value);
@@ -3568,17 +3839,29 @@ export class LeadCaptureService {
       }
     }
 
-    // If the user supplies two unlabelled amounts in the one-message buyer
-    // schema, the second slot is annual profit because the prompt itself asks
-    // for minimum annual profit (or ROI) in that position.
+    // If the user supplies a second unlabelled amount in the one-message buyer
+    // schema, treat it as annual profit because the prompt itself asks for
+    // maximum budget followed by minimum annual profit/ROI. This must also work
+    // when the budget is explicitly labelled ("budget 500k, 100k") or is a
+    // range ("300k-500k, 100k"). Do not steal a number from another labelled
+    // financial concept such as revenue/turnover.
+    const hasOtherFinancialLabel =
+      /\b(?:revenue|turnover|sales|expenses?|costs?|debt|liabilit(?:y|ies))\b/i.test(value) ||
+      /(?:выручк|оборот|расход|долг)/iu.test(value) ||
+      /(?:إيراد|مبيعات|مصاريف|ديون)/u.test(value);
+    const trailingProfitIndex = compactBudgetRange ? values.length - 1 : 1;
+    const hasTrailingProfitSlot = compactBudgetRange
+      ? values.length >= 3
+      : values.length >= 2;
     if (
-      compactTuple &&
-      !compactBudgetRange &&
+      (compactTuple || budgetAlreadyExplicit || hasBudgetWords) &&
       !hasProfitWords &&
-      values.length >= 2 &&
-      values[1] !== undefined
+      !hasOtherFinancialLabel &&
+      hasTrailingProfitSlot &&
+      trailingProfitIndex >= 0 &&
+      values[trailingProfitIndex] !== undefined
     ) {
-      const annualProfit = this.formatAedAmount(values[1]);
+      const annualProfit = this.formatAedAmount(values[trailingProfitIndex]!);
       const changed =
         state.buyerMinimumAnnualProfitAed !== annualProfit ||
         state.buyerReturnPeriod !== 'annual';
@@ -3601,7 +3884,70 @@ export class LeadCaptureService {
       .replace(/\d+(?:[.,]\d+)?\s*(?:bn|billion|b|mm|mn|mln|million|mil|mio|m|thousand|grand|k|lakh|lac|crore|cr)?/g, ' ')
       .replace(/[^\p{L}\p{N}]+/gu, ' ')
       .trim();
+    const correctionCue = /\b(?:actually|change|update|make it|set it|instead|new|rather|better)\b/i.test(value);
+    let inferredCorrectionRole: 'budget' | 'profit' | null = null;
     if (
+      correctionCue &&
+      values.length === 1 &&
+      values[0] !== undefined &&
+      !hasBudgetWords &&
+      !hasProfitWords &&
+      !genericSector &&
+      !compactSector &&
+      this.hasValue(state.buyerBudgetAed) &&
+      this.hasValue(state.buyerMinimumAnnualProfitAed) &&
+      onlyMoneyLike.length === 0
+    ) {
+      const currentBudget = this.parseAedAmount(state.buyerBudgetAed || '');
+      const currentProfit = this.parseAedAmount(state.buyerMinimumAnnualProfitAed || '');
+      const amount = values[0];
+      if (currentBudget && currentProfit && amount) {
+        // Infer only when the new figure is clearly in one existing field's
+        // scale. Middle-ground values still get the one short clarification.
+        if (amount >= currentBudget * 0.6) inferredCorrectionRole = 'budget';
+        else if (amount <= currentProfit * 2.5) inferredCorrectionRole = 'profit';
+      }
+      if (inferredCorrectionRole === 'budget') {
+        const formatted = this.formatAedAmount(amount);
+        if (state.buyerBudgetAed !== formatted) {
+          state.buyerBudgetAed = formatted;
+          fieldsUpdated.push('buyer_budget_aed');
+        }
+      } else if (inferredCorrectionRole === 'profit') {
+        const formatted = this.formatAedAmount(amount);
+        if (state.buyerMinimumAnnualProfitAed !== formatted || state.buyerReturnPeriod !== 'annual') {
+          state.buyerReturnAmountAed = formatted;
+          state.buyerReturnPeriod = 'annual';
+          state.buyerMinimumAnnualProfitAed = formatted;
+          state.buyerProfitableOnly = true;
+          fieldsUpdated.push('buyer_return_period', 'buyer_minimum_annual_profit_aed', 'buyer_profitable_only');
+        }
+      }
+    }
+
+    const isBareBudgetCorrection =
+      inferredCorrectionRole === null &&
+      values.length === 1 &&
+      values[0] !== undefined &&
+      !hasBudgetWords &&
+      !hasProfitWords &&
+      !genericSector &&
+      !compactSector &&
+      this.hasValue(state.buyerBudgetAed) &&
+      !this.hasValue(state.buyerMinimumAnnualProfitAed) &&
+      onlyMoneyLike.length === 0 &&
+      /\b(?:actually|change|update|make it|set it|instead|new|rather|better)\b/i.test(value);
+    if (isBareBudgetCorrection && values[0] !== undefined) {
+      const correctedBudget = this.formatAedAmount(values[0]);
+      if (state.buyerBudgetAed !== correctedBudget) {
+        state.buyerBudgetAed = correctedBudget;
+        fieldsUpdated.push('buyer_budget_aed');
+      }
+    }
+
+    if (
+      !isBareBudgetCorrection &&
+      inferredCorrectionRole === null &&
       values.length === 1 &&
       values[0] !== undefined &&
       !hasBudgetWords &&
@@ -3649,10 +3995,7 @@ export class LeadCaptureService {
   private extractCompactBuyerSector(value: string): string | null {
     const firstClause = value.split(/[,;]/, 1)[0] || '';
     if (/^\s*(?:no|not|except|excluding|avoid|anything but|anything except)\b/i.test(firstClause)) return null;
-    if (/\b(?:Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\b/i.test(firstClause) && !/\b(?:restaurants?|cafes?|retail|trading|clinics?|health|salons?|technology|tech|manufacturing|logistics|services?|education|food|beauty|fitness|pharmacy)\b/i.test(firstClause)) return null;
-    if (this.looksLikeBuyerFinancialPhrase(firstClause) && !/\b(?:restaurants?|cafes?|retail|trading|clinics?|health|salons?|technology|tech|manufacturing|logistics|services?|education|food|beauty|fitness|pharmacy)\b/i.test(firstClause)) {
-      return null;
-    }
+
     const firstMoney = value.search(/(?:aed|dhs?|dirhams?)?\s*\d{1,3}(?:[, .]\d{3})+|(?:aed|dhs?|dirhams?)?\s*\d+(?:[.,]\d+)?\s*(?:bn|billion|b|mm|mn|mln|million|mil|mio|m|thousand|grand|k|lakh|lac|crore|cr)?/i);
     if (firstMoney <= 0) return null;
 
@@ -3661,9 +4004,18 @@ export class LeadCaptureService {
     candidate = candidate
       .replace(/^(?:sector|industry|business type)\s*[:=-]?\s*/i, '')
       .replace(/^(?:looking for|want(?: to buy)?|buy|seeking|interested in)\s+(?:a|an|the)?\s*/i, '')
+      .replace(/^(?:actually|instead|rather|sorry|please|change(?: it)? to|update(?: it)? to|make it|set it to|new)\s+/i, '')
+      // Location-first shorthand is as common for buyers as sellers ("Dubai
+      // laundry 500k"). Strip a leading UAE place before deciding whether
+      // the remaining words are a sector. If the input is only "Dubai 500k"
+      // this intentionally leaves an empty candidate rather than inventing a
+      // sector.
+      .replace(/^(?:in\s+)?(?:Business Bay|Dubai Marina|Downtown Dubai|Dubai Silicon Oasis|Dubai Investment Park|Palm Jumeirah|International City|Motor City|Bur Dubai|Al Barsha|Al Quoz|Deira|JLT|JVC|JBR|DSO|DIP|Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\s+/i, '')
       .replace(/(?:\s+in)?\s+(?:Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\s*$/i, '')
+      .replace(/(?:\s+in)?\s+(?:JLT|JVC|JBR|Business Bay|Dubai Marina|Downtown Dubai|Al Quoz|Deira|Bur Dubai|Al Barsha|Palm Jumeirah|Dubai Silicon Oasis|DSO|Dubai Investment Park|DIP|Motor City|International City)\s*$/i, '')
       .replace(/\s+(?:only|exclusively|strictly)\s*$/i, '')
       .trim();
+    if (/^(?:actually|instead|rather|sorry|please|change|update|make it|set it|new|same)$/i.test(candidate)) return null;
     if (!candidate || this.isBuyerCriteriaOnlyText(candidate) || this.looksLikeBuyerFinancialPhrase(candidate)) return null;
 
     const normalized = this.normalizeBuyerSectorCandidate(candidate);
@@ -3702,14 +4054,14 @@ export class LeadCaptureService {
 
   private extractBuyerSectorPreference(value: string): string | null {
     const patterns = [
-      /(?:looking for|want to (?:buy|acquire)|interested in|seeking|i want|i need|i prefer)\s+(?:(?:a|an|the)\s+)?(.+?)(?=\s+(?:in|under|below|up to|with (?:a\s+)?budget|within (?:a\s+)?budget|that|which|if)\b|[,.;]|$)/i,
-      /(?:sector|industry|business type)\s*(?:must be|has to be|required)?\s*[:=-]?\s*(.+?)(?=\s+(?:in|under|below|up to|with|budget)\b|[,.;]|$)/i,
-      /(?:buy|acquire)\s+(?:(?:a|an|the)\s+)?(.+?)(?=\s+(?:in|under|below|up to|with|for)\b|[,.;]|$)/i,
-      /(?:sector|industry|business type)\s*(?:is|to|=|:)?\s*(.+?)(?=\s+(?:in|under|below|up to|with|budget)\b|[,.;]|$)/i,
-      /(?:ищу|хочу купить|интересует|рассматриваю)\s+(.+?)(?=\s+(?:в|до|с бюджетом|бюджет)\b|[,.;]|$)/iu,
-      /(?:أبحث عن|أريد شراء|مهتم بـ)\s*(.+?)(?=\s+(?:في|بميزانية|حتى)\b|[,.;]|$)/u,
-      /\b(?:actually|i mean|make that|instead|rather)\s+(?:(?:a|an|the)\s+)?([a-z][a-z &/-]{1,50}?)(?=\s+(?:in|under|below|up to|with|budget|max|cap)\b|[,.;]|$)/i,
-      /\b(?:maybe|perhaps|ideally|preferably)\s+(?:(?:a|an|the)\s+)?([a-z][a-z &/-]{1,50}?)(?=\s+(?:in|under|below|up to|with|budget|max|cap)\b|[,.;]|$)/i,
+      /(?:looking for|want to (?:buy|acquire)|interested in|seeking|i want|i need|i prefer)\s+(?:(?:a|an|the)\s+)?(.+?)(?=\s+(?:in|under|below|up to|with (?:a\s+)?budget|within (?:a\s+)?budget|that|which|if)\b|[,;]|\.(?!\d)|$)/i,
+      /(?:sector|industry|business type)\s*(?:must be|has to be|required)?\s*[:=-]?\s*(.+?)(?=\s+(?:in|under|below|up to|with|budget)\b|[,;]|\.(?!\d)|$)/i,
+      /(?:buy|acquire)\s+(?:(?:a|an|the)\s+)?(.+?)(?=\s+(?:in|under|below|up to|with|for)\b|[,;]|\.(?!\d)|$)/i,
+      /(?:sector|industry|business type)\s*(?:is|to|=|:)?\s*(.+?)(?=\s+(?:in|under|below|up to|with|budget)\b|[,;]|\.(?!\d)|$)/i,
+      /(?:ищу|хочу купить|интересует|рассматриваю)\s+(.+?)(?=\s+(?:в|до|с бюджетом|бюджет)\b|[,;]|\.(?!\d)|$)/iu,
+      /(?:أبحث عن|أريد شراء|مهتم بـ)\s*(.+?)(?=\s+(?:في|بميزانية|حتى)\b|[,;]|\.(?!\d)|$)/u,
+      /\b(?:actually|i mean|make that|instead|rather)\s+(?:(?:a|an|the)\s+)?([a-z][a-z &/-]{1,50}?)(?=\s+(?:in|under|below|up to|with|budget|max|cap)\b|[,;]|\.(?!\d)|$)/i,
+      /\b(?:maybe|perhaps|ideally|preferably)\s+(?:(?:a|an|the)\s+)?([a-z][a-z &/-]{1,50}?)(?=\s+(?:in|under|below|up to|with|budget|max|cap)\b|[,;]|\.(?!\d)|$)/i,
     ];
     for (const pattern of patterns) {
       const match = value.match(pattern);
@@ -3744,6 +4096,8 @@ export class LeadCaptureService {
     return (this.normalizeBusinessText(value) || '')
       .replace(/\s+(?:only|exclusively|strictly|(?:is\s+)?a\s+must|required)$/i, '')
       .replace(/^(?:only|exclusively|strictly|ideally|preferably|maybe|perhaps|possibly|open to|prefer(?:red)?|i(?:'d| would)? prefer)\s+(?:a|an|the)?\s*/i, '')
+      .replace(/(?:\s+in)?\s+(?:Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\s*$/i, '')
+      .replace(/(?:\s+in)?\s+(?:JLT|JVC|JBR|Business Bay|Dubai Marina|Downtown Dubai|Al Quoz|Deira|Bur Dubai|Al Barsha|Palm Jumeirah|Dubai Silicon Oasis|DSO|Dubai Investment Park|DIP|Motor City|International City)\s*$/i, '')
       .trim();
   }
 
@@ -3786,13 +4140,19 @@ export class LeadCaptureService {
 
     // An unlabeled monetary range in the first buyer description is normally
     // a purchase-price range (e.g. "500k-1m" or "1 to 2m"). Treat its
-    // upper end as the maximum budget, but never steal a range explicitly
-    // labelled as profit/income/ROI.
-    if (!/\b(?:profit|income|earnings?|cash\s*flow|cashflow|roi|return|yield)\b/i.test(value)) {
-      const range = value.match(
-        /(?:aed|dhs?|dirhams?|дирхам(?:ов|а)?|درهم)?\s*(\d+(?:[.,]\d+)?)\s*(k|m|mn|mln|million|mil|thousand|grand|млн|миллион(?:а|ов)?|тыс(?:яч[аи]?)?|مليون|ألف)?\s*(?:-|–|—|to|до|إلى)\s*(?:aed|dhs?|dirhams?|дирхам(?:ов|а)?|درهم)?\s*(\d+(?:[.,]\d+)?)\s*(k|m|mn|mln|million|mil|thousand|grand|млн|миллион(?:а|ов)?|тыс(?:яч[аи]?)?|مليون|ألف)?/iu
+    // upper end as the maximum budget. Do not reject the range merely because
+    // the same compact sentence also contains a later profit target
+    // ("500k-1m, annual profit 100k"). Only skip a range when a return/profit
+    // label immediately precedes that specific range.
+    const range = value.match(
+      /(?:aed|dhs?|dirhams?|дирхам(?:ов|а)?|درهم)?\s*(\d+(?:[.,]\d+)?)\s*(k|m|mn|mln|million|mil|thousand|grand|млн|миллион(?:а|ов)?|тыс(?:яч[аи]?)?|مليون|ألف)?\s*(?:-|–|—|to|до|إلى)\s*(?:aed|dhs?|dirhams?|дирхам(?:ов|а)?|درهم)?\s*(\d+(?:[.,]\d+)?)\s*(k|m|mn|mln|million|mil|thousand|grand|млн|миллион(?:а|ов)?|тыс(?:яч[аи]?)?|مليون|ألف)?/iu
+    );
+    if (range?.[1] && range?.[3] && range.index !== undefined) {
+      const beforeRange = value.slice(Math.max(0, range.index - 45), range.index);
+      const returnLabelImmediatelyBefore = /(?:profit|income|earnings?|cash\s*flow|cashflow|roi|return|yield|прибыл|доход|ربح|دخل)\s*(?::|=|-)?\s*$/iu.test(
+        beforeRange
       );
-      if (range?.[1] && range?.[3]) {
+      if (!returnLabelImmediatelyBefore) {
         const rightScale = range[4] || '';
         const leftScale = range[2] || rightScale;
         const left = this.scaleMoneyNumber(range[1], leftScale);
@@ -3843,7 +4203,7 @@ export class LeadCaptureService {
   ): { amount: number; period: 'annual' | 'monthly' | 'ambiguous' } | null {
     const profitPatterns = [
       /\b(?:net\s+profit|net\s+income|profit|income|ebitda|cash\s*flow|cashflow|earnings?|earns?|makes?(?!\s+(?:it|money)\b)|brings?(?!\s+it\b)|generates?|return|pays? me|nets? me|take[- ]?home|clears? me)\b/i,
-      /(?:прибыл|доход|денежн(?:ый|ого)? поток|зарабатывает|приносит)/iu,
+      /(?:прибыл(?:ь|и|ью|ей)(?=$|[^\p{L}])|доход|денежн(?:ый|ого)? поток|зарабатывает|приносит)/iu,
       /(?:ربح|دخل|تدفق نقدي|يدر|عائد)/u,
     ];
 
@@ -3924,7 +4284,12 @@ export class LeadCaptureService {
             .trim();
           const exclusionNoise = /^(?:preference|preferences|location|budget|price|profit|income|return|roi|passive|active|management|manage|run|work|owner|involvement|fixed|limit|maximum|anything|everything)$/i.test(clean)
             || /\b(?:preference|doesn't matter|does not matter|not required|is fine|is okay|acceptable)\b/i.test(clean);
-          if (!exclusionNoise && clean.length >= 2 && clean.length <= 50) results.push(clean);
+          const isLocationName = Boolean(
+            this.extractKnownUaeArea(clean) ||
+            this.extractKnownFreeZone(clean) ||
+            /^(?:Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)$/i.test(clean)
+          );
+          if (!exclusionNoise && !isLocationName && clean.length >= 2 && clean.length <= 50) results.push(clean);
         }
       }
     }
@@ -3981,8 +4346,50 @@ export class LeadCaptureService {
     return null;
   }
 
+  private extractCompactSellerAskingPrice(
+    value: string,
+    state: LeadCaptureState
+  ): string | null {
+    // The seller intake explicitly invites business + location + asking price in
+    // one natural message. If the only unlabelled commercial amount left after
+    // removing revenue/profit/expense clauses is a plausible asking price, use
+    // it instead of forcing the seller to repeat the figure with a label.
+    const hasBusinessContext = Boolean(
+      state.businessType || this.extractBusinessType(value, false)
+    );
+    const hasLocationContext = Boolean(
+      state.businessLocation ||
+      this.extractLocation(value, false) ||
+      /\bUAE\b/i.test(value)
+    );
+    if (!hasBusinessContext && !hasLocationContext) return null;
+
+    const money = String.raw`(?:aed|dhs?|dirhams?|usd|us\s*dollars?|\$)?\s*\d+(?:[.,]\d+)?\s*(?:bn|billion|b|mm|mn|mln|million|mil|mio|m|thousand|grand|k|crore|cr|lakh|lac)?\s*(?:aed|dhs?|dirhams?|usd|us\s*dollars?)?`;
+    let residual = value
+      // Phone numbers must never become asking prices.
+      .replace(/(?:\+?\d[\d\s()-]{7,}\d)/g, ' ')
+      // Financial metrics labelled before the amount.
+      .replace(new RegExp(String.raw`\b(?:annual\s+)?(?:revenue|turnov(?:er|r)|sales|profit|net\s+profit|income|ebitda|expenses?|opex|rent|payroll|salary)\b[^,;]{0,25}?${money}`, 'giu'), ' ')
+      // The equally common shorthand "2m turnover" / "50k profit".
+      .replace(new RegExp(String.raw`${money}\s*(?:per\s+(?:month|year)|monthly|yearly|annual(?:ly)?)?\s*\b(?:revenue|turnov(?:er|r)|sales|profit|net\s+profit|income|ebitda|expenses?|opex|rent|payroll|salary)\b`, 'giu'), ' ')
+      .replace(/\b(?:established|founded|since)\s+(?:19|20)\d{2}\b/giu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const candidate = this.extractMoneyExpression(residual);
+    if (!candidate || candidate === 'Unknown / to confirm') return null;
+    const amount = this.parseAedAmount(candidate);
+    return amount !== null && amount >= 10_000 ? candidate : null;
+  }
+
   private extractMoneyExpression(value: string): string | null {
     if (this.isExplicitUnknown(value)) return 'Unknown / to confirm';
+    if (
+      /^\s*(?:(?:aed|dhs?|dirhams?|usd|us\s*dollars?|\$)\s*)?-\s*\d/i.test(value) ||
+      /\b(?:negative|minus)\s+\d/i.test(value)
+    ) {
+      return null;
+    }
 
     const explicitlyAed = /\b(?:aed|dhs?|dirhams?)\b/i.test(value) || /(?:дирхам|درهم)/iu.test(value);
     const nonAedCurrency = this.detectNonAedCurrency(value);
@@ -3998,7 +4405,7 @@ export class LeadCaptureService {
     const isMinimum = /\b(?:over|above|more than|at least)\b/i.test(value);
 
     const rangeMatch = value.match(
-      /(?:\b(?:aed|dhs?|dirhams?|usd|us\s*dollars?)\b|\$)?\s*(\d+(?:[.,]\d+)?)\s*(m|mn|mln|million|k|thousand|млн|тыс|مليون|ألف)?\s*(?:-|–|—|to|до|إلى)\s*(?:\b(?:aed|dhs?|dirhams?|usd|us\s*dollars?)\b|\$)?\s*(\d+(?:[.,]\d+)?)\s*(m|mn|mln|million|k|thousand|млн|тыс|مليون|ألف)?/iu
+      /(?:\b(?:aed|dhs?|dirhams?|usd|us\s*dollars?)\b|\$)?\s*(\d+(?:[.,]\d+)?)\s*(b|bn|billion|m|mm|mn|mln|million|k|thousand|crore|cr|lakh|lac|млрд|миллиард(?:а|ов)?|млн|тыс|مليار|مليون|ألف)?\s*(?:\b(?:aed|dhs?|dirhams?|usd|us\s*dollars?)\b|\$)?\s*(?:-|–|—|to|до|إلى)\s*(?:\b(?:aed|dhs?|dirhams?|usd|us\s*dollars?)\b|\$)?\s*(\d+(?:[.,]\d+)?)\s*(b|bn|billion|m|mm|mn|mln|million|k|thousand|crore|cr|lakh|lac|млрд|миллиард(?:а|ов)?|млн|тыс|مليار|مليون|ألف)?/iu
     );
     if (rangeMatch?.[1] && rangeMatch[3]) {
       const rightUnit = rangeMatch[4] || '';
@@ -4037,7 +4444,7 @@ export class LeadCaptureService {
     }
 
     const scaled = value.match(
-      /(\d+(?:[.,]\d+)?)\s*(m|mn|mln|million|k|thousand|млн|миллион(?:а|ов)?|тыс(?:яч[аи]?)?|مليون|ألف)\b/iu
+      /(\d+(?:[.,]\d+)?)\s*(b|bn|billion|m|mm|mn|mln|million|k|thousand|crore|cr|lakh|lac|млрд|миллиард(?:а|ов)?|млн|миллион(?:а|ов)?|тыс(?:яч[аи]?)?|مليار|مليون|ألف)(?=$|[^\p{L}\p{N}])/iu
     );
     if (scaled?.[1] && scaled[2]) {
       const amount = convert(this.scaleMoneyNumber(scaled[1], scaled[2]));
@@ -4256,17 +4663,47 @@ export class LeadCaptureService {
     const normalized = value.toLowerCase().trim();
     if (normalized === '1') return true;
     if (normalized === '2') return false;
+
+    // Explicit refusal wins over a generic yes/no token. This prevents phrases
+    // such as "yes, but I do not agree to the commission" from being accepted.
+    const explicitReject =
+      /\b(?:not agree|do not agree|don't agree|will not agree|won't agree|do not accept|don't accept|will not accept|won't accept)\b/.test(normalized) ||
+      /\b(?:will not pay|won't pay|refuse to pay)\s+(?:the\s+)?(?:fee|commission)\b/.test(normalized) ||
+      /^(?:decline|reject)\b/.test(normalized) ||
+      /(?:не согласен|не согласна|не принимаю|не буду платить (?:комиссию|вознаграждение)|отказываюсь)/iu.test(value) ||
+      /(?:غير موافق|لا أوافق|لا أقبل|لن أدفع (?:الرسوم|العمولة)|أرفض)/u.test(value);
+    if (explicitReject) return false;
+
+    const explicitPositive =
+      /^(?:yes|yeah|yep|y|sure|agree|agreed|accepted|i accept|sounds good|okay|ok|proceed|continue|go ahead|fine|works for me|let'?s do it)\b/.test(normalized) ||
+      /^(?:👍[🏻🏼🏽🏾🏿]?|✅|👌[🏻🏼🏽🏾🏿]?)(?:\ufe0f)?(?:\s*(?:yes|ok|okay|agree|agreed|sure|proceed|go ahead))?$/iu.test(value.trim()) ||
+      /^(?:да|согласен|согласна|принимаю|подходит|продолжим|хорошо)\b/iu.test(value) ||
+      /^(?:نعم|موافق|أوافق|أقبل|تابع|حسناً|تمام)\b/u.test(value);
+    if (explicitPositive) return true;
+
+    // Sellers often answer the fee clause with the condition itself instead of
+    // another "yes". These phrases affirm the exact success-fee/no-upfront
+    // model already presented, so accepting them avoids a needless extra turn.
+    const affirmsSuccessFeeTiming =
+      /\b(?:only\s+)?(?:pay(?:ment)?|fee|commission)?\s*(?:is\s+)?(?:only\s+)?(?:after|when)\s+(?:the\s+)?sale\s+(?:is\s+)?(?:complete|completed|completes|closes?|closed|done)\b/.test(normalized) ||
+      /\b(?:only after sale|after the sale only|success[- ]?fee only|success[- ]?based only|no upfront (?:fee|fees|charge|charges|payment|payments))\b/.test(normalized) ||
+      /(?:только после продажи|только по факту продажи|оплата только после продажи|без предоплаты|без аванса)/iu.test(value) ||
+      /(?:فقط بعد البيع|الدفع بعد البيع فقط|بدون رسوم مقدمة|بدون دفعة مقدمة|رسوم نجاح فقط)/u.test(value);
+    if (affirmsSuccessFeeTiming) return true;
+
     const reject =
-      /\b(no|not agree|do not agree|decline|reject)\b/.test(normalized) ||
-      /(нет|не согласен|не согласна|отказываюсь)/i.test(value) ||
-      /(لا|غير موافق|لا أوافق|أرفض)/i.test(value);
+      /^(?:👎[🏻🏼🏽🏾🏿]?|❌)(?:\ufe0f)?(?:\s*(?:no|nope|decline|reject))?$/iu.test(value.trim()) ||
+      /^(?:no|nope|n)\b/.test(normalized) ||
+      /^(?:нет)\b/iu.test(value) ||
+      /^(?:لا)\b/u.test(value);
     if (reject) return false;
+
     const accept =
       /\b(yes|agree|accepted|i accept|sounds good|okay|ok|proceed)\b/.test(
         normalized
       ) ||
-      /(да|согласен|согласна|принимаю|подходит|продолжим)/i.test(value) ||
-      /(نعم|موافق|أوافق|أقبل|تابع)/i.test(value);
+      /(да|согласен|согласна|принимаю|подходит|продолжим)/iu.test(value) ||
+      /(نعم|موافق|أوافق|أقبل|تابع)/u.test(value);
     if (accept) return true;
     return null;
   }
@@ -4283,11 +4720,15 @@ export class LeadCaptureService {
 
   private extractPhoneFromJid(jid: string): string | null {
     const trimmed = jid.trim();
-    const separator = trimmed.indexOf('@');
+    const separator = trimmed.lastIndexOf('@');
     if (separator >= 0) {
       const domain = trimmed.slice(separator + 1).toLowerCase();
-      if (domain !== 's.whatsapp.net') return null;
-      return this.normalizePhoneNumber(trimmed.slice(0, separator));
+      // PN identities can be delivered on the normal or Meta-hosted domain.
+      // Strip the multi-device suffix (:2, :3, ...) before extracting digits;
+      // otherwise a device id would silently become part of the CRM phone.
+      if (domain !== 's.whatsapp.net' && domain !== 'hosted') return null;
+      const user = trimmed.slice(0, separator).split(':', 1)[0] || '';
+      return this.normalizePhoneNumber(user);
     }
     return this.normalizePhoneNumber(trimmed);
   }
@@ -4396,25 +4837,43 @@ export class LeadCaptureService {
   private normalizeBusinessText(value: string): string | null {
     let cleaned = this.cleanFreeTextAnswer(value) || '';
     cleaned = cleaned
+      // Location-first shorthand is common in WhatsApp ("Dubai cafe 500k" or
+      // "in Dubai I have a salon"). The location is captured separately; keep
+      // it out of the business title.
+      .replace(/^(?:in\s+)?(?:Business Bay|Dubai Marina|Downtown Dubai|Dubai Silicon Oasis|Dubai Investment Park|Palm Jumeirah|International City|Motor City|Bur Dubai|Al Barsha|Al Quoz|Deira|JLT|JVC|JBR|DSO|DIP|Hamriyah Free Zone|JAFZA|DMCC|RAKEZ|SAIF Zone|Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\s+(?=(?:i|we)\s+(?:have|own|run|operate)\b|[A-Za-z])/i, '')
+      .replace(/^(?:my|our)\s+business\s+is\s+(?:a\s+|an\s+|the\s+)?/i, '')
+      .replace(/^(?:i|we)\s+wanna\s+sell\s+(?:(?:my|our|a|an|the)\s+)?/i, '')
       .replace(/^(?:i(?:'m| am)?|we(?:'re| are)?)\s+(?:am\s+)?(?:looking|trying|planning)\s+to\s+sell\s+(?:(?:my|our|a|an|the)\s+)?/i, '')
       .replace(/^(?:i|we)\s+(?:want|would like|need|plan)\s+to\s+sell\s+(?:(?:my|our|a|an|the)\s+)?/i, '')
       .replace(/^(?:i(?:'m| am)?|we(?:'re| are)?)\s+selling\s+(?:(?:my|our|a|an|the)\s+)?/i, '')
       .replace(/^(?:i\s+(?:want|would like|need|plan)\s+to\s+|i(?:'m| am)\s+|we\s+)(?:sell(?:ing)?|buy(?:ing)?|acquir(?:e|ing)|looking for)\s+(?:(?:my|our|a|an|the)\s+)?/i, '')
-      .replace(/^(?:sell|selling|buy|buying|acquire|acquiring|looking for)\s+(?:a\s+|an\s+|the\s+)?/i, '')
+      .replace(/^(?:sell|selling|buy|buying|acquire|acquiring|looking for)\s+(?:(?:my|our|a|an|the)\s+)?/i, '')
       .replace(/^(?:we\s+(?:operate|run|own|have|are)|i\s+(?:operate|run|own|have))\s+(?:a\s+|an\s+|the\s+)?/i, '')
+      .replace(/^(?:i|we)\s+(?:sell|offer|provide)\s+/i, '')
       .replace(/^business\s*[:=-]?\s*/i, '')
       .replace(/^(?:a|an|the)\s+/i, '')
       .replace(/^(?:Hamriyah\s+Free\s+Zone|Jebel\s+Ali\s+Free\s+Zone|JAFZA|DMCC|RAKEZ|SAIF\s+Zone)\s*[-,:]?\s*/i, '');
 
     const boundary = cleaned.search(
-      /(?:[,;.]|\s+(?:in|located in|based in)\s+(?=Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)|\s+(?:last|previous)\s+(?:yr|year)\b|\s+(?:with\s+)?(?:annual|yearly|monthly)?\s*(?:revenue|turnover|sales|profit|expenses)|\s+(?:asking(?: price)?|expected price|selling price|sell(?:ing)? for|selling at|looking for|budget|under|up to|maximum|max(?:imum)?)\b)/i
+      /(?:[,;]|\.(?!\d)|\s+(?:in|located in|based in)\s+(?=Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)|\s+(?:last|previous)\s+(?:yr|year)\b|\s+(?:with\s+)?(?:annual|yearly|monthly)?\s*(?:revenue|turnov(?:er|r)|sales|profit|expenses)|\s+(?:asking(?: price)?|expected price|selling price|sell(?:ing|ng)? for|selling at|looking for|budget|under|up to|maximum|max(?:imum)?)\b|\s+(?:and\s+)?(?:want out|want to exit|looking to exit|for sale)\b)/i
     );
     if (boundary > 0) cleaned = cleaned.slice(0, boundary);
 
     cleaned = cleaned
-      .replace(/\b(?:in dubai|in abu dhabi|uae)\b/gi, '')
+      .replace(/\b(?:in dubai|in abu dhabi|(?:in\s+)?uae)\b/gi, '')
+      // A compact seller sentence may leave the bare asking-price token after
+      // the activity ("restaurant UAE 500k"). Keep money out of the title.
+      .replace(/\s+(?:aed|dhs?|dirhams?|usd|\$)?\s*\d+(?:[.,]\d+)?\s*(?:bn|billion|b|mm|mn|mln|million|mil|mio|m|thousand|grand|k|crore|cr|lakh|lac)(?:\s*(?:aed|dhs?|dirhams?|usd))?.*$/i, '')
+      .replace(/\s+(?:aed|dhs?|dirhams?|usd|\$)\s*\d[\d,. ]*(?:\s*(?:aed|dhs?|dirhams?|usd))?\s*$/i, '')
+      .replace(/\s+\d{4,}(?:[.,]\d+)?(?:\s*(?:aed|dhs?|dirhams?|usd))?\s*$/i, '')
+      .replace(/\s+(?:in|at|based in)\s*$/i, '')
       .replace(/\s+/g, ' ')
       .trim();
+    if (
+      /^(?:to sell|for sale|sale|selling|to buy|for purchase|business to sell|business for sale)$/i.test(cleaned)
+    ) {
+      return null;
+    }
     if (!cleaned || cleaned.length < 2 || !this.isMeaningfulFreeText(cleaned)) {
       return null;
     }
@@ -4706,12 +5165,45 @@ export class LeadCaptureService {
       return messages[state.language];
     }
 
+    const labels: Record<
+      ConversationLanguage,
+      {
+        business: string;
+        location: string;
+        price: string;
+        revenue: string;
+        profit: string;
+      }
+    > = {
+      en: {
+        business: 'Business',
+        location: 'Location',
+        price: 'Expected price',
+        revenue: 'Annual revenue',
+        profit: 'Monthly profit',
+      },
+      ru: {
+        business: 'Бизнес',
+        location: 'Локация',
+        price: 'Ожидаемая цена',
+        revenue: 'Годовая выручка',
+        profit: 'Месячная прибыль',
+      },
+      ar: {
+        business: 'النشاط',
+        location: 'الموقع',
+        price: 'السعر المتوقع',
+        revenue: 'الإيراد السنوي',
+        profit: 'الربح الشهري',
+      },
+    };
+    const label = labels[state.language];
     const summary: string[] = [];
-    if (state.businessType) summary.push(`Business: ${state.businessType}`);
-    if (state.businessLocation) summary.push(`Location: ${state.businessLocation}`);
-    if (state.desiredSellingPriceAed) summary.push(`Expected price: ${state.desiredSellingPriceAed}`);
-    if (state.annualRevenueAed) summary.push(`Annual revenue: ${state.annualRevenueAed}`);
-    if (state.monthlyNetProfitAed) summary.push(`Monthly profit: ${state.monthlyNetProfitAed}`);
+    if (state.businessType) summary.push(`${label.business}: ${state.businessType}`);
+    if (state.businessLocation) summary.push(`${label.location}: ${state.businessLocation}`);
+    if (state.desiredSellingPriceAed) summary.push(`${label.price}: ${state.desiredSellingPriceAed}`);
+    if (state.annualRevenueAed) summary.push(`${label.revenue}: ${state.annualRevenueAed}`);
+    if (state.monthlyNetProfitAed) summary.push(`${label.profit}: ${state.monthlyNetProfitAed}`);
     const rendered = summary.map((item) => `• ${item}`).join('\n');
     const messages: Record<ConversationLanguage, string> = {
       en: `I have recorded the essential details${rendered ? `:\n${rendered}` : ''}. This is enough for an initial SHARH review. Would you like me to submit it for review, add more details, or send you the website link?`,

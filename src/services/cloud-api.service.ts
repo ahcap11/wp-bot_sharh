@@ -82,11 +82,12 @@ export class CloudApiTransport implements MessagingTransport {
       };
     }
 
-    const bubbles = message
-      .split(/\n?\s*---\s*\n?/g)
-      .map(part => part.trim())
-      .filter(Boolean);
-    const outgoing = bubbles.length > 0 ? bubbles : [message.trim()];
+    // Keep each logical reply atomic so a retry cannot duplicate a chunk that
+    // the provider already accepted before a later chunk failed.
+    const outgoing = [message.trim()].filter(Boolean);
+    if (outgoing.length === 0) {
+      return { success: true, providerMessageIds: [] };
+    }
     const providerMessageIds: string[] = [];
 
     for (const text of outgoing) {

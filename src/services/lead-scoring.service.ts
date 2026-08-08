@@ -29,7 +29,7 @@ export class LeadScoringService {
     }
 
     if (record.inquiryPurpose === 'selling') {
-      score += this.scoreSeller(record, reasons, riskFlags);
+      score += this.scoreSeller(record, reasons);
     } else if (record.inquiryPurpose === 'buying') {
       score += this.scoreBuyer(record, reasons, riskFlags);
     } else {
@@ -70,8 +70,7 @@ export class LeadScoringService {
 
   private scoreSeller(
     record: LeadCaptureRecord,
-    reasons: string[],
-    riskFlags: string[]
+    reasons: string[]
   ): number {
     let points = 0;
     if (record.termsAccepted === 'yes') {
@@ -87,9 +86,10 @@ export class LeadScoringService {
     points += financials * 5;
     if (financials === 3) {
       reasons.push('Revenue, net profit, and asking price are all captured.');
-    } else if (!record.annualRevenueAed && !record.monthlyNetProfitAed) {
-      riskFlags.push('No operating performance figure has been captured yet.');
     }
+    // Missing optional enrichment is not itself a risk. The seller can reach a
+    // valid initial review with business, location and asking price; risk flags
+    // are reserved for contradictions or genuinely decision-relevant concerns.
 
     const operations = [
       record.yearEstablished,

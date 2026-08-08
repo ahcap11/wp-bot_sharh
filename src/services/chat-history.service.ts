@@ -67,6 +67,16 @@ export class ChatHistoryService {
         this.chatHistories.set(chatId, chatHistory);
       }
 
+      // Provider replays and our own durable inbound retry must not duplicate
+      // the same message in the transcript.
+      if (message.id && chatHistory.messages.some(item => item.id === message.id)) {
+        logger.debug('Duplicate message skipped in chat history', {
+          chatId,
+          messageId: message.id,
+        });
+        return;
+      }
+
       // Add message to history
       chatHistory.messages.push(message);
 

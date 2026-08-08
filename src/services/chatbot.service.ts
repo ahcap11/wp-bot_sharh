@@ -31,6 +31,8 @@ import { BuyerCriteriaService, BuyerSearchCriteria } from './buyer-criteria.serv
 
 const ROLES_PERSISTENCE_NAMESPACE = 'chatRoles';
 const INBOUND_DEDUP_NAMESPACE = 'processedInboundMessages';
+const PENDING_INBOUND_NAMESPACE = 'pendingInboundMessages';
+const CHAT_IDENTITY_ALIAS_NAMESPACE = 'chatIdentityAliases';
 const MAX_INBOUND_DEDUP_IDS = 5000;
 const BUYER_MATCHES_NAMESPACE = 'buyerListingMatches';
 const BUYER_LISTING_CODES_NAMESPACE = 'buyerListingCodes';
@@ -68,15 +70,23 @@ export class ChatbotService {
   private readonly sharhSyncService: SharhSyncService | null;
   private readonly messageDeliveryService: MessageDeliveryService;
   private readonly processedInboundIds: Set<string> = new Set();
+  private readonly inFlightInboundIds: Set<string> = new Set();
+  private readonly pendingInboundMessages: Map<string, WhatsAppMessage> = new Map();
+  private readonly chatIdentityAliases: Map<string, string> = new Map();
   private readonly funnelQualityService: FunnelQualityService | null;
   private readonly conversationSafetyService: ConversationSafetyService | null;
   private readonly buyerMatchFingerprints: Map<string, string> = new Map();
   private readonly buyerListingCodes: Map<string, string[]> = new Map();
   private readonly buyerListingRows: Map<string, PublicListingRow[]> = new Map();
   private readonly adminOutboxSent: Map<string, string> = new Map();
+  private readonly adminOutboxRetry: Map<
+    string,
+    { attempts: number; nextAttemptAt: number; lastError: string }
+  > = new Map();
   private readonly pendingConversationResets: Set<string> = new Set();
   private readonly buyerCriteriaService = new BuyerCriteriaService();
   private adminOutboxTimer: ReturnType<typeof setInterval> | null = null;
+  private pendingInboundRetryTimer: ReturnType<typeof setInterval> | null = null;
   private adminOutboxProcessing = false;
 
   constructor(
@@ -115,6 +125,8 @@ export class ChatbotService {
     this.roleSwitchEnabled = process.env['ROLE_SWITCH_ENABLED'] === 'true';
     this.hydrateRoles();
     this.hydrateInboundDedup();
+    this.hydratePendingInbound();
+    this.hydrateChatIdentityAliases();
     this.hydrateBuyerMatches();
     this.hydrateBuyerListingCodes();
     this.hydrateAdminOutboxSent();
@@ -150,6 +162,35 @@ export class ChatbotService {
       if (processed === true) this.processedInboundIds.add(messageId);
     }
     this.trimInboundDedup();
+  }
+
+  private hydratePendingInbound(): void {
+    if (!this.persistence) return;
+    const stored = this.persistence.getNamespace<WhatsAppMessage>(
+      PENDING_INBOUND_NAMESPACE
+    );
+    for (const [messageId, message] of Object.entries(stored)) {
+      if (
+        messageId &&
+        message &&
+        typeof message === 'object' &&
+        typeof message.content === 'string'
+      ) {
+        this.pendingInboundMessages.set(messageId, message);
+      }
+    }
+  }
+
+  private hydrateChatIdentityAliases(): void {
+    if (!this.persistence) return;
+    const stored = this.persistence.getNamespace<string>(
+      CHAT_IDENTITY_ALIAS_NAMESPACE
+    );
+    for (const [alias, canonical] of Object.entries(stored)) {
+      if (this.isDirectChatIdentity(alias) && this.isDirectChatIdentity(canonical)) {
+        this.chatIdentityAliases.set(alias, canonical);
+      }
+    }
   }
 
   private hydrateBuyerMatches(): void {
@@ -198,6 +239,9 @@ export class ChatbotService {
       (status: ConnectionStatus) => {
         this.webSocketService.sendConnectionStatus(status);
         logger.info('WhatsApp connection status changed', { status });
+        if (status === ConnectionStatus.READY) {
+          void this.retryPendingInboundMessages();
+        }
       }
     );
 
@@ -237,10 +281,20 @@ export class ChatbotService {
 
       // Initialize WhatsApp service
       await this.whatsappService.initialize();
+      this.startPendingInboundRetryLoop();
+      void this.retryPendingInboundMessages();
 
-      // Initialize optional Google Sheets integration
+      // Google Sheets is optional enrichment/reporting. Its credentials, API
+      // quota or network health must never prevent the WhatsApp funnel from
+      // coming online.
       if (this.googleSheetsService) {
-        await this.googleSheetsService.initialize();
+        try {
+          await this.googleSheetsService.initialize();
+        } catch (error) {
+          logger.warn('Google Sheets initialization failed; WhatsApp funnel will continue', {
+            error: error instanceof Error ? error.message : 'Unknown error',
+          });
+        }
       }
 
       this.sharhSyncService?.start();
@@ -432,6 +486,11 @@ export class ChatbotService {
     try {
       const items = await this.sharhApiService.fetchAdminOutbox(10);
       for (const item of items) {
+        const retryState = this.adminOutboxRetry.get(item.id);
+        if (retryState && retryState.nextAttemptAt > Date.now()) {
+          continue;
+        }
+
         const alreadySentProviderId = this.adminOutboxSent.get(item.id);
         if (alreadySentProviderId !== undefined) {
           const acknowledged = await this.sharhApiService.acknowledgeAdminOutboxMessage(
@@ -441,6 +500,7 @@ export class ChatbotService {
           );
           if (acknowledged) {
             this.adminOutboxSent.delete(item.id);
+            this.adminOutboxRetry.delete(item.id);
             this.persistence?.removeItem(ADMIN_OUTBOX_SENT_NAMESPACE, item.id);
           }
           continue;
@@ -459,6 +519,7 @@ export class ChatbotService {
           );
           if (acknowledged) {
             this.adminOutboxSent.delete(item.id);
+            this.adminOutboxRetry.delete(item.id);
             this.persistence?.removeItem(ADMIN_OUTBOX_SENT_NAMESPACE, item.id);
           }
           this.chatHistoryService.addMessage(item.externalChatId, {
@@ -477,16 +538,24 @@ export class ChatbotService {
             messageId: item.id,
           });
         } else {
-          await this.sharhApiService.acknowledgeAdminOutboxMessage(
-            item.id,
-            'failed',
-            undefined,
-            result.error || 'WhatsApp provider rejected the message'
-          );
-          logger.warn('Admin WhatsApp reply failed', {
+          // A temporary WhatsApp/socket failure must not consume a human reply.
+          // Leave the backend message pending and retry with capped backoff. The
+          // admin will continue to see it as pending until WhatsApp accepts it.
+          const previous = this.adminOutboxRetry.get(item.id);
+          const attempts = (previous?.attempts || 0) + 1;
+          const backoffMs = Math.min(5 * 60_000, 5_000 * 2 ** Math.min(attempts - 1, 6));
+          const lastError = result.error || 'WhatsApp provider rejected the message';
+          this.adminOutboxRetry.set(item.id, {
+            attempts,
+            nextAttemptAt: Date.now() + backoffMs,
+            lastError,
+          });
+          logger.warn('Admin WhatsApp reply failed; kept pending for retry', {
             conversationId: item.conversationId,
             messageId: item.id,
-            error: result.error || 'unknown send error',
+            attempts,
+            retryInMs: backoffMs,
+            error: lastError,
           });
         }
       }
@@ -502,7 +571,10 @@ export class ChatbotService {
   /**
    * Queue incoming messages by chat, allowing multiple chats in parallel
    */
-  private enqueueMessageProcessing(message: WhatsAppMessage): void {
+  private enqueueMessageProcessing(
+    message: WhatsAppMessage,
+    replayPending: boolean = false
+  ): void {
     const from = message.from || '';
     const isBroadcastOrChannel =
       from.endsWith('@broadcast') ||
@@ -517,15 +589,51 @@ export class ChatbotService {
     }
 
     if (message.id && this.processedInboundIds.has(message.id)) {
-      logger.debug('Ignoring duplicate inbound provider message', {
+      logger.debug('Ignoring duplicate completed inbound provider message', {
         messageId: message.id,
         from,
       });
       return;
     }
-    if (this.accessControl) {
+    if (message.id && this.inFlightInboundIds.has(message.id)) {
+      logger.debug('Ignoring inbound provider message already in flight', {
+        messageId: message.id,
+        from,
+      });
+      return;
+    }
+    if (!replayPending && this.accessControl) {
       const verdict = this.accessControl.evaluate(message.from);
       if (!verdict.allowed) {
+        if (verdict.reason === 'rate_limited') {
+          // Rate limiting is a pacing control, not a licence to discard a real
+          // seller/buyer message. Persist the turn and replay it after the
+          // sliding window opens. Per-chat queues preserve the original order,
+          // and the separate AI safety budget still protects costs/abuse.
+          if (message.id && !this.pendingInboundMessages.has(message.id)) {
+            this.pendingInboundMessages.set(message.id, message);
+            this.persistence?.setItem(PENDING_INBOUND_NAMESPACE, message.id, message);
+          }
+          const retryAfterMs = Math.max(250, this.accessControl.retryAfterMs(message.from));
+          logger.warn('Inbound message rate limited; queued instead of dropped', {
+            from: message.from,
+            messageId: message.id,
+            retryAfterMs,
+          });
+          const timer = setTimeout(() => {
+            if (!message.id || this.pendingInboundMessages.has(message.id)) {
+              this.enqueueMessageProcessing(message, true);
+            }
+          }, retryAfterMs);
+          timer.unref?.();
+          void this.persistence?.flush().catch(error => {
+            logger.error('Could not persist rate-limited inbound message', {
+              messageId: message.id,
+              error: error instanceof Error ? error.message : 'Unknown error',
+            });
+          });
+          return;
+        }
         logger.warn('Inbound message blocked by access control', {
           from: message.from,
           reason: verdict.reason,
@@ -534,12 +642,16 @@ export class ChatbotService {
       }
     }
 
-    // Persist provider-message deduplication only after the sender passes access
-    // control. A temporarily blocked message must not poison a later retry.
+    // A message is not considered processed until its bot reply is accepted by
+    // WhatsApp (or the application deliberately suppresses a reply). Persist the
+    // inbound work item first so a crash, socket failure, or API timeout cannot
+    // permanently consume a customer's turn.
     if (message.id) {
-      this.processedInboundIds.add(message.id);
-      this.persistence?.setItem(INBOUND_DEDUP_NAMESPACE, message.id, true);
-      this.trimInboundDedup();
+      this.inFlightInboundIds.add(message.id);
+      if (!this.pendingInboundMessages.has(message.id)) {
+        this.pendingInboundMessages.set(message.id, message);
+        this.persistence?.setItem(PENDING_INBOUND_NAMESPACE, message.id, message);
+      }
     }
 
     const chatId = this.getChatId(message);
@@ -558,8 +670,12 @@ export class ChatbotService {
         this.isProcessing = this.activeMessageCount > 0;
 
         try {
+          // Force the accepted inbound message to disk before doing work that can
+          // fail. Pilot-scale file persistence makes this cheap and predictable.
+          await this.persistence?.flush();
           await this.handleIncomingMessage(message, chatId);
         } finally {
+          if (message.id) this.inFlightInboundIds.delete(message.id);
           this.activeMessageCount = Math.max(0, this.activeMessageCount - 1);
           this.isProcessing = this.activeMessageCount > 0;
         }
@@ -572,6 +688,41 @@ export class ChatbotService {
         this.chatProcessingQueues.delete(chatId);
       }
     });
+  }
+
+  private async markInboundCompleted(messageId: string): Promise<void> {
+    if (!messageId) return;
+    this.pendingInboundMessages.delete(messageId);
+    this.persistence?.removeItem(PENDING_INBOUND_NAMESPACE, messageId);
+    this.processedInboundIds.add(messageId);
+    this.persistence?.setItem(INBOUND_DEDUP_NAMESPACE, messageId, true);
+    this.trimInboundDedup();
+    // Commit the completion marker before the turn leaves the queue. This
+    // favors at-most-once customer replies after a process crash.
+    await this.persistence?.flush();
+  }
+
+  private startPendingInboundRetryLoop(): void {
+    if (this.pendingInboundRetryTimer) return;
+    const retry = (): void => {
+      void this.retryPendingInboundMessages();
+    };
+    this.pendingInboundRetryTimer = setInterval(retry, 15000);
+    this.pendingInboundRetryTimer.unref?.();
+  }
+
+  private async retryPendingInboundMessages(): Promise<void> {
+    if (!this.whatsappService.isConnected()) return;
+    const pending = Array.from(this.pendingInboundMessages.values()).slice(0, 100);
+    if (!pending.length) return;
+    logger.warn('Retrying unfinished inbound WhatsApp messages', {
+      count: pending.length,
+    });
+    for (const message of pending) {
+      if (message.id && !this.inFlightInboundIds.has(message.id)) {
+        this.enqueueMessageProcessing(message, true);
+      }
+    }
   }
 
   /**
@@ -668,17 +819,30 @@ export class ChatbotService {
           },
           `${incomingMessage.id}-control`
         );
+        await this.markInboundCompleted(incomingMessage.id);
         return;
       }
 
+      // Media without text/caption must never disappear silently. Keep the
+      // response short and do not mutate funnel fields from content we cannot
+      // reliably interpret.
+      const mediaOnlyResponse = incomingMessage.mediaOnly
+        ? this.buildMediaOnlyResponse(
+            incomingMessage.type,
+            this.leadCaptureService?.getLanguage(chatId) || 'en'
+          )
+        : null;
+
       // Capture lead data and resolve the application-owned funnel action.
-      const salesTurn = await this.captureSalesLeadData(
-        chatId,
-        incomingMessage,
-        role,
-        control?.adminGuidance || [],
-        control?.recentHumanMessages || []
-      );
+      const salesTurn = mediaOnlyResponse
+        ? undefined
+        : await this.captureSalesLeadData(
+            chatId,
+            incomingMessage,
+            role,
+            control?.adminGuidance || [],
+            control?.recentHumanMessages || []
+          );
 
       if (salesTurn && !salesTurn.directive.shouldRespond) {
         logger.info('Bot response suppressed by funnel ownership/state', {
@@ -686,6 +850,7 @@ export class ChatbotService {
           stage: salesTurn.directive.stage,
           owner: salesTurn.directive.owner,
         });
+        await this.markInboundCompleted(incomingMessage.id);
         return;
       }
 
@@ -696,6 +861,7 @@ export class ChatbotService {
       let result: MessageProcessingResult;
       if (role === 'sales') {
         const response =
+          mediaOnlyResponse ||
           directResponse ||
           (await this.buildSalesContinuityFallback(
             chatId,
@@ -736,7 +902,7 @@ export class ChatbotService {
       if (result.success && result.response) {
         let outboundResponse = result.response;
         let directiveDelivered = true;
-        if (role === 'sales' && this.funnelQualityService) {
+        if (role === 'sales' && this.funnelQualityService && !incomingMessage.mediaOnly) {
           const quality = this.funnelQualityService.evaluate(
             outboundResponse,
             salesTurn?.record,
@@ -774,7 +940,28 @@ export class ChatbotService {
           );
         }
 
-        // Add delay to simulate human-like response
+        // Give an explicit admin takeover/pause the final word even if it occurs
+        // while this turn is being parsed or while a reply is being prepared.
+        if (this.sharhApiService?.isEnabled()) {
+          const finalControl = await this.sharhApiService.getConversationControl(
+            chatId,
+            incomingMessage.from
+          );
+          if (
+            finalControl?.found &&
+            (!finalControl.botEnabled || finalControl.owner !== 'bot' || ['paused', 'human', 'closed'].includes(finalControl.controlMode))
+          ) {
+            logger.info('Bot reply cancelled because conversation control changed before send', {
+              chatId,
+              owner: finalControl.owner,
+              controlMode: finalControl.controlMode,
+            });
+            await this.markInboundCompleted(incomingMessage.id);
+            return;
+          }
+        }
+
+        // Add a short pacing delay without making the response path depend on it.
         await this.delay(this.responseDelay);
 
         // Send response via WhatsApp
@@ -786,7 +973,6 @@ export class ChatbotService {
         );
 
         if (sendResult.success) {
-          // Add bot response to chat history
           const botMessage: WhatsAppMessage = {
             id: sendResult.providerMessageIds[0] || `bot-${Date.now()}`,
             from: 'bot',
@@ -800,6 +986,10 @@ export class ChatbotService {
             isFromBot: true,
           };
 
+          // Commit the customer-visible reply, funnel transition and inbound
+          // completion together before doing secondary sync/telemetry work.
+          // This narrows the crash window that could otherwise replay a turn
+          // after WhatsApp already accepted the reply.
           this.messageDeliveryService.recordAccepted(
             botMessage.id,
             replyTarget,
@@ -808,6 +998,16 @@ export class ChatbotService {
             sendResult
           );
           this.chatHistoryService.addMessage(chatId, botMessage);
+          if (salesTurn && directiveDelivered) {
+            this.leadCaptureService?.confirmDirectiveSent(
+              chatId,
+              salesTurn.directive
+            );
+          }
+          await this.markInboundCompleted(incomingMessage.id);
+
+          // Everything below is useful but non-critical. Failure or process exit
+          // here must not make the customer receive the same reply twice.
           this.webSocketService.sendMessageSent(botMessage);
           this.sharhSyncService?.enqueueMessage(
             chatId,
@@ -825,12 +1025,6 @@ export class ChatbotService {
             },
             botMessage.id
           );
-          if (salesTurn && directiveDelivered) {
-            this.leadCaptureService?.confirmDirectiveSent(
-              chatId,
-              salesTurn.directive
-            );
-          }
 
           logger.info('Response sent successfully', {
             to: replyTarget,
@@ -845,8 +1039,11 @@ export class ChatbotService {
             error: sendResult.error || 'Unknown send failure',
           });
         }
+      } else if (result.success) {
+        // A successful turn with intentionally no outbound text is complete.
+        await this.markInboundCompleted(incomingMessage.id);
       } else {
-        logger.error('Message processing failed', { error: result.error });
+        logger.error('Message processing failed; inbound message remains pending for retry', { error: result.error });
         this.webSocketService.sendError({
           message: 'Failed to process message',
           error: result.error,
@@ -856,7 +1053,7 @@ export class ChatbotService {
       const processingTime = Date.now() - startTime;
       logger.info('Message processing completed', { processingTime });
     } catch (error) {
-      logger.error('Error processing message', {
+      logger.error('Error processing message; inbound message remains pending for retry', {
         chatId,
         inboundMessageId: incomingMessage.id,
         error: error instanceof Error ? error.message : 'Unknown error',
@@ -926,6 +1123,48 @@ export class ChatbotService {
     }
   }
 
+  private buildMediaOnlyResponse(
+    type: WhatsAppMessage['type'],
+    language: 'en' | 'ru' | 'ar'
+  ): string {
+    if (language === 'ru') {
+      if (type === 'audio') {
+        return 'Получил голосовое. Чтобы не ошибиться в цифрах или деталях, напишите ключевую информацию одним коротким сообщением.';
+      }
+      if (type === 'location') {
+        return 'Получил геолокацию. Напишите, пожалуйста, эмират или район текстом, чтобы я сохранил его правильно.';
+      }
+      if (type === 'sticker') {
+        return 'Вижу стикер. Чтобы я точно понял ответ, напишите его одним коротким сообщением.';
+      }
+      return 'Получил файл. Если в нём есть важная для заявки информация, напишите ключевую деталь текстом.';
+    }
+
+    if (language === 'ar') {
+      if (type === 'audio') {
+        return 'وصلتني الرسالة الصوتية. لتجنب الخطأ في الأرقام أو التفاصيل، اكتب المعلومة الأساسية في رسالة قصيرة.';
+      }
+      if (type === 'location') {
+        return 'وصلني الموقع. اكتب اسم الإمارة أو المنطقة نصاً حتى أسجلها بشكل صحيح.';
+      }
+      if (type === 'sticker') {
+        return 'وصلني الملصق. حتى أفهم ردك بدقة، اكتبه في رسالة قصيرة.';
+      }
+      return 'وصلني الملف. إذا كان يحتوي على معلومة مهمة للطلب، اكتب المعلومة الأساسية نصاً.';
+    }
+
+    if (type === 'audio') {
+      return 'I received the voice note. To avoid getting a figure or detail wrong, please type the key point in one short message.';
+    }
+    if (type === 'location') {
+      return 'I received the location. Please type the emirate or area name so I can save it correctly.';
+    }
+    if (type === 'sticker') {
+      return 'I can see the sticker. To make sure I understand your answer, please type it in one short message.';
+    }
+    return 'I received it. If it contains an important detail for your request, please send that key detail as text.';
+  }
+
   /**
    * Utility function to add delay
    */
@@ -937,7 +1176,67 @@ export class ChatbotService {
    * Resolve chat id used for history and queueing
    */
   private getChatId(message: WhatsAppMessage): string {
-    return message.groupId || message.to;
+    if (message.groupId) return message.groupId;
+
+    const candidates = Array.from(
+      new Set(
+        [message.to, message.from, ...(message.identityAliases || [])].filter(
+          value => this.isDirectChatIdentity(value)
+        )
+      )
+    );
+
+    // Reuse any identity mapping already learned. This prevents one person from
+    // becoming two conversations if WhatsApp alternates between a phone JID and
+    // a Linked Identity JID across reconnects.
+    for (const candidate of candidates) {
+      const known = this.chatIdentityAliases.get(candidate);
+      if (known) {
+        this.rememberChatIdentityAliases(candidates, known);
+        return known;
+      }
+    }
+
+    // If this chat already existed before alternate identifiers became
+    // available, keep its established key rather than creating a second state.
+    const existingChats = new Set(this.chatHistoryService.getAllChatIds());
+    const existing = candidates.find(candidate => existingChats.has(candidate));
+    if (existing) {
+      this.rememberChatIdentityAliases(candidates, existing);
+      return existing;
+    }
+
+    // The actual incoming direct-chat JID is the safest new canonical key.
+    // It is also the exact destination Baileys expects for the reply.
+    const canonical = message.to;
+    this.rememberChatIdentityAliases(candidates, canonical);
+    return canonical;
+  }
+
+  private isDirectChatIdentity(value: string | undefined): value is string {
+    return Boolean(
+      value &&
+        (value.endsWith('@s.whatsapp.net') ||
+          value.endsWith('@lid') ||
+          value.endsWith('@hosted') ||
+          value.endsWith('@hosted.lid'))
+    );
+  }
+
+  private rememberChatIdentityAliases(
+    aliases: string[],
+    canonical: string
+  ): void {
+    if (!this.isDirectChatIdentity(canonical)) return;
+    for (const alias of aliases) {
+      if (!this.isDirectChatIdentity(alias)) continue;
+      this.chatIdentityAliases.set(alias, canonical);
+      this.persistence?.setItem(
+        CHAT_IDENTITY_ALIAS_NAMESPACE,
+        alias,
+        canonical
+      );
+    }
   }
 
   /**
@@ -1993,6 +2292,15 @@ export class ChatbotService {
       }
     }
 
+    if (rows.length === 0 && this.sharhApiService.getRuntimeStatus().reachable === false) {
+      const unavailable = record.language === 'ru'
+        ? 'Критерии сохранены, но список опубликованных предложений сейчас временно недоступен. Я не буду выдавать это за отсутствие совпадений — попробуйте ещё раз через минуту или продолжите уточнять критерии.'
+        : record.language === 'ar'
+          ? 'تم حفظ المعايير، لكن خدمة الإعلانات المنشورة غير متاحة مؤقتاً. لن أتعامل مع ذلك على أنه عدم وجود مطابقات — حاول مرة أخرى بعد قليل أو واصل تعديل المعايير.'
+          : 'Your criteria are saved, but published listings are temporarily unavailable. I will not treat that as “no matches.” Try again shortly or keep refining the criteria.';
+      return unavailable;
+    }
+
     this.buyerMatchFingerprints.set(chatId, fingerprint);
     this.persistence?.setItem(BUYER_MATCHES_NAMESPACE, chatId, fingerprint);
 
@@ -2973,6 +3281,10 @@ export class ChatbotService {
       if (this.adminOutboxTimer) {
         clearInterval(this.adminOutboxTimer);
         this.adminOutboxTimer = null;
+      }
+      if (this.pendingInboundRetryTimer) {
+        clearInterval(this.pendingInboundRetryTimer);
+        this.pendingInboundRetryTimer = null;
       }
       this.sharhSyncService?.stop();
       await this.sharhSyncService?.flush();

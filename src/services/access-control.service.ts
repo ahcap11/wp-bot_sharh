@@ -66,6 +66,24 @@ export class AccessControlService {
   }
 
   /**
+   * Milliseconds until this sender can enter the sliding window again.
+   * Used by the funnel to *delay* excess messages rather than silently lose
+   * customer data. AI/cost controls remain a separate protection layer.
+   */
+  retryAfterMs(senderJid: string, now: number = Date.now()): number {
+    if (!this.config.rateLimitEnabled) return 0;
+    const key = this.normalize(senderJid) || senderJid;
+    const windowStart = now - this.config.rateLimitWindowMs;
+    const recent = (this.hits.get(key) || [])
+      .filter(timestamp => timestamp > windowStart)
+      .sort((a, b) => a - b);
+    if (recent.length < this.config.rateLimitMaxMessages) return 0;
+    const oldest = recent[0];
+    if (oldest === undefined) return 0;
+    return Math.max(1, oldest + this.config.rateLimitWindowMs - now + 1);
+  }
+
+  /**
    * Combined gate used by the message pipeline.
    */
   evaluate(senderJid: string): { allowed: boolean; reason?: string } {
@@ -79,7 +97,11 @@ export class AccessControlService {
   }
 
   private normalize(value: string): string {
+    // Multi-device JIDs can include a device suffix such as
+    // 971501234567:2@s.whatsapp.net. The suffix is not part of the phone
+    // identity and must never be folded into an allowlist/rate-limit key.
     const localPart = value.split('@')[0] || '';
-    return localPart.replace(/\D/g, '');
+    const identityPart = localPart.split(':')[0] || '';
+    return identityPart.replace(/\D/g, '');
   }
 }

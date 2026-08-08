@@ -36,6 +36,8 @@ export class WhatsAppService implements MessagingTransport {
   private generation = 0;
   private stopping = false;
   private recoveryPromise: Promise<void> | null = null;
+  private readonly messageCache: Map<string, proto.IMessage> = new Map();
+  private readonly maxMessageCacheEntries = 500;
 
   constructor(private readonly config: MessagingConfig) {
     logger.info('Baileys WhatsApp service initialized', {
@@ -85,6 +87,11 @@ export class WhatsAppService implements MessagingTransport {
         defaultQueryTimeoutMs: 30000,
         keepAliveIntervalMs: 25000,
         retryRequestDelayMs: 500,
+        // Baileys can ask for the original message while recovering encryption
+        // state or retrying delivery. Keeping a small in-memory cache prevents a
+        // retry request from turning into another silent send failure.
+        getMessage: async (key: { remoteJid?: string | null; id?: string | null }) =>
+          this.getCachedMessage(key.remoteJid || '', key.id || ''),
       });
       this.sock = sock;
 
@@ -104,7 +111,7 @@ export class WhatsAppService implements MessagingTransport {
         }
       });
 
-      sock.ev.on('messages.upsert', upsert => {
+      sock.ev.on('messages.upsert', async upsert => {
         if (!this.isCurrentConnection(generation, sock)) return;
         if (upsert.type !== 'notify') {
           logger.debug('Ignoring non-live Baileys message batch', {
@@ -117,7 +124,7 @@ export class WhatsAppService implements MessagingTransport {
         for (const msg of upsert.messages) {
           if (!msg || msg.key.fromMe || !msg.message) continue;
 
-          const routing = this.resolveMessageRouting(msg);
+          const routing = await this.resolveMessageRouting(msg);
           if (!routing || !this.isSupportedRemoteJid(routing.replyJid)) {
             logger.warn('Ignoring Baileys message with unsupported sender JID', {
               remoteJid: msg.key.remoteJid || null,
@@ -127,6 +134,7 @@ export class WhatsAppService implements MessagingTransport {
             continue;
           }
 
+          this.cacheMessage(msg);
           const whatsappMessage = this.parseMessage(msg, routing);
           if (!whatsappMessage) {
             logger.warn('Ignoring unsupported or empty Baileys message', {
@@ -165,6 +173,14 @@ export class WhatsAppService implements MessagingTransport {
   private async resolveProtocolVersion(): Promise<
     [number, number, number] | undefined
   > {
+    // Baileys' bundled protocol version is the stable default. Looking up the
+    // latest WhatsApp Web version on every boot adds an unnecessary external
+    // dependency and can pair an older Baileys build with a newer protocol.
+    // Keep live lookup as an explicit diagnostic escape hatch only.
+    if (process.env['BAILEYS_FETCH_LATEST_VERSION'] !== 'true') {
+      return undefined;
+    }
+
     let timeout: NodeJS.Timeout | null = null;
     try {
       const latest = await Promise.race([
@@ -177,7 +193,7 @@ export class WhatsAppService implements MessagingTransport {
           timeout.unref?.();
         }),
       ]);
-      logger.info('Using WhatsApp Web protocol version', {
+      logger.warn('Using explicitly requested live WhatsApp Web protocol version', {
         version: latest.version,
         isLatest: latest.isLatest,
       });
@@ -329,11 +345,15 @@ export class WhatsAppService implements MessagingTransport {
       };
     }
 
-    const bubbles = message
-      .split(/\n?\s*---\s*\n?/g)
-      .map(part => part.trim())
-      .filter(Boolean);
-    const outgoing = bubbles.length > 0 ? bubbles : [message];
+    // Keep each logical reply atomic. Splitting one reply into several provider
+    // sends creates a retry trap: an early chunk may be delivered before a later
+    // chunk fails, then socket recovery would resend the entire reply and
+    // duplicate the earlier chunk. Funnel replies are intentionally concise, so
+    // one provider send is both simpler for the customer and safer to retry.
+    const outgoing = [message.trim()].filter(Boolean);
+    if (outgoing.length === 0) {
+      return { success: true, providerMessageIds: [] };
+    }
     const providerMessageIds: string[] = [];
 
     try {
@@ -349,12 +369,13 @@ export class WhatsAppService implements MessagingTransport {
           // Presence is best-effort and must never block the actual reply.
         }
         await this.delay(Math.min(1200, 300 + text.length * 12));
-        const sent = await this.withTimeout(
+        const sent = (await this.withTimeout(
           sock.sendMessage(chatId, { text }),
           35000,
           'WhatsApp send timed out'
-        );
+        )) as proto.IWebMessageInfo | undefined;
         if (sent?.key?.id) providerMessageIds.push(sent.key.id);
+        if (sent) this.cacheMessage(sent);
         if (i < outgoing.length - 1) await this.delay(400);
       }
       try {
@@ -456,14 +477,48 @@ export class WhatsAppService implements MessagingTransport {
     }
   }
 
+  private messageCacheKey(remoteJid: string, messageId: string): string {
+    return `${remoteJid}:${messageId}`;
+  }
+
+  private cacheMessage(message: proto.IWebMessageInfo): void {
+    const remoteJid = message.key.remoteJid || '';
+    const messageId = message.key.id || '';
+    if (!remoteJid || !messageId || !message.message) return;
+    this.messageCache.set(
+      this.messageCacheKey(remoteJid, messageId),
+      message.message
+    );
+    while (this.messageCache.size > this.maxMessageCacheEntries) {
+      const oldest = this.messageCache.keys().next().value;
+      if (!oldest) break;
+      this.messageCache.delete(oldest);
+    }
+  }
+
+  private async getCachedMessage(
+    remoteJid: string,
+    messageId: string
+  ): Promise<proto.IMessage | undefined> {
+    return this.messageCache.get(this.messageCacheKey(remoteJid, messageId));
+  }
+
   private parseMessage(
     msg: proto.IWebMessageInfo,
-    routing: { identityJid: string; replyJid: string; isGroup: boolean }
+    routing: {
+      identityJid: string;
+      replyJid: string;
+      isGroup: boolean;
+      identityAliases: string[];
+    }
   ): WhatsAppMessage | null {
     try {
       const unwrapped = this.unwrapMessage(msg.message || undefined);
       const messageType = this.getMessageType(unwrapped);
-      const content = this.extractMessageContent(unwrapped);
+      const extractedContent = this.extractMessageContent(unwrapped);
+      const mediaOnly = !extractedContent && messageType !== 'text';
+      const content =
+        extractedContent || (mediaOnly ? this.mediaOnlyLabel(messageType) : null);
       if (!content) return null;
 
       return {
@@ -475,6 +530,10 @@ export class WhatsAppService implements MessagingTransport {
         content,
         isGroup: routing.isGroup,
         ...(routing.isGroup ? { groupId: routing.replyJid } : {}),
+        ...(routing.identityAliases.length
+          ? { identityAliases: routing.identityAliases }
+          : {}),
+        ...(mediaOnly ? { mediaOnly: true } : {}),
         ...(msg.pushName ? { senderName: msg.pushName } : {}),
         isFromBot: false,
       };
@@ -486,9 +545,14 @@ export class WhatsAppService implements MessagingTransport {
     }
   }
 
-  private resolveMessageRouting(
+  private async resolveMessageRouting(
     msg: proto.IWebMessageInfo
-  ): { identityJid: string; replyJid: string; isGroup: boolean } | null {
+  ): Promise<{
+    identityJid: string;
+    replyJid: string;
+    isGroup: boolean;
+    identityAliases: string[];
+  } | null> {
     const remoteJid = msg.key.remoteJid || '';
     if (!remoteJid) return null;
 
@@ -501,26 +565,118 @@ export class WhatsAppService implements MessagingTransport {
           this.getKeyString(msg, 'senderPn'),
           msg.key.participant || ''
         ) || msg.key.participant || remoteJid;
-      return { identityJid: participant, replyJid: remoteJid, isGroup: true };
+      return {
+        identityJid: participant,
+        replyJid: remoteJid,
+        isGroup: true,
+        identityAliases: [],
+      };
     }
 
     // Recent WhatsApp/Baileys sessions may deliver private messages using a
     // Linked Identity JID (@lid). Keep the actual incoming conversation JID as
     // the reply target, but use a phone-number JID for CRM identity when the
     // alternate PN fields are present.
-    const phoneJid = this.firstPhoneJid(
+    const alternateJids = [
       this.getKeyString(msg, 'remoteJidAlt'),
       this.getKeyString(msg, 'senderPn'),
       this.getKeyString(msg, 'participantPn'),
       this.getKeyString(msg, 'participantAlt'),
-      remoteJid
+    ]
+      .map(value => this.normalizeDirectIdentityJid(value))
+      .filter((value): value is string => Boolean(value));
+    let phoneJid = this.firstPhoneJid(...alternateJids, remoteJid);
+
+    // LID deliberately hides the phone number. If the current message does not
+    // include the alternate PN, make one cheap lookup in Baileys' *local learned
+    // mapping* before showing the CRM as phone-unknown. This never guesses a
+    // number and does not add a question to the customer funnel.
+    if (!phoneJid && this.isLidIdentityJid(remoteJid)) {
+      phoneJid = await this.resolveLearnedPhoneJid(remoteJid);
+    }
+
+    const identityAliases = Array.from(
+      new Set(
+        [remoteJid, this.normalizeDirectIdentityJid(remoteJid) || '', phoneJid || '', ...alternateJids]
+          .filter(Boolean)
+      )
     );
 
     return {
-      identityJid: phoneJid || remoteJid,
+      identityJid: phoneJid || this.normalizeDirectIdentityJid(remoteJid) || remoteJid,
       replyJid: remoteJid,
       isGroup: false,
+      identityAliases,
     };
+  }
+
+  private isLidIdentityJid(value: string): boolean {
+    const normalized = this.normalizeDirectIdentityJid(value);
+    return Boolean(normalized && (normalized.endsWith('@lid') || normalized.endsWith('@hosted.lid')));
+  }
+
+  private isPhoneIdentityJid(value: string): boolean {
+    const normalized = this.normalizeDirectIdentityJid(value);
+    return Boolean(normalized && (normalized.endsWith('@s.whatsapp.net') || normalized.endsWith('@hosted')));
+  }
+
+  private normalizeDirectIdentityJid(value: string): string | null {
+    const trimmed = value.trim();
+    const at = trimmed.lastIndexOf('@');
+    if (at <= 0 || at === trimmed.length - 1) return null;
+    const server = trimmed.slice(at + 1).toLowerCase();
+    if (!['s.whatsapp.net', 'lid', 'hosted', 'hosted.lid'].includes(server)) return null;
+    const userWithDevice = trimmed.slice(0, at);
+    const user = userWithDevice.split(':', 1)[0]?.trim() || '';
+    if (!user) return null;
+    return `${user}@${server}`;
+  }
+
+  private async resolveLearnedPhoneJid(lidJid: string): Promise<string | null> {
+    const normalizedLid = this.normalizeDirectIdentityJid(lidJid);
+    if (!normalizedLid) return null;
+    try {
+      const repository = (this.sock as unknown as {
+        signalRepository?: {
+          lidMapping?: {
+            getPNForLID?: (jid: string) => Promise<string | null | undefined> | string | null | undefined;
+          };
+        };
+      } | null)?.signalRepository?.lidMapping;
+      if (typeof repository?.getPNForLID !== 'function') return null;
+      const raw = await this.withTimeout(
+        Promise.resolve(repository.getPNForLID(normalizedLid)),
+        750,
+        'LID-to-PN lookup timed out'
+      );
+      if (!raw || !this.isPhoneIdentityJid(raw)) return null;
+      return this.normalizeDirectIdentityJid(raw);
+    } catch {
+      // Reverse LID->PN is best-effort and only works when Baileys has already
+      // learned the mapping. Missing phone information must never block a reply.
+      return null;
+    }
+  }
+
+  private mediaOnlyLabel(type: WhatsAppMessage['type']): string {
+    switch (type) {
+      case 'audio':
+        return '[Voice message]';
+      case 'image':
+        return '[Image]';
+      case 'video':
+        return '[Video]';
+      case 'document':
+        return '[Document]';
+      case 'location':
+        return '[Location shared]';
+      case 'contact':
+        return '[Contact shared]';
+      case 'sticker':
+        return '[Sticker]';
+      default:
+        return '[WhatsApp message]';
+    }
   }
 
   private getKeyString(
@@ -538,7 +694,8 @@ export class WhatsAppService implements MessagingTransport {
 
   private firstPhoneJid(...values: string[]): string | null {
     for (const value of values) {
-      if (value.endsWith('@s.whatsapp.net')) return value;
+      const normalized = this.normalizeDirectIdentityJid(value);
+      if (normalized && this.isPhoneIdentityJid(normalized)) return normalized;
     }
     return null;
   }
@@ -593,6 +750,42 @@ export class WhatsAppService implements MessagingTransport {
       return message.listResponseMessage.title;
     if (message.templateButtonReplyMessage?.selectedDisplayText)
       return message.templateButtonReplyMessage.selectedDisplayText;
+
+    // Reactions are real user input. In particular, users often react with 👍
+    // to accept terms instead of sending a separate "yes" message. Treat the
+    // reaction emoji as text so the normal funnel parser can handle it.
+    const dynamic = message as unknown as Record<string, unknown>;
+    const reaction = dynamic['reactionMessage'] as
+      | { text?: string | null }
+      | undefined;
+    if (reaction?.text) return reaction.text;
+
+    // Newer WhatsApp interactive/native-flow replies are not represented by the
+    // older button/list fields above. Read their visible body first, then a
+    // conservative set of common JSON fields. This keeps quick-reply UX from
+    // silently disappearing when WhatsApp changes the envelope type.
+    const interactive = dynamic['interactiveResponseMessage'] as
+      | {
+          body?: { text?: string | null } | null;
+          nativeFlowResponseMessage?: { paramsJson?: string | null } | null;
+        }
+      | undefined;
+    if (interactive?.body?.text) return interactive.body.text;
+    const paramsJson = interactive?.nativeFlowResponseMessage?.paramsJson;
+    if (paramsJson) {
+      try {
+        const parsed = JSON.parse(paramsJson) as Record<string, unknown>;
+        for (const key of ['title', 'display_text', 'selectedDisplayText', 'id']) {
+          const candidate = parsed[key];
+          if (typeof candidate === 'string' && candidate.trim()) {
+            return candidate.trim();
+          }
+        }
+      } catch {
+        // Ignore malformed provider metadata; unsupported content receives the
+        // normal fallback below rather than crashing message ingestion.
+      }
+    }
     return null;
   }
 
@@ -605,7 +798,9 @@ export class WhatsAppService implements MessagingTransport {
       message.extendedTextMessage ||
       message.buttonsResponseMessage ||
       message.listResponseMessage ||
-      message.templateButtonReplyMessage
+      message.templateButtonReplyMessage ||
+      (message as unknown as Record<string, unknown>)['reactionMessage'] ||
+      (message as unknown as Record<string, unknown>)['interactiveResponseMessage']
     )
       return 'text';
     if (message.imageMessage) return 'image';
@@ -614,6 +809,7 @@ export class WhatsAppService implements MessagingTransport {
     if (message.documentMessage) return 'document';
     if (message.locationMessage) return 'location';
     if (message.contactMessage || message.contactsArrayMessage) return 'contact';
+    if (message.stickerMessage) return 'sticker';
     return 'text';
   }
 
@@ -749,6 +945,8 @@ export class WhatsAppService implements MessagingTransport {
     return (
       remoteJid.endsWith('@s.whatsapp.net') ||
       remoteJid.endsWith('@lid') ||
+      remoteJid.endsWith('@hosted') ||
+      remoteJid.endsWith('@hosted.lid') ||
       remoteJid.endsWith('@g.us')
     );
   }

@@ -77,6 +77,7 @@ export class SharhApiService {
   private readonly config: SharhApiConfig;
   private readonly buyerCriteria = new BuyerCriteriaService();
   private readonly contextCache: Map<string, CachedContext> = new Map();
+  private readonly conversationControlCache = new Map<string, SharhConversationControl>();
   private reachable: boolean | null = null;
   private lastSuccessAt?: string | undefined;
   private lastFailureAt?: string | undefined;
@@ -510,9 +511,13 @@ export class SharhApiService {
       `/api/v1/bot/conversations/context?${params.toString()}`
     );
     if (!result.ok || !this.isRecord(result.data)) {
-      return null;
+      // API downtime must not erase a previously learned human takeover. A
+      // stale human/pause decision is safer than letting the bot talk over an
+      // administrator just because the control endpoint is temporarily down.
+      return this.conversationControlCache.get(externalChatId) || null;
     }
     if (result.data['found'] !== true) {
+      this.conversationControlCache.delete(externalChatId);
       return {
         found: false,
         botEnabled: true,
@@ -550,7 +555,7 @@ export class SharhApiService {
           .filter(Boolean)
           .slice(-5)
       : [];
-    return {
+    const resolved: SharhConversationControl = {
       found: true,
       botEnabled,
       owner,
@@ -564,6 +569,8 @@ export class SharhApiService {
       adminGuidance,
       recentHumanMessages,
     };
+    this.conversationControlCache.set(externalChatId, resolved);
+    return resolved;
   }
 
   async getConversationContext(

@@ -13,12 +13,17 @@ export interface WhatsAppMessage {
     | 'audio'
     | 'document'
     | 'location'
-    | 'contact';
+    | 'contact'
+    | 'sticker';
   content: string;
   isGroup: boolean;
   groupId?: string | undefined;
   senderName?: string | undefined;
   isFromBot?: boolean | undefined;
+  /** Alternate WhatsApp identities exposed by the transport (for example PN ↔ LID). */
+  identityAliases?: string[] | undefined;
+  /** True when the message contains media but no usable text/caption. */
+  mediaOnly?: boolean | undefined;
 }
 
 /**

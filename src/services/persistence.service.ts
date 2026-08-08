@@ -17,8 +17,11 @@ export class PersistenceService {
   private readonly filePath: string;
   private readonly saveDebounceMs: number;
   private saveTimer: NodeJS.Timeout | null = null;
-  private writing: boolean = false;
-  private pendingWrite: boolean = false;
+  // Serialize writes through one promise chain. A caller awaiting flush() must
+  // not return merely because another write is already in flight; otherwise a
+  // crash can still lose the inbound/pending marker that the caller believed
+  // was durable.
+  private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(filePath: string, saveDebounceMs: number = 1000) {
     this.filePath = filePath;
@@ -87,7 +90,12 @@ export class PersistenceService {
     }
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
-      void this.flush();
+      void this.flush().catch(error => {
+        logger.error('Scheduled persistence flush failed', {
+          filePath: this.filePath,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
+      });
     }, this.saveDebounceMs);
     // Do not let a pending save keep the process alive on shutdown.
     this.saveTimer.unref();
@@ -102,30 +110,30 @@ export class PersistenceService {
       this.saveTimer = null;
     }
 
-    if (this.writing) {
-      // A write is already in flight; mark that another is needed afterwards.
-      this.pendingWrite = true;
-      return;
-    }
-
-    this.writing = true;
-    try {
-      const dir = path.dirname(this.filePath);
-      await fs.promises.mkdir(dir, { recursive: true });
-      const tempPath = `${this.filePath}.tmp`;
-      await fs.promises.writeFile(tempPath, JSON.stringify(this.data), 'utf8');
-      await fs.promises.rename(tempPath, this.filePath);
-    } catch (error) {
-      logger.error('Failed to persist state to disk', {
-        filePath: this.filePath,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      });
-    } finally {
-      this.writing = false;
-      if (this.pendingWrite) {
-        this.pendingWrite = false;
-        await this.flush();
+    // Queue a real snapshot write behind any existing one and await this exact
+    // write. This deliberately favors correctness over micro-optimizing a tiny
+    // pilot-scale JSON file.
+    const write = async (): Promise<void> => {
+      try {
+        const dir = path.dirname(this.filePath);
+        await fs.promises.mkdir(dir, { recursive: true });
+        const tempPath = `${this.filePath}.tmp`;
+        await fs.promises.writeFile(tempPath, JSON.stringify(this.data), 'utf8');
+        await fs.promises.rename(tempPath, this.filePath);
+      } catch (error) {
+        logger.error('Failed to persist state to disk', {
+          filePath: this.filePath,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
+        // Durability is part of the message-processing contract. Never tell a
+        // caller that its pending/completion marker was committed when the disk
+        // write actually failed.
+        throw error;
       }
-    }
+    };
+
+    this.writeQueue = this.writeQueue.then(write, write);
+    await this.writeQueue;
   }
+
 }
