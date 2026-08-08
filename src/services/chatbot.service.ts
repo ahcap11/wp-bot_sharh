@@ -700,7 +700,12 @@ export class ChatbotService {
             responseLength: outboundResponse.length,
           });
         } else {
-          logger.error('Failed to send WhatsApp response');
+          logger.error('Failed to send WhatsApp response', {
+            chatId,
+            inboundMessageId: incomingMessage.id,
+            replyTarget,
+            error: sendResult.error || 'Unknown send failure',
+          });
         }
       } else {
         logger.error('Message processing failed', { error: result.error });
@@ -714,6 +719,8 @@ export class ChatbotService {
       logger.info('Message processing completed', { processingTime });
     } catch (error) {
       logger.error('Error processing message', {
+        chatId,
+        inboundMessageId: incomingMessage.id,
         error: error instanceof Error ? error.message : 'Unknown error',
       });
       this.webSocketService.sendError({

@@ -140,6 +140,23 @@ describe('conversation navigation and seller terms', () => {
     expect(record?.annualRevenueAed).toBe('');
   });
 
+  it('parses a USD seller price range and still returns the review-ready reply', () => {
+    turn('sell');
+    turn('yes');
+    turn('Hamriyah Free Zone oil n gas last yr turnover over 40M aed');
+    turn('Sharjah');
+
+    service.updateFromMessage(chatId, message(`m-${++sequence}`, '10M to 20M USD $'));
+    const record = service.getCurrentRecord(chatId);
+    const directive = service.getDirective(chatId);
+
+    expect(record?.desiredSellingPriceAed).toContain('36,725,000');
+    expect(record?.desiredSellingPriceAed).toContain('73,450,000');
+    expect(record?.status).toBe('qualified');
+    expect(directive.shouldRespond).toBe(true);
+    expect(directive.directResponse).toContain('initial SHARH review');
+  });
+
   it('asks for the client name only when submitting for review', () => {
     turn('sell');
     turn('yes');

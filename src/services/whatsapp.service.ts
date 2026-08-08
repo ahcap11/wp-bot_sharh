@@ -35,6 +35,7 @@ export class WhatsAppService implements MessagingTransport {
   private reconnectAttempt = 0;
   private generation = 0;
   private stopping = false;
+  private recoveryPromise: Promise<void> | null = null;
 
   constructor(private readonly config: MessagingConfig) {
     logger.info('Baileys WhatsApp service initialized', {
@@ -77,6 +78,13 @@ export class WhatsAppService implements MessagingTransport {
         browser: Browsers.ubuntu('Chrome'),
         syncFullHistory: false,
         markOnlineOnConnect: false,
+        // Baileys can otherwise leave an internal query unresolved indefinitely,
+        // which makes a socket look connected while sendMessage never returns.
+        // Keep these explicit instead of relying on version-specific defaults.
+        connectTimeoutMs: 30000,
+        defaultQueryTimeoutMs: 30000,
+        keepAliveIntervalMs: 25000,
+        retryRequestDelayMs: 500,
       });
       this.sock = sock;
 
@@ -285,9 +293,35 @@ export class WhatsAppService implements MessagingTransport {
     chatId: string,
     message: string
   ): Promise<MessagingSendResult> {
+    const first = await this.sendMessageAttempt(chatId, message);
+    if (first.success || this.stopping) return first;
+
+    // A Baileys socket can remain marked READY even when its internal query
+    // path is stuck. Recycle it once and retry the reply instead of silently
+    // losing the customer's message.
+    logger.warn('Recovering WhatsApp socket after send failure', {
+      chatId,
+      error: first.error || 'unknown send failure',
+    });
+    const recovered = await this.recoverConnection('send failure');
+    if (!recovered) return first;
+
+    const retry = await this.sendMessageAttempt(chatId, message);
+    if (!retry.success) {
+      logger.error('WhatsApp reply failed after socket recovery', {
+        chatId,
+        error: retry.error || 'unknown send failure',
+      });
+    }
+    return retry;
+  }
+
+  private async sendMessageAttempt(
+    chatId: string,
+    message: string
+  ): Promise<MessagingSendResult> {
     const sock = this.sock;
     if (!sock || this.connectionStatus !== ConnectionStatus.READY) {
-      logger.error('WhatsApp is not connected');
       return {
         success: false,
         providerMessageIds: [],
@@ -306,19 +340,31 @@ export class WhatsAppService implements MessagingTransport {
       for (let i = 0; i < outgoing.length; i++) {
         const text = outgoing[i] as string;
         try {
-          await sock.sendPresenceUpdate('composing', chatId);
+          await this.withTimeout(
+            sock.sendPresenceUpdate('composing', chatId),
+            5000,
+            'WhatsApp presence update timed out'
+          );
         } catch {
-          // Presence is best-effort.
+          // Presence is best-effort and must never block the actual reply.
         }
         await this.delay(Math.min(1200, 300 + text.length * 12));
-        const sent = await sock.sendMessage(chatId, { text });
+        const sent = await this.withTimeout(
+          sock.sendMessage(chatId, { text }),
+          35000,
+          'WhatsApp send timed out'
+        );
         if (sent?.key?.id) providerMessageIds.push(sent.key.id);
         if (i < outgoing.length - 1) await this.delay(400);
       }
       try {
-        await sock.sendPresenceUpdate('paused', chatId);
+        await this.withTimeout(
+          sock.sendPresenceUpdate('paused', chatId),
+          5000,
+          'WhatsApp presence update timed out'
+        );
       } catch {
-        // Presence is best-effort.
+        // Presence is best-effort and must never block completion.
       }
       logger.info('Message sent successfully', {
         chatId,
@@ -331,6 +377,82 @@ export class WhatsAppService implements MessagingTransport {
       const detail = error instanceof Error ? error.message : 'Unknown error';
       logger.error('Failed to send message', { chatId, error: detail });
       return { success: false, providerMessageIds, error: detail };
+    }
+  }
+
+  private async recoverConnection(reason: string): Promise<boolean> {
+    if (this.stopping) return false;
+    if (this.recoveryPromise) {
+      await this.recoveryPromise;
+      return this.connectionStatus === ConnectionStatus.READY;
+    }
+
+    this.recoveryPromise = (async () => {
+      this.clearReconnectTimer();
+      const oldSock = this.sock;
+      this.sock = null;
+      this.generation += 1;
+      this.updateConnectionStatus(ConnectionStatus.CONNECTING);
+
+      if (oldSock) {
+        try {
+          const closeable = oldSock as unknown as {
+            end?: (error?: Error) => void;
+            ws?: { close?: () => void };
+          };
+          if (typeof closeable.end === 'function') {
+            closeable.end(new Error(`Transport recovery: ${reason}`));
+          } else {
+            closeable.ws?.close?.();
+          }
+        } catch (error) {
+          logger.warn('Error while recycling Baileys socket', {
+            error: error instanceof Error ? error.message : 'Unknown error',
+          });
+        }
+      }
+
+      await this.openConnection();
+      await this.waitForReady(20000);
+    })().finally(() => {
+      this.recoveryPromise = null;
+    });
+
+    try {
+      await this.recoveryPromise;
+    } catch (error) {
+      logger.error('WhatsApp socket recovery failed', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+    return this.connectionStatus === ConnectionStatus.READY;
+  }
+
+  private async waitForReady(timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!this.stopping && Date.now() < deadline) {
+      if (this.connectionStatus === ConnectionStatus.READY && this.sock) return;
+      await this.delay(250);
+    }
+    throw new Error(`WhatsApp did not become ready within ${timeoutMs}ms`);
+  }
+
+  private async withTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    message: string
+  ): Promise<T> {
+    let timer: NodeJS.Timeout | null = null;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 

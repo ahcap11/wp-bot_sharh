@@ -3833,15 +3833,30 @@ export class LeadCaptureService {
   private extractMoneyExpression(value: string): string | null {
     if (this.isExplicitUnknown(value)) return 'Unknown / to confirm';
 
+    const explicitlyAed = /\b(?:aed|dhs?|dirhams?)\b/i.test(value) || /(?:дирхам|درهم)/iu.test(value);
+    const nonAedCurrency = this.detectNonAedCurrency(value);
+    // USD/AED is a fixed peg, so accepting a USD asking price does not require
+    // another user step. Other currencies stay unconverted rather than silently
+    // inventing an exchange rate.
+    if (nonAedCurrency && nonAedCurrency !== 'USD' && !explicitlyAed) {
+      return null;
+    }
+    const toAed = nonAedCurrency === 'USD' && !explicitlyAed ? 3.6725 : 1;
+    const convert = (amount: number | null): number | null =>
+      amount === null ? null : Math.round(amount * toAed);
+
     const rangeMatch = value.match(
-      /(\d+(?:[.,]\d+)?)\s*(?:-|–|to|до|إلى)\s*(\d+(?:[.,]\d+)?)\s*(m|mn|mln|million|k|thousand|млн|тыс|مليون|ألف)?/iu
+      /(?:\b(?:aed|dhs?|dirhams?|usd|us\s*dollars?)\b|\$)?\s*(\d+(?:[.,]\d+)?)\s*(m|mn|mln|million|k|thousand|млн|тыс|مليون|ألف)?\s*(?:-|–|—|to|до|إلى)\s*(?:\b(?:aed|dhs?|dirhams?|usd|us\s*dollars?)\b|\$)?\s*(\d+(?:[.,]\d+)?)\s*(m|mn|mln|million|k|thousand|млн|тыс|مليون|ألف)?/iu
     );
-    if (rangeMatch?.[1] && rangeMatch[2]) {
-      const unit = rangeMatch[3] || '';
-      const first = this.scaleMoneyNumber(rangeMatch[1], unit);
-      const second = this.scaleMoneyNumber(rangeMatch[2], unit);
+    if (rangeMatch?.[1] && rangeMatch[3]) {
+      const rightUnit = rangeMatch[4] || '';
+      const leftUnit = rangeMatch[2] || rightUnit;
+      const first = convert(this.scaleMoneyNumber(rangeMatch[1], leftUnit));
+      const second = convert(this.scaleMoneyNumber(rangeMatch[3], rightUnit));
       if (first && second) {
-        return `AED ${first.toLocaleString('en-US')}–${second.toLocaleString('en-US')}`;
+        const low = Math.min(first, second);
+        const high = Math.max(first, second);
+        return `AED ${low.toLocaleString('en-US')}–${high.toLocaleString('en-US')}`;
       }
     }
 
@@ -3865,24 +3880,26 @@ export class LeadCaptureService {
         ten: 10,
       };
       const multiplier = multipliers[wordMillion[1].toLowerCase()];
-      if (multiplier) return this.formatAedAmount(multiplier * 1_000_000);
+      const amount = multiplier ? convert(multiplier * 1_000_000) : null;
+      if (amount) return this.formatAedAmount(amount);
     }
 
     const scaled = value.match(
       /(\d+(?:[.,]\d+)?)\s*(m|mn|mln|million|k|thousand|млн|миллион(?:а|ов)?|тыс(?:яч[аи]?)?|مليون|ألف)\b/iu
     );
     if (scaled?.[1] && scaled[2]) {
-      const amount = this.scaleMoneyNumber(scaled[1], scaled[2]);
+      const amount = convert(this.scaleMoneyNumber(scaled[1], scaled[2]));
       if (amount) return this.formatAedAmount(amount);
     }
 
     const compact = value.match(
-      /(?:aed|dhs?|dirhams?|дирхам(?:ов|а)?|درهم)?\s*(\d{1,3}(?:[ ,]\d{3})+|\d{4,12})(?:\s*(?:aed|dhs?|dirhams?|дирхам(?:ов|а)?|درهم))?/iu
+      /(?:aed|dhs?|dirhams?|usd|us\s*dollars?|\$|дирхам(?:ов|а)?|درهم)?\s*(\d{1,3}(?:[ ,]\d{3})+|\d{4,12})(?:\s*(?:aed|dhs?|dirhams?|usd|us\s*dollars?|дирхам(?:ов|а)?|درهم))?/iu
     );
     if (compact?.[1]) {
       const parsed = Number.parseInt(compact[1].replace(/[ ,]/g, ''), 10);
-      if (Number.isFinite(parsed) && parsed >= 1000) {
-        return this.formatAedAmount(parsed);
+      const amount = Number.isFinite(parsed) ? convert(parsed) : null;
+      if (amount !== null && amount >= 1000) {
+        return this.formatAedAmount(amount);
       }
     }
     return null;
@@ -4788,7 +4805,7 @@ export class LeadCaptureService {
         annual_revenue_aed: 'Please send an approximate amount such as AED 150,000, 1.2m, or “unknown”.',
         monthly_net_profit_aed: 'Please send an approximate monthly amount such as AED 20,000 or “unknown”.',
         monthly_operating_expenses_aed: 'Please send an approximate monthly amount such as AED 50,000 or “unknown”.',
-        desired_selling_price_aed: 'Please send a price, choose an option, ask me for an indicative range, or reply “unknown”.',
+        desired_selling_price_aed: 'Please send the expected price or range. AED is preferred; USD is also accepted and converted automatically.',
         buyer_budget_aed: 'Please send a budget such as AED 500,000, choose an option, or reply “unknown”.',
         year_established: 'Please send a four-digit year such as 2018, or reply “unknown”.',
         employee_count: 'Please send the number of employees, such as 12, or reply “unknown”.',

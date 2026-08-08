@@ -993,6 +993,7 @@ export class SharhApiService {
         desired_selling_price_aed: this.parseAedRepresentative(
           record.desiredSellingPriceAed
         ),
+        desired_selling_price_text: record.desiredSellingPriceAed || null,
         year_established: this.parseInteger(record.yearEstablished),
         employee_count: this.parseInteger(record.employeeCount),
         monthly_operating_expenses_aed: this.parseAedRepresentative(
