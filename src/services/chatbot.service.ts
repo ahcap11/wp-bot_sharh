@@ -244,6 +244,7 @@ export class ChatbotService {
       }
 
       this.sharhSyncService?.start();
+      this.reconcilePersistedSellerCases();
       if (this.sharhApiService?.isEnabled()) {
         const reachable = await this.sharhApiService.checkHealth();
         if (reachable) {
@@ -273,6 +274,45 @@ export class ChatbotService {
         error: error instanceof Error ? error.message : 'Unknown error',
       });
       throw error;
+    }
+  }
+
+
+  /**
+   * Re-read recent local transcripts once at startup and re-sync saved seller
+   * snapshots. This fixes stale drafts after parser upgrades without sending a
+   * WhatsApp message or asking the seller to repeat anything.
+   */
+  private reconcilePersistedSellerCases(): void {
+    if (!this.sharhSyncService || !this.sharhApiService?.isEnabled()) return;
+
+    let queued = 0;
+    let repaired = 0;
+    for (const chatId of this.chatHistoryService.getAllChatIds()) {
+      const history = this.chatHistoryService.getChatHistory(chatId);
+      if (!history.length) continue;
+
+      if (this.leadCaptureService.reconcileFromHistory(chatId, history)) {
+        repaired += 1;
+      }
+      const record = this.leadCaptureService.getCurrentRecord(chatId);
+      if (!record || record.inquiryPurpose !== 'selling') continue;
+
+      const lastInbound = [...history]
+        .reverse()
+        .find(message => !message.isFromBot && message.from !== 'admin');
+      this.sharhSyncService.enqueueLead(
+        record,
+        `startup-seller-reconcile-v1-${lastInbound?.id || 'saved'}`
+      );
+      queued += 1;
+    }
+
+    if (queued > 0) {
+      logger.info('Persisted seller cases queued for startup reconciliation', {
+        queued,
+        repaired,
+      });
     }
   }
 

@@ -150,9 +150,17 @@ describe('conversation navigation and seller terms', () => {
     const record = service.getCurrentRecord(chatId);
     const directive = service.getDirective(chatId);
 
+    expect(record?.businessType).toBe('Oil & Gas');
+    expect(record?.businessLocation).toBe('Hamriyah Free Zone, Sharjah');
+    expect(record?.annualRevenueAed).toContain('40,000,000');
     expect(record?.desiredSellingPriceAed).toContain('36,725,000');
     expect(record?.desiredSellingPriceAed).toContain('73,450,000');
     expect(record?.status).toBe('qualified');
+    expect(record?.conversationSummary).toContain('Oil & Gas');
+    expect(record?.conversationSummary).not.toContain('Unidentified contact');
+    expect(record?.conversationSummary).not.toContain('Qualification is');
+    expect(record?.nextBestAction).toBe('Review the seller draft and verify the reported figures before publishing.');
+    expect(record?.riskFlags).not.toContain('Seller financial picture is incomplete');
     expect(directive.shouldRespond).toBe(true);
     expect(directive.directResponse).toContain('initial SHARH review');
   });

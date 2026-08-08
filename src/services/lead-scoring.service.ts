@@ -87,8 +87,8 @@ export class LeadScoringService {
     points += financials * 5;
     if (financials === 3) {
       reasons.push('Revenue, net profit, and asking price are all captured.');
-    } else {
-      riskFlags.push('Seller financial picture is incomplete.');
+    } else if (!record.annualRevenueAed && !record.monthlyNetProfitAed) {
+      riskFlags.push('No operating performance figure has been captured yet.');
     }
 
     const operations = [
@@ -169,6 +169,16 @@ export class LeadScoringService {
     record: LeadCaptureRecord,
     riskFlags: string[]
   ): { code: string; label: string } {
+    const sellerDraftReady =
+      record.inquiryPurpose === 'selling' &&
+      record.termsAccepted === 'yes' &&
+      Boolean(record.businessType && record.businessLocation && record.desiredSellingPriceAed);
+    if (sellerDraftReady) {
+      return {
+        code: 'review_seller_draft',
+        label: 'Review the seller draft and verify the reported figures before publishing.',
+      };
+    }
     if (record.status === 'qualified' || record.completionPercent >= 100) {
       return {
         code: 'review_qualified_lead',

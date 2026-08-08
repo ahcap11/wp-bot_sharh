@@ -1151,6 +1151,78 @@ export class LeadCaptureService {
     return this.buildRecord(chatId, synthetic, state, []);
   }
 
+  /**
+   * Conservatively repair persisted seller state from the local transcript.
+   * This is used on startup after parser improvements so an already captured
+   * WhatsApp case can be corrected and re-synced without asking the seller to
+   * repeat information or sending any message.
+   */
+  reconcileFromHistory(chatId: string, messages: WhatsAppMessage[]): boolean {
+    const state = this.leadStates.get(chatId);
+    if (!state || state.inquiryPurpose !== 'selling' || !messages.length) {
+      return false;
+    }
+
+    let changed = false;
+    let previousBotPrompt = '';
+    for (const message of messages.slice(-50)) {
+      const content = this.normalizeWhitespace(message.content || '');
+      if (!content) continue;
+
+      if (message.isFromBot || message.from === 'admin') {
+        previousBotPrompt = content;
+        continue;
+      }
+
+      const sector = this.extractCanonicalBusinessSector(content);
+      if (
+        sector &&
+        (!state.businessType || this.businessTypeNeedsCleanup(state.businessType)) &&
+        state.businessType !== sector
+      ) {
+        state.businessType = sector;
+        changed = true;
+      }
+
+      const location = this.extractLocation(content, false);
+      if (location) {
+        const merged = this.mergeSellerLocation(state.businessLocation, location);
+        if (merged && merged !== state.businessLocation) {
+          state.businessLocation = merged;
+          changed = true;
+        }
+      }
+
+      const revenue = this.extractMoneyByHints(content, [
+        /revenue|turnover|annual sales|yearly sales|per year|annually/i,
+        /выручк|оборот|годов.*доход|за год/i,
+        /الإيراد|المبيعات السنوية|سنوي/i,
+      ]);
+      if (revenue && revenue !== 'Unknown / to confirm' && revenue !== state.annualRevenueAed) {
+        state.annualRevenueAed = revenue;
+        changed = true;
+      }
+
+      const explicitPrice = /asking(?: price)?|selling price|sell for|desired price|expected price|valuation|цена продаж|سعر البيع/iu.test(content);
+      const promptedForPrice = /selling price|price range|expected price|expected selling price|цена продажи|سعر البيع/iu.test(previousBotPrompt);
+      if (explicitPrice || promptedForPrice) {
+        const price = this.extractMoneyExpression(content);
+        if (price && price !== 'Unknown / to confirm' && price !== state.desiredSellingPriceAed) {
+          state.desiredSellingPriceAed = price;
+          changed = true;
+        }
+      }
+
+      previousBotPrompt = '';
+    }
+
+    if (!changed) return false;
+    if (this.hasRequiredLeadFields(state)) this.markQualified(state);
+    this.recalculateStage(state);
+    this.persist(chatId);
+    return true;
+  }
+
   isRestartRecoveryCommand(chatId: string, rawContent: string): boolean {
     const content = this.normalizeWhitespace(rawContent).toLowerCase();
     const state = this.leadStates.get(chatId);
@@ -2247,13 +2319,14 @@ export class LeadCaptureService {
           fieldsUpdated
         );
       } else {
-        this.setIfMissing(
-          state,
-          'businessLocation',
-          location,
-          'business_location',
-          fieldsUpdated
+        const mergedLocation = this.mergeSellerLocation(
+          state.businessLocation,
+          location
         );
+        if (mergedLocation && mergedLocation !== state.businessLocation) {
+          state.businessLocation = mergedLocation;
+          fieldsUpdated.push('business_location');
+        }
       }
     }
 
@@ -2972,6 +3045,9 @@ export class LeadCaptureService {
     value: string,
     allowWholeAnswer: boolean = false
   ): string | null {
+    const canonicalSector = this.extractCanonicalBusinessSector(value);
+    if (canonicalSector) return canonicalSector;
+
     const beforeKnownLocation = value.match(
       /^(.+?)\s+(?:in|located in|based in)\s+(?:Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\b/i
     );
@@ -2997,6 +3073,53 @@ export class LeadCaptureService {
     return null;
   }
 
+  private extractCanonicalBusinessSector(value: string): string | null {
+    if (/\boil\s*(?:&|and|n|'n')\s*gas\b|\boil\s+gas\b/i.test(value)) {
+      return 'Oil & Gas';
+    }
+    return null;
+  }
+
+  private extractKnownFreeZone(value: string): string | null {
+    const zones: Array<[RegExp, string]> = [
+      [/\bHamriyah\s+Free\s+Zone\b/i, 'Hamriyah Free Zone'],
+      [/\b(?:Jebel\s+Ali\s+Free\s+Zone|JAFZA)\b/i, 'JAFZA'],
+      [/\b(?:Dubai\s+Multi\s+Commodities\s+Centre|DMCC)\b/i, 'DMCC'],
+      [/\b(?:Ras\s+Al\s+Khaimah\s+Economic\s+Zone|RAKEZ)\b/i, 'RAKEZ'],
+      [/\b(?:Sharjah\s+Airport\s+International\s+Free\s+Zone|SAIF\s+Zone)\b/i, 'SAIF Zone'],
+    ];
+    for (const [pattern, label] of zones) {
+      if (pattern.test(value)) return label;
+    }
+    return null;
+  }
+
+  private mergeSellerLocation(current: string | undefined, candidate: string): string {
+    const existing = (current || '').trim();
+    const incoming = candidate.trim();
+    if (!existing) return incoming;
+    if (!incoming) return existing;
+    if (existing.toLowerCase() === incoming.toLowerCase()) return existing;
+    if (existing.toLowerCase().includes(incoming.toLowerCase())) return existing;
+    if (incoming.toLowerCase().includes(existing.toLowerCase())) return incoming;
+
+    const emiratePattern = /^(?:Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)$/i;
+    const existingZone = /(?:Free Zone|JAFZA|DMCC|RAKEZ|SAIF Zone)/i.test(existing);
+    const incomingZone = /(?:Free Zone|JAFZA|DMCC|RAKEZ|SAIF Zone)/i.test(incoming);
+    if (existingZone && emiratePattern.test(incoming)) return `${existing}, ${incoming}`;
+    if (incomingZone && emiratePattern.test(existing)) return `${incoming}, ${existing}`;
+    return existing;
+  }
+
+  private businessTypeNeedsCleanup(value: string): boolean {
+    const normalized = value.trim();
+    return (
+      normalized.split(/\s+/).length > 7 ||
+      /\d/.test(normalized) ||
+      /\b(?:turnover|revenue|sales|profit|last\s+(?:yr|year)|previous\s+year|free\s+zone)\b/i.test(normalized)
+    );
+  }
+
   private extractLocation(
     value: string,
     allowWholeAnswer: boolean = false
@@ -3007,6 +3130,14 @@ export class LeadCaptureService {
       return this.isMeaningfulFreeText(value)
         ? this.cleanFreeTextAnswer(value)
         : null;
+    }
+
+    const freeZone = this.extractKnownFreeZone(value);
+    const freeZoneEmirate = value.match(
+      /\b(Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)\b/i
+    )?.[1];
+    if (freeZone) {
+      return freeZoneEmirate ? `${freeZone}, ${freeZoneEmirate}` : freeZone;
     }
 
     const correctedLocation = value.match(
@@ -3844,6 +3975,7 @@ export class LeadCaptureService {
     const toAed = nonAedCurrency === 'USD' && !explicitlyAed ? 3.6725 : 1;
     const convert = (amount: number | null): number | null =>
       amount === null ? null : Math.round(amount * toAed);
+    const isMinimum = /\b(?:over|above|more than|at least)\b/i.test(value);
 
     const rangeMatch = value.match(
       /(?:\b(?:aed|dhs?|dirhams?|usd|us\s*dollars?)\b|\$)?\s*(\d+(?:[.,]\d+)?)\s*(m|mn|mln|million|k|thousand|млн|тыс|مليون|ألف)?\s*(?:-|–|—|to|до|إلى)\s*(?:\b(?:aed|dhs?|dirhams?|usd|us\s*dollars?)\b|\$)?\s*(\d+(?:[.,]\d+)?)\s*(m|mn|mln|million|k|thousand|млн|тыс|مليون|ألف)?/iu
@@ -3889,7 +4021,7 @@ export class LeadCaptureService {
     );
     if (scaled?.[1] && scaled[2]) {
       const amount = convert(this.scaleMoneyNumber(scaled[1], scaled[2]));
-      if (amount) return this.formatAedAmount(amount);
+      if (amount) return `${this.formatAedAmount(amount)}${isMinimum ? '+' : ''}`;
     }
 
     const compact = value.match(
@@ -3899,7 +4031,7 @@ export class LeadCaptureService {
       const parsed = Number.parseInt(compact[1].replace(/[ ,]/g, ''), 10);
       const amount = Number.isFinite(parsed) ? convert(parsed) : null;
       if (amount !== null && amount >= 1000) {
-        return this.formatAedAmount(amount);
+        return `${this.formatAedAmount(amount)}${isMinimum ? '+' : ''}`;
       }
     }
     return null;
@@ -4248,10 +4380,11 @@ export class LeadCaptureService {
       .replace(/^(?:sell|selling|buy|buying|acquire|acquiring|looking for)\s+(?:a\s+|an\s+|the\s+)?/i, '')
       .replace(/^(?:we\s+(?:operate|run|own|have|are)|i\s+(?:operate|run|own|have))\s+(?:a\s+|an\s+|the\s+)?/i, '')
       .replace(/^business\s*[:=-]?\s*/i, '')
-      .replace(/^(?:a|an|the)\s+/i, '');
+      .replace(/^(?:a|an|the)\s+/i, '')
+      .replace(/^(?:Hamriyah\s+Free\s+Zone|Jebel\s+Ali\s+Free\s+Zone|JAFZA|DMCC|RAKEZ|SAIF\s+Zone)\s*[-,:]?\s*/i, '');
 
     const boundary = cleaned.search(
-      /(?:[,;.]|\s+(?:in|located in|based in)\s+(?=Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)|\s+(?:with\s+)?(?:annual|yearly|monthly)?\s*(?:revenue|turnover|sales|profit|expenses)|\s+(?:asking(?: price)?|expected price|selling price|sell for|looking for|budget|under|up to|maximum|max(?:imum)?)\b)/i
+      /(?:[,;.]|\s+(?:in|located in|based in)\s+(?=Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)|\s+(?:last|previous)\s+(?:yr|year)\b|\s+(?:with\s+)?(?:annual|yearly|monthly)?\s*(?:revenue|turnover|sales|profit|expenses)|\s+(?:asking(?: price)?|expected price|selling price|sell for|looking for|budget|under|up to|maximum|max(?:imum)?)\b)/i
     );
     if (boundary > 0) cleaned = cleaned.slice(0, boundary);
 
