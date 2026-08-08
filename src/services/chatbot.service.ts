@@ -284,7 +284,12 @@ export class ChatbotService {
    * WhatsApp message or asking the seller to repeat anything.
    */
   private reconcilePersistedSellerCases(): void {
-    if (!this.sharhSyncService || !this.sharhApiService?.isEnabled()) return;
+    // Capture nullable dependencies once. Besides being clearer, this keeps the
+    // TypeScript null guard valid inside the loop and during async-safe startup
+    // reconciliation.
+    const leadCaptureService = this.leadCaptureService;
+    const sharhSyncService = this.sharhSyncService;
+    if (!leadCaptureService || !sharhSyncService || !this.sharhApiService?.isEnabled()) return;
 
     let queued = 0;
     let repaired = 0;
@@ -292,16 +297,16 @@ export class ChatbotService {
       const history = this.chatHistoryService.getChatHistory(chatId);
       if (!history.length) continue;
 
-      if (this.leadCaptureService.reconcileFromHistory(chatId, history)) {
+      if (leadCaptureService.reconcileFromHistory(chatId, history)) {
         repaired += 1;
       }
-      const record = this.leadCaptureService.getCurrentRecord(chatId);
+      const record = leadCaptureService.getCurrentRecord(chatId);
       if (!record || record.inquiryPurpose !== 'selling') continue;
 
       const lastInbound = [...history]
         .reverse()
         .find(message => !message.isFromBot && message.from !== 'admin');
-      this.sharhSyncService.enqueueLead(
+      sharhSyncService.enqueueLead(
         record,
         `startup-seller-reconcile-v1-${lastInbound?.id || 'saved'}`
       );

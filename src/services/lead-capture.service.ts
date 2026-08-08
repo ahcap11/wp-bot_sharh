@@ -1174,13 +1174,16 @@ export class LeadCaptureService {
         continue;
       }
 
-      const sector = this.extractCanonicalBusinessSector(content);
+      const promptedForBusinessType = /what the business does|business does|business type|type of business|what kind of business|чем занимается бизнес|тип бизнеса|نوع النشاط/iu.test(previousBotPrompt);
+      const businessType =
+        this.extractCanonicalBusinessSector(content) ||
+        this.extractBusinessType(content, promptedForBusinessType);
       if (
-        sector &&
+        businessType &&
         (!state.businessType || this.businessTypeNeedsCleanup(state.businessType)) &&
-        state.businessType !== sector
+        state.businessType !== businessType
       ) {
-        state.businessType = sector;
+        state.businessType = businessType;
         changed = true;
       }
 
@@ -1203,7 +1206,7 @@ export class LeadCaptureService {
         changed = true;
       }
 
-      const explicitPrice = /asking(?: price)?|selling price|sell for|desired price|expected price|valuation|цена продаж|سعر البيع/iu.test(content);
+      const explicitPrice = /asking(?: price)?|selling price|sell(?:ing)? for|selling at|desired price|expected price|valuation|цена продаж|سعر البيع/iu.test(content);
       const promptedForPrice = /selling price|price range|expected price|expected selling price|цена продажи|سعر البيع/iu.test(previousBotPrompt);
       if (explicitPrice || promptedForPrice) {
         const price = this.extractMoneyExpression(content);
@@ -2345,7 +2348,7 @@ export class LeadCaptureService {
       );
 
       const askingPrice = this.extractMoneyByHints(content, [
-        /asking(?: price)?|selling price|sell for|desired price|expected price|valuation|price/i,
+        /asking(?: price)?|selling price|sell(?:ing)? for|selling at|desired price|expected price|valuation|price/i,
         /цена продаж|хочу получить|ожидаемая цена|оценк|стоимост/i,
         /سعر البيع|السعر المطلوب|التقييم/i,
       ]);
@@ -3066,7 +3069,10 @@ export class LeadCaptureService {
       const match = value.match(pattern);
       if (match?.[1]) {
         const normalized = this.normalizeBusinessText(match[1]);
-        if (normalized) return normalized;
+        // Phrases such as "business is profitable and running" describe the
+        // condition of the business, not its sector/type. Do not let them replace
+        // the actual business description earlier in the same user message.
+        if (normalized && !this.looksLikeBusinessStatus(normalized)) return normalized;
       }
     }
     if (allowWholeAnswer) return this.normalizeBusinessText(value);
@@ -3116,7 +3122,14 @@ export class LeadCaptureService {
     return (
       normalized.split(/\s+/).length > 7 ||
       /\d/.test(normalized) ||
-      /\b(?:turnover|revenue|sales|profit|last\s+(?:yr|year)|previous\s+year|free\s+zone)\b/i.test(normalized)
+      /\b(?:turnover|revenue|sales|profit|last\s+(?:yr|year)|previous\s+year|free\s+zone)\b/i.test(normalized) ||
+      this.looksLikeBusinessStatus(normalized)
+    );
+  }
+
+  private looksLikeBusinessStatus(value: string): boolean {
+    return /^(?:(?:very\s+)?profitable|running|operational|active|established|profitable\s+(?:and|&)\s+running|running\s+(?:and|&)\s+profitable|currently\s+running)(?:\b|$)/i.test(
+      value.trim()
     );
   }
 
@@ -4384,7 +4397,7 @@ export class LeadCaptureService {
       .replace(/^(?:Hamriyah\s+Free\s+Zone|Jebel\s+Ali\s+Free\s+Zone|JAFZA|DMCC|RAKEZ|SAIF\s+Zone)\s*[-,:]?\s*/i, '');
 
     const boundary = cleaned.search(
-      /(?:[,;.]|\s+(?:in|located in|based in)\s+(?=Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)|\s+(?:last|previous)\s+(?:yr|year)\b|\s+(?:with\s+)?(?:annual|yearly|monthly)?\s*(?:revenue|turnover|sales|profit|expenses)|\s+(?:asking(?: price)?|expected price|selling price|sell for|looking for|budget|under|up to|maximum|max(?:imum)?)\b)/i
+      /(?:[,;.]|\s+(?:in|located in|based in)\s+(?=Dubai|Abu Dhabi|Sharjah|Ajman|Fujairah|Ras Al Khaimah|RAK|Umm Al Quwain)|\s+(?:last|previous)\s+(?:yr|year)\b|\s+(?:with\s+)?(?:annual|yearly|monthly)?\s*(?:revenue|turnover|sales|profit|expenses)|\s+(?:asking(?: price)?|expected price|selling price|sell(?:ing)? for|selling at|looking for|budget|under|up to|maximum|max(?:imum)?)\b)/i
     );
     if (boundary > 0) cleaned = cleaned.slice(0, boundary);
 

@@ -140,6 +140,32 @@ describe('conversation navigation and seller terms', () => {
     expect(record?.annualRevenueAed).toBe('');
   });
 
+  it('captures an informal selling-for price before asking for location', () => {
+    turn('sell');
+    turn('yes');
+
+    service.updateFromMessage(
+      chatId,
+      message(`m-${++sequence}`, 'Shoe cleaning, selling for 400K, business is profitable and running')
+    );
+
+    let record = service.getCurrentRecord(chatId);
+    let directive = service.getDirective(chatId);
+    expect(record?.businessType).toBe('Shoe cleaning');
+    expect(record?.desiredSellingPriceAed).toBe('AED 400,000');
+    expect(directive.expectedField).toBe('business_location');
+
+    service.updateFromMessage(chatId, message(`m-${++sequence}`, 'Dubai'));
+    record = service.getCurrentRecord(chatId);
+    directive = service.getDirective(chatId);
+
+    expect(record?.businessLocation).toContain('Dubai');
+    expect(record?.desiredSellingPriceAed).toBe('AED 400,000');
+    expect(record?.status).toBe('qualified');
+    expect(directive.directResponse).toContain('initial SHARH review');
+    expect(directive.directResponse).not.toContain('selling price or price range');
+  });
+
   it('parses a USD seller price range and still returns the review-ready reply', () => {
     turn('sell');
     turn('yes');
