@@ -244,7 +244,7 @@ export class ChatbotService {
       }
 
       this.sharhSyncService?.start();
-      this.reconcilePersistedSellerCases();
+      await this.reconcilePersistedSellerCases();
       if (this.sharhApiService?.isEnabled()) {
         const reachable = await this.sharhApiService.checkHealth();
         if (reachable) {
@@ -280,19 +280,22 @@ export class ChatbotService {
 
   /**
    * Re-read recent local transcripts once at startup and re-sync saved seller
-   * snapshots. This fixes stale drafts after parser upgrades without sending a
-   * WhatsApp message or asking the seller to repeat anything.
+   * snapshots. Parser upgrades repair stale drafts without asking the seller to
+   * repeat anything. A single unanswered explicit submit command may also be
+   * acknowledged so a case cannot remain visibly stuck after deployment.
    */
-  private reconcilePersistedSellerCases(): void {
+  private async reconcilePersistedSellerCases(): Promise<void> {
     // Capture nullable dependencies once. Besides being clearer, this keeps the
     // TypeScript null guard valid inside the loop and during async-safe startup
     // reconciliation.
     const leadCaptureService = this.leadCaptureService;
     const sharhSyncService = this.sharhSyncService;
-    if (!leadCaptureService || !sharhSyncService || !this.sharhApiService?.isEnabled()) return;
+    const sharhApiService = this.sharhApiService;
+    if (!leadCaptureService || !sharhSyncService || !sharhApiService?.isEnabled()) return;
 
     let queued = 0;
     let repaired = 0;
+    let recoveredReplies = 0;
     for (const chatId of this.chatHistoryService.getAllChatIds()) {
       const history = this.chatHistoryService.getChatHistory(chatId);
       if (!history.length) continue;
@@ -300,23 +303,113 @@ export class ChatbotService {
       if (leadCaptureService.reconcileFromHistory(chatId, history)) {
         repaired += 1;
       }
-      const record = leadCaptureService.getCurrentRecord(chatId);
-      if (!record || record.inquiryPurpose !== 'selling') continue;
 
+      const latest = history[history.length - 1];
       const lastInbound = [...history]
         .reverse()
         .find(message => !message.isFromBot && message.from !== 'admin');
+
+      // Narrow recovery for a command that was received but never answered by
+      // an older build. This intentionally does not replay arbitrary historic
+      // messages. It only handles an explicit seller submission command when
+      // that command is still the final message in the local transcript.
+      let recoveredResponse: string | undefined;
+      if (
+        latest &&
+        lastInbound &&
+        latest.id === lastInbound.id &&
+        /\b(?:submit|send|review|отправ|рассмотр|مراجعة|أرسل)\b/iu.test(lastInbound.content)
+      ) {
+        const control = await sharhApiService.getConversationControl(
+          chatId,
+          lastInbound.from
+        );
+        if (
+          !control?.found ||
+          (control.botEnabled && control.owner === 'bot' && !['paused', 'human', 'closed'].includes(control.controlMode))
+        ) {
+          const navigation = leadCaptureService.handleNavigationCommand(
+            chatId,
+            lastInbound.content
+          );
+          if (navigation.handled && navigation.action === 'review' && navigation.response) {
+            recoveredResponse = navigation.response;
+          }
+        }
+      }
+
+      const record = leadCaptureService.getCurrentRecord(chatId);
+      if (!record || record.inquiryPurpose !== 'selling') continue;
+
+      const reconcileFingerprint = [
+        record.businessType,
+        record.businessLocation,
+        record.desiredSellingPriceAed,
+        record.annualRevenueAed,
+        record.clientName,
+        record.nextStep,
+        record.status,
+      ]
+        .map(value => String(value || '').trim().toLowerCase())
+        .join('|')
+        .slice(0, 500);
       sharhSyncService.enqueueLead(
         record,
-        `startup-seller-reconcile-v1-${lastInbound?.id || 'saved'}`
+        `startup-seller-reconcile-v2-${lastInbound?.id || 'saved'}-${reconcileFingerprint}`
       );
       queued += 1;
+
+      if (recoveredResponse && this.whatsappService.isConnected()) {
+        const sendResult = await this.sendDetailed(chatId, recoveredResponse);
+        if (sendResult.success) {
+          const botMessage: WhatsAppMessage = {
+            id: sendResult.providerMessageIds[0] || `bot-recovery-${Date.now()}`,
+            from: 'bot',
+            to: chatId,
+            timestamp: Date.now(),
+            type: 'text',
+            content: recoveredResponse,
+            isGroup: false,
+            senderName: 'AI Assistant',
+            isFromBot: true,
+          };
+          this.chatHistoryService.addMessage(chatId, botMessage);
+          this.messageDeliveryService.recordAccepted(
+            botMessage.id,
+            chatId,
+            recoveredResponse,
+            'bot_reply',
+            sendResult
+          );
+          sharhSyncService.enqueueMessage(chatId, 'outbound', botMessage, 'sales');
+          sharhSyncService.enqueueAnalytics(
+            'conversation_missed_reply_recovered',
+            chatId,
+            { reason: 'explicit_seller_submit_command' },
+            botMessage.id
+          );
+          const recoveryDirective = leadCaptureService.getDirective(chatId);
+          leadCaptureService.confirmDirectiveSent(chatId, recoveryDirective);
+          recoveredReplies += 1;
+          logger.info('Recovered unanswered seller submission command', {
+            chatId,
+            inboundMessageId: lastInbound?.id || null,
+          });
+        } else {
+          logger.warn('Could not recover unanswered seller submission command; will leave it for the next user turn', {
+            chatId,
+            inboundMessageId: lastInbound?.id || null,
+            error: sendResult.error || 'unknown send error',
+          });
+        }
+      }
     }
 
     if (queued > 0) {
       logger.info('Persisted seller cases queued for startup reconciliation', {
         queued,
         repaired,
+        recoveredReplies,
       });
     }
   }

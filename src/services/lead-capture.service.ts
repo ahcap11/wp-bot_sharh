@@ -814,13 +814,9 @@ export class LeadCaptureService {
     }
 
     if (state.pendingSubmitRequest) {
-      if (!state.clientName) {
-        return this.questionDirective(
-          state,
-          'client_name',
-          this.template(state.language, 'ask_name')
-        );
-      }
+      // Review submission is a one-tap action. A display name is useful but not
+      // required, so never make the seller answer another question just to
+      // complete the action they explicitly requested.
       state.pendingSubmitRequest = false;
       state.submittedForReview = true;
       state.nextStep = 'submit';
@@ -1219,8 +1215,11 @@ export class LeadCaptureService {
       previousBotPrompt = '';
     }
 
+    if (this.hasRequiredLeadFields(state) && state.status !== 'qualified') {
+      this.markQualified(state);
+      changed = true;
+    }
     if (!changed) return false;
-    if (this.hasRequiredLeadFields(state)) this.markQualified(state);
     this.recalculateStage(state);
     this.persist(chatId);
     return true;
@@ -1408,7 +1407,7 @@ export class LeadCaptureService {
     }
 
     if (state.status === 'qualified' && state.inquiryPurpose === 'selling') {
-      if (/^(?:1|submit|submit it|submit for review|send for review|review it|подать|отправить на рассмотрение|إرسال للمراجعة)$/iu.test(lower)) {
+      if (/^(?:1|(?:(?:yes|yes please|sure|ok|okay|please|go ahead)[,\s]+)?(?:submit(?: it)?|submit for review|send(?: it)? for review|review it)(?:[,\s]+please)?|подать|отправить на рассмотрение|да[,\s]+отправ(?:ить|ьте)(?:\s+на\s+рассмотрение)?|إرسال للمراجعة|نعم[,\s]+أرسل(?:ها)?\s+للمراجعة)[.!]?$/iu.test(lower)) {
         state.pendingSubmitRequest = true;
         state.nextStep = undefined;
         state.qualificationNoticeSent = false;
@@ -2695,7 +2694,10 @@ export class LeadCaptureService {
   }
 
   private hasRequiredLeadFields(state: LeadCaptureState): boolean {
-    if (!state.clientPhone || !state.inquiryPurpose) {
+    // A WhatsApp conversation is already addressable by its chat/JID even when
+    // Baileys exposes a privacy-preserving @lid identity and no phone number.
+    // Missing phone must not strand an otherwise complete buyer/seller funnel.
+    if (!state.inquiryPurpose) {
       return false;
     }
 
@@ -3119,7 +3121,12 @@ export class LeadCaptureService {
 
   private businessTypeNeedsCleanup(value: string): boolean {
     const normalized = value.trim();
+    const looksLikeSellerSentence =
+      /^(?:i(?:'m| am)?|we(?:'re| are)?)\s+(?:looking|trying|planning)\s+to\s+sell\b/i.test(normalized) ||
+      /^(?:i|we)\s+(?:want|would like|need|plan)\s+to\s+sell\b/i.test(normalized) ||
+      /^(?:i(?:'m| am)?|we(?:'re| are)?)\s+selling\b/i.test(normalized);
     return (
+      looksLikeSellerSentence ||
       normalized.split(/\s+/).length > 7 ||
       /\d/.test(normalized) ||
       /\b(?:turnover|revenue|sales|profit|last\s+(?:yr|year)|previous\s+year|free\s+zone)\b/i.test(normalized) ||
@@ -4389,7 +4396,10 @@ export class LeadCaptureService {
   private normalizeBusinessText(value: string): string | null {
     let cleaned = this.cleanFreeTextAnswer(value) || '';
     cleaned = cleaned
-      .replace(/^(?:i\s+(?:want|would like|need|plan)\s+to\s+|i(?:'m| am)\s+|we\s+)(?:sell(?:ing)?|buy(?:ing)?|acquir(?:e|ing)|looking for)\s+(?:a\s+|an\s+|the\s+)?/i, '')
+      .replace(/^(?:i(?:'m| am)?|we(?:'re| are)?)\s+(?:am\s+)?(?:looking|trying|planning)\s+to\s+sell\s+(?:(?:my|our|a|an|the)\s+)?/i, '')
+      .replace(/^(?:i|we)\s+(?:want|would like|need|plan)\s+to\s+sell\s+(?:(?:my|our|a|an|the)\s+)?/i, '')
+      .replace(/^(?:i(?:'m| am)?|we(?:'re| are)?)\s+selling\s+(?:(?:my|our|a|an|the)\s+)?/i, '')
+      .replace(/^(?:i\s+(?:want|would like|need|plan)\s+to\s+|i(?:'m| am)\s+|we\s+)(?:sell(?:ing)?|buy(?:ing)?|acquir(?:e|ing)|looking for)\s+(?:(?:my|our|a|an|the)\s+)?/i, '')
       .replace(/^(?:sell|selling|buy|buying|acquire|acquiring|looking for)\s+(?:a\s+|an\s+|the\s+)?/i, '')
       .replace(/^(?:we\s+(?:operate|run|own|have|are)|i\s+(?:operate|run|own|have))\s+(?:a\s+|an\s+|the\s+)?/i, '')
       .replace(/^business\s*[:=-]?\s*/i, '')
@@ -4751,9 +4761,9 @@ export class LeadCaptureService {
 
   private submissionConfirmed(language: ConversationLanguage): string {
     const messages: Record<ConversationLanguage, string> = {
-      en: 'Submitted for initial SHARH review. The SHARH team can now see the conversation and the information recorded. I can still help you update this request or start a separate one.',
-      ru: 'Запрос отправлен на первичное рассмотрение SHARH. Команда видит переписку WhatsApp и сохранённые данные. Я по-прежнему могу помочь обновить этот запрос или создать отдельный.',
-      ar: 'تم إرسال الطلب للمراجعة الأولية لدى SHARH. ويمكن للفريق الاطلاع على محادثة واتساب والمعلومات المسجلة. ما زلت أستطيع مساعدتك في تحديث الطلب أو بدء طلب منفصل.',
+      en: 'Done — submitted for initial SHARH review. The team can see this chat and the saved details. You can still update anything here.',
+      ru: 'Готово — заявка отправлена на первичное рассмотрение SHARH. Команда видит этот чат и сохранённые данные. Здесь же можно внести любые изменения.',
+      ar: 'تم — أُرسل الطلب للمراجعة الأولية لدى SHARH. يمكن للفريق رؤية هذه المحادثة والبيانات المحفوظة، ويمكنك تعديل أي شيء هنا.',
     };
     return messages[language];
   }

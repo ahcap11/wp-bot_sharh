@@ -140,6 +140,42 @@ describe('conversation navigation and seller terms', () => {
     expect(record?.annualRevenueAed).toBe('');
   });
 
+  it('does not require a visible phone number to complete a WhatsApp seller intake', () => {
+    const lidChat = 'privacy-lid-chat';
+    let lidSequence = 0;
+    const lidMessage = (content: string): WhatsAppMessage => ({
+      id: `lid-${++lidSequence}`,
+      from: '208911705595993@lid',
+      to: 'bot@s.whatsapp.net',
+      timestamp: Date.now(),
+      type: 'text',
+      content,
+      isGroup: false,
+      isFromBot: false,
+    });
+    const lidTurn = (content: string): void => {
+      service.updateFromMessage(lidChat, lidMessage(content));
+      const directive = service.getDirective(lidChat);
+      if (directive.shouldRespond) service.confirmDirectiveSent(lidChat, directive);
+    };
+
+    lidTurn('sell');
+    lidTurn('yes');
+    lidTurn('Shoe cleaning, selling for 400K, business is profitable and running');
+    service.updateFromMessage(lidChat, lidMessage('Dubai'));
+
+    const record = service.getCurrentRecord(lidChat);
+    const directive = service.getDirective(lidChat);
+    expect(record?.clientPhone).toBe('');
+    expect(record?.status).toBe('qualified');
+    expect(directive.directResponse).toContain('initial SHARH review');
+
+    const submit = service.handleNavigationCommand(lidChat, 'Yes submit it');
+    expect(submit.handled).toBe(true);
+    expect(submit.response).toContain('Submitted for review');
+    expect(service.getCurrentRecord(lidChat)?.nextStep).toBe('submit');
+  });
+
   it('captures an informal selling-for price before asking for location', () => {
     turn('sell');
     turn('yes');
@@ -164,6 +200,18 @@ describe('conversation navigation and seller terms', () => {
     expect(record?.status).toBe('qualified');
     expect(directive.directResponse).toContain('initial SHARH review');
     expect(directive.directResponse).not.toContain('selling price or price range');
+  });
+
+  it('normalizes a natural seller intent sentence into the actual business type', () => {
+    turn('sell');
+    turn('yes');
+
+    service.updateFromMessage(
+      chatId,
+      message(`m-${++sequence}`, 'I am looking to sell my restaurant')
+    );
+
+    expect(service.getCurrentRecord(chatId)?.businessType).toBe('Restaurant');
   });
 
   it('parses a USD seller price range and still returns the review-ready reply', () => {
@@ -191,19 +239,16 @@ describe('conversation navigation and seller terms', () => {
     expect(directive.directResponse).toContain('initial SHARH review');
   });
 
-  it('asks for the client name only when submitting for review', () => {
+  it('submits immediately without forcing an extra name question', () => {
     turn('sell');
     turn('yes');
     turn('Boat trading company in Dubai, expected selling price AED 600k');
 
-    const submit = service.handleNavigationCommand(chatId, 'submit for review');
-    expect(submit.response).toContain('Could I have your name');
-    const nameDirective = service.getDirective(chatId);
-    service.confirmDirectiveSent(chatId, nameDirective);
-
-    turn('Ansar');
+    const submit = service.handleNavigationCommand(chatId, 'Yes, submit it.');
+    expect(submit.handled).toBe(true);
+    expect(submit.response).toContain('submitted for initial SHARH review');
+    expect(submit.response).not.toContain('What name');
     expect(service.getCurrentRecord(chatId)?.nextStep).toBe('submit');
-    expect(service.getCurrentRecord(chatId)?.clientName).toBe('Ansar');
   });
 
   it('uses a one-time contextual re-entry prompt after a completed case', () => {
